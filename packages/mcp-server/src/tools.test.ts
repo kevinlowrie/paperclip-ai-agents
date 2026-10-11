@@ -30,6 +30,70 @@ describe("paperclip MCP tools", () => {
     vi.restoreAllMocks();
   });
 
+  it("classifies and dispatches a developer task with one correlation id", async () => {
+    process.env.PAPERCLIP_MODEL_ROUTER_URL = "http://model-router:8092";
+    process.env.PAPERCLIP_DEVELOPER_TEAM_URL = "http://team:8080";
+    process.env.PAPERCLIP_DEVELOPER_TEAM_KEY = "team-secret";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockJsonResponse({
+        request: { request_id: "66666666-6666-4666-8666-666666666666" },
+        classification: { scope: "complex-code", confidence: 0.94, reason: "feature" },
+        accounting: { request_id: "66666666-6666-4666-8666-666666666666", cost_usd: 0.02 },
+      }))
+      .mockResolvedValueOnce(mockJsonResponse({ job_id: "66666666-6666-4666-8666-666666666666", status: "running" }, 202));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipRouteDeveloperTask");
+    const response = await tool.execute({
+      task: "Implement and validate the feature",
+      projectId: "project-42",
+      projectRequirements: ["Preserve API compatibility"],
+      repo: "homelab",
+      requestArtifactId: "s3://requests/one.json",
+      externalJobId: "blissful_txzen",
+      telegramContext: {
+        bot_alias: "hlab-pclip",
+        chat_id: "987654321",
+        message_id: "42",
+        actor_id: "123456789",
+        thread_id: "77",
+      },
+      requestId: "66666666-6666-4666-8666-666666666666",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [classifyUrl, classifyInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(classifyUrl).toBe("http://model-router:8092/paperclip/classify");
+    expect(JSON.parse(String(classifyInit.body))).toMatchObject({
+      project_id: "project-42",
+      project_requirements: ["Preserve API compatibility"],
+      request_id: "66666666-6666-4666-8666-666666666666",
+      external_job_id: "blissful_txzen",
+    });
+    expect((classifyInit.headers as Record<string, string>).Authorization).toBe("Bearer team-secret");
+    const [teamUrl, teamInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(teamUrl).toBe("http://team:8080/v1/jobs");
+    expect((teamInit.headers as Record<string, string>).Authorization).toBe("Bearer team-secret");
+    expect(JSON.parse(String(teamInit.body))).toMatchObject({
+      scope: "complex-code",
+      project_id: "project-42",
+      project_requirements: ["Preserve API compatibility"],
+      request_id: "66666666-6666-4666-8666-666666666666",
+      repo: "homelab",
+      request_artifact_id: "s3://requests/one.json",
+      external_job_id: "blissful_txzen",
+      telegram_context: {
+        bot_alias: "hlab-pclip",
+        chat_id: "987654321",
+        message_id: "42",
+        actor_id: "123456789",
+        thread_id: "77",
+      },
+    });
+    expect(response.content[0]?.text).toContain('"cost_usd": 0.02');
+    expect(response.content[0]?.text).not.toContain("team-secret");
+  });
+
   it("adds auth headers and run id to mutating requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ ok: true }),
@@ -67,6 +131,31 @@ describe("paperclip MCP tools", () => {
       "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/skills",
     );
     expect(response.content[0]?.text).toContain("wireframe");
+  });
+
+  it("returns the authenticated agent inbox and assigned issues for personal todo queries", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockJsonResponse({ id: "22222222-2222-2222-2222-222222222222", companyId: "11111111-1111-1111-1111-111111111111", name: "Chief of Staff" }))
+      .mockResolvedValueOnce(mockJsonResponse([{ id: "inbox-1" }]))
+      .mockResolvedValueOnce(mockJsonResponse([{ id: "PAP-7", title: "Inbox cleanup", status: "todo" }]));
+    vi.stubGlobal("fetch", fetchMock);
+    const response = await getTool("paperclipMyTodos").execute({});
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [issuesUrl] = fetchMock.mock.calls[2] as [string];
+    expect(String(issuesUrl)).toContain("/companies/11111111-1111-1111-1111-111111111111/issues?assigneeAgentId=22222222-2222-2222-2222-222222222222");
+    expect(response.content[0]?.text).toContain("Inbox cleanup");
+  });
+
+  it("queries job cost through the authenticated model router using an external label", async () => {
+    process.env.PAPERCLIP_MODEL_ROUTER_URL = "http://model-router:8092";
+    process.env.PAPERCLIP_DEVELOPER_TEAM_KEY = "team-secret";
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ total_cost_usd: 1.25, request_count: 3 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const response = await getTool("paperclipDeveloperJobCost").execute({ externalJobId: "blissful_txzen" });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe("http://model-router:8092/paperclip/cost?external_job_id=blissful_txzen");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer team-secret");
+    expect(response.content[0]?.text).toContain("1.25");
   });
 
   it("uses default company id for company-scoped list tools", async () => {
@@ -122,6 +211,7 @@ describe("paperclip MCP tools", () => {
     );
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
+      allowDuplicate: false,
       title: "Assigned follow-up",
       workMode: "standard",
       priority: "medium",

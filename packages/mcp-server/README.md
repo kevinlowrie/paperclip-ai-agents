@@ -17,6 +17,28 @@ The server reads its configuration from environment variables:
 
 Inside an active heartbeat, Paperclip also injects `PAPERCLIP_RUNTIME_TOOLS_*` variables. They enable the run-scoped `connections_search` and `connection_request` tools and expire with the run.
 
+To enable the routed developer-team tool, configure these variables on the MCP
+server process (keep the team key in its secret store; it is never a tool
+argument or returned value):
+
+- `PAPERCLIP_MODEL_ROUTER_URL` - internal base URL for the model-router service
+- `PAPERCLIP_DEVELOPER_TEAM_URL` - internal base URL for the Paperclip team API
+- `PAPERCLIP_DEVELOPER_TEAM_KEY` - bearer credential for that team API
+
+`paperclipRouteDeveloperTask` sends project/task context to the model router,
+then dispatches the selected scope to the Paperclip team using one stable
+request ID. Classification token/cost receipts are returned with the team job.
+The team API passes that ID and an optional external job label through Redis
+and worker requests. Worker inference stays behind LiteLLM and carries those
+identifiers as request tags. `paperclipDeveloperJobCost` reads the filtered
+LiteLLM spend logs through the router; its read key is held by the router and
+does not reach the MCP client.
+
+`paperclipMyTodos` combines the authenticated agent's inbox-lite list with its
+assigned Paperclip issues. `paperclipListIssues` accepts a `q` filter for
+questions such as “what is the status of inbox cleanup?”. These tools are
+read-only and use the Paperclip identity configured for this MCP process.
+
 ## Usage
 
 ```sh
@@ -41,6 +63,8 @@ Read tools:
 
 - `paperclipMe`
 - `paperclipInboxLite`
+- `paperclipMyTodos`
+- `paperclipDeveloperJobCost`
 - `paperclipListAgents`
 - `paperclipGetAgent`
 - `paperclipListIssues`
@@ -64,6 +88,8 @@ Read tools:
 - `paperclipListApprovalComments`
 
 Write tools:
+
+- `paperclipRouteDeveloperTask`
 
 - `paperclipCreateIssue`
 - `paperclipUpdateIssue`

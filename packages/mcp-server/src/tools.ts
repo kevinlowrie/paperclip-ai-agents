@@ -225,6 +225,103 @@ const waitForIssueWorkspaceServiceSchema = z.object({
   timeoutSeconds: z.number().int().positive().max(300).optional(),
 });
 
+const developerTaskSchema = z.object({
+  task: z.string().trim().min(1).max(50000),
+  projectId: z.string().trim().max(128).optional().nullable(),
+  projectName: z.string().trim().max(256).optional().nullable(),
+  projectRequirements: z.array(z.string().trim().min(1).max(2000)).max(30).optional(),
+  repo: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/).optional().nullable(),
+  memoryNamespace: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/).optional().nullable(),
+  scopeHint: z.enum(["research", "plan", "small-code", "complex-code", "qa"]).optional(),
+  requestArtifactId: z.string().trim().max(256).optional().nullable(),
+  externalJobId: z.string().trim().min(1).max(128).optional().nullable(),
+  telegramContext: z.object({
+    bot_alias: z.enum(["hlab-n8n", "hlab-pclip"]),
+    chat_id: z.string().min(1).max(128),
+    message_id: z.string().max(128).optional().nullable(),
+    actor_id: z.string().max(128).optional().nullable(),
+    thread_id: z.string().max(128).optional().nullable(),
+  }).strict().optional().nullable(),
+  requestId: z.string().uuid().optional(),
+});
+
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required to route developer tasks`);
+  return value.replace(/\/+$/, "");
+}
+
+async function postJson(url: string, token: string | undefined, body: unknown) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const text = await response.text();
+  let payload: unknown;
+  try { payload = text ? JSON.parse(text) as unknown : null; } catch { payload = text; }
+  if (!response.ok) {
+    const detail = payload && typeof payload === "object" && "detail" in payload
+      ? String((payload as { detail: unknown }).detail)
+      : `HTTP ${response.status}`;
+    throw new Error(`Developer task routing failed: ${detail}`);
+  }
+  if (!payload || typeof payload !== "object") throw new Error("Developer task router returned an invalid response");
+  return payload as Record<string, unknown>;
+}
+
+async function routeDeveloperTask(input: z.infer<typeof developerTaskSchema>) {
+  const routerUrl = requiredEnv("PAPERCLIP_MODEL_ROUTER_URL");
+  const teamUrl = requiredEnv("PAPERCLIP_DEVELOPER_TEAM_URL");
+  const teamKey = process.env.PAPERCLIP_DEVELOPER_TEAM_KEY?.trim();
+  if (!teamKey) throw new Error("PAPERCLIP_DEVELOPER_TEAM_KEY is required to dispatch developer tasks");
+  const requestId = input.requestId ?? crypto.randomUUID();
+  const classified = await postJson(`${routerUrl}/paperclip/classify`, teamKey, {
+    task: input.task,
+    project_id: input.projectId ?? null,
+    project_name: input.projectName ?? null,
+    project_requirements: input.projectRequirements ?? [],
+    repo: input.repo ?? null,
+    memory_namespace: input.memoryNamespace ?? null,
+    scope_hint: input.scopeHint ?? null,
+    request_id: requestId,
+    external_job_id: input.externalJobId ?? null,
+  });
+  const request = classified.request as Record<string, unknown> | undefined;
+  const classification = classified.classification as Record<string, unknown> | undefined;
+  const accounting = classified.accounting as Record<string, unknown> | undefined;
+  if (!request || typeof classification?.scope !== "string") {
+    throw new Error("Developer task router returned an incomplete classification");
+  }
+  const dispatch = await postJson(`${teamUrl}/v1/jobs`, teamKey, {
+    scope: classification.scope,
+    prompt: input.task,
+    project_id: input.projectId ?? null,
+    project_requirements: input.projectRequirements ?? [],
+    repo: input.repo ?? null,
+    memory_namespace: input.memoryNamespace ?? null,
+    request_artifact_id: input.requestArtifactId ?? null,
+    external_job_id: input.externalJobId ?? null,
+    telegram_context: input.telegramContext ?? null,
+    request_id: requestId,
+  });
+  return {
+    request_id: requestId,
+    classification,
+    dispatch,
+    accounting: {
+      classification,
+      correlation: "request_id is shared by the classification and developer team job; worker-level LiteLLM spend tagging depends on adapter metadata support",
+      receipt: accounting ?? null,
+    },
+  };
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -270,6 +367,12 @@ async function getIssueWorkspaceRuntime(client: PaperclipApiClient, issueId: str
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
   return [
     makeTool(
+      "paperclipRouteDeveloperTask",
+      "Classify a Paperclip developer request with the LiteLLM-backed model router, then dispatch it to the configured Paperclip developer team. Supply project requirements so the router can select research, plan, small-code, complex-code, or QA. The shared request ID is returned for accounting reconciliation.",
+      developerTaskSchema,
+      routeDeveloperTask,
+    ),
+    makeTool(
       "connections_search",
       CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
       connectionsSearchInputSchema,
@@ -298,6 +401,42 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "Get the current authenticated agent inbox-lite assignment list",
       z.object({}),
       async () => client.requestJson("GET", "/agents/me/inbox-lite"),
+    ),
+    makeTool(
+      "paperclipMyTodos",
+      "Get the current agent's open assigned work and inbox items for personal todo/status questions",
+      z.object({}),
+      async () => {
+        const [agent, inbox] = await Promise.all([
+          client.requestJson("GET", "/agents/me") as Promise<Record<string, unknown>>,
+          client.requestJson("GET", "/agents/me/inbox-lite"),
+        ]);
+        const companyId = String(agent.companyId ?? "");
+        const agentId = String(agent.id ?? "");
+        if (!companyId || !agentId) throw new Error("Authenticated Paperclip agent identity is incomplete");
+        const params = new URLSearchParams({ assigneeAgentId: agentId });
+        const issues = await client.requestJson("GET", `/companies/${encodeURIComponent(companyId)}/issues?${params}`);
+        return { agent: { id: agentId, name: agent.name }, inbox, assigned_issues: issues };
+      },
+    ),
+    makeTool(
+      "paperclipDeveloperJobCost",
+      "Read the reconciled LiteLLM cost for one Paperclip developer job by UUID or external job label",
+      z.object({ jobId: z.string().trim().min(1).max(128).optional(), externalJobId: z.string().trim().min(1).max(128).optional() }).refine((value) => Boolean(value.jobId) !== Boolean(value.externalJobId), "Provide exactly one jobId or externalJobId"),
+      async ({ jobId, externalJobId }) => {
+        const routerUrl = requiredEnv("PAPERCLIP_MODEL_ROUTER_URL");
+        const teamKey = process.env.PAPERCLIP_DEVELOPER_TEAM_KEY?.trim();
+        if (!teamKey) throw new Error("PAPERCLIP_DEVELOPER_TEAM_KEY is required to read developer job cost");
+        const param = jobId ? `job_id=${encodeURIComponent(jobId)}` : `external_job_id=${encodeURIComponent(externalJobId!)}`;
+        const response = await fetch(`${routerUrl}/paperclip/cost?${param}`, {
+          headers: { Authorization: `Bearer ${teamKey}`, Accept: "application/json" },
+          signal: AbortSignal.timeout(30_000),
+        });
+        const text = await response.text();
+        const result = text ? JSON.parse(text) as unknown : null;
+        if (!response.ok) throw new Error(`Developer job cost lookup failed: HTTP ${response.status}`);
+        return result;
+      },
     ),
     makeTool(
       "paperclipListAgents",
