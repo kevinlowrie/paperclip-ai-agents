@@ -108,7 +108,10 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   targetIsRemote?: boolean;
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) {
+  // Provider setup is independent of tool permission policy. Credentials must be
+  // materialized server-side even when a sanitized child env cannot carry them.
+  const providerConfig = input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS;
+  if (!skipPermissions && !providerConfig?.trim()) {
     return {
       env: input.env,
       notes: [],
@@ -150,7 +153,9 @@ export async function prepareOpenCodeRuntimeConfig(input: {
 
   const existingConfig = await readJsonObject(runtimeConfigPath);
   const notes = [
-    "Injected runtime OpenCode config with permission=allow for all tools and connections.",
+    skipPermissions
+      ? "Injected runtime OpenCode config with permission=allow for all tools and connections."
+      : "Injected runtime OpenCode provider config without changing tool permissions.",
   ];
 
   // Merge gateway/custom provider definitions supplied via PAPERCLIP_OPENCODE_PROVIDERS
@@ -162,7 +167,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // hard-coded) so the gateway URL, key env, and model list stay declarative.
   const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
   const gatewayProviders = parseProviderConfig(
-    input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
+    providerConfig,
     resolveEnv,
     notes,
   );
@@ -204,7 +209,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
 
   const nextConfig: Record<string, unknown> = {
     ...existingConfig,
-    permission: "allow",
+    ...(skipPermissions ? { permission: "allow" } : {}),
   };
   if (Object.keys(nextProvider).length > 0) {
     nextConfig.provider = nextProvider;

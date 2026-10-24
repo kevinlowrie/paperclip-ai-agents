@@ -309,6 +309,37 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
+  it("injects gateway credentials without enabling permission skipping", async () => {
+    const permission = { read: "allow", bash: "ask", edit: "deny" };
+    const configHome = await makeConfigHome({ permission });
+    const keyName = "PAPERCLIP_TEST_GATEWAY_KEY";
+    process.env[keyName] = "fixture-gateway-marker";
+    const providers = {
+      litellm: {
+        npm: "@ai-sdk/openai-compatible",
+        options: { baseURL: "http://gateway.test/v1", apiKey: `{env:${keyName}}` },
+        models: { "luna-6": {} },
+      },
+    };
+    try {
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome, PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify(providers) },
+        config: { dangerouslySkipPermissions: false, model: "litellm/luna-6" },
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      const runtimeConfig = JSON.parse(await fs.readFile(
+        path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8",
+      ));
+      expect(runtimeConfig.permission).toEqual(permission);
+      expect(runtimeConfig.provider.litellm.options.apiKey).toBe("fixture-gateway-marker");
+      expect(prepared.env[keyName]).toBeUndefined();
+      expect(prepared.notes.some((n) => n.includes("permission=allow"))).toBe(false);
+      await prepared.cleanup();
+    } finally {
+      delete process.env[keyName];
+    }
+  });
+
   it("respects explicit opt-out", async () => {
     const configHome = await makeConfigHome();
     const prepared = await prepareOpenCodeRuntimeConfig({
