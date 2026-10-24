@@ -14,6 +14,12 @@ RUN usermod -u $USER_UID --non-unique node \
 
 FROM base AS deps
 WORKDIR /app
+# Native Node dependencies (for example ssh2's optional accelerator) run
+# node-gyp during install and need the build toolchain. Keep these packages in
+# this build-only stage; production is based on `base` and only copies /app.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential python3 \
+  && rm -rf /var/lib/apt/lists/*
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
 COPY cli/package.json cli/
 COPY server/package.json server/
@@ -162,6 +168,7 @@ RUN mkdir -p /provider-pack \
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
+ARG PAPERCLIP_SOURCE_FINGERPRINT=""
 # Refreshes the tool layer below when it changes (CI stamps an ISO week, so
 # the @latest CLI tools advance weekly). Without it the cached layer would
 # freeze the tools until an unrelated cache bust.
@@ -211,6 +218,7 @@ ENV NODE_ENV=production \
   PAPERCLIP_INSTANCE_ID=default \
   PAPERCLIP_BUILD_VERSION=${PAPERCLIP_BUILD_VERSION} \
   PAPERCLIP_BUILD_COMMIT=${PAPERCLIP_BUILD_COMMIT} \
+  PAPERCLIP_SOURCE_FINGERPRINT=${PAPERCLIP_SOURCE_FINGERPRINT} \
   USER_UID=${USER_UID} \
   USER_GID=${USER_GID} \
   PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
