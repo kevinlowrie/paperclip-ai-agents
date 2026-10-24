@@ -31,6 +31,9 @@ const groupPolicies = {
 // MCP names are retained only as traceability aliases into that contract; they
 // are not a second tool catalog and do not receive independent dispositions.
 const legacyMcpFoldTargets = {
+  paperclipRouteDeveloperTask: "eval:su-parent-goal-01",
+  paperclipMyTodos: "eval:hb-inbox-lite-01",
+  paperclipDeveloperJobCost: "eval:rf-api-mgr-heartbeat-01",
   paperclipMe: "eval:hb-inbox-lite-01",
   paperclipInboxLite: "eval:hb-inbox-lite-01",
   paperclipListAgents: "eval:rf-api-mgr-heartbeat-01",
@@ -247,7 +250,7 @@ export async function buildMcpInventory(repoRoot) {
 
 export function validateInventories(inventories) {
   const errors = [];
-  const expectedCounts = { capabilities: 157, evaluations: 106, legacyMcpAliases: 42 };
+  const expectedCounts = { capabilities: 157, evaluations: 106, legacyMcpAliases: 45 };
   const normativeNames = ["capabilities", "evaluations"];
   const normativeRows = new Map();
   const globalNormativeIds = new Set();

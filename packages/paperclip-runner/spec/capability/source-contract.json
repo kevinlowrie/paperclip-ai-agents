@@ -12,6 +12,9 @@
     "skills/paperclip/references/workflows.md"
   ],
   "toolMappings": {
+    "paperclipRouteDeveloperTask": ["optional_agent_tool", "dispatch_developer_task"],
+    "paperclipMyTodos": ["always_agent_tool", "list_assigned_work"],
+    "paperclipDeveloperJobCost": ["optional_agent_tool", "get_job_cost"],
     "paperclipMe": ["control_plane_owned", "injected_actor_context"],
     "paperclipInboxLite": ["control_plane_owned", "runner_work_selection"],
     "paperclipListAgents": ["optional_agent_tool", "list_agents"],
