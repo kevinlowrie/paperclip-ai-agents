@@ -99,6 +99,17 @@ function transportDriverIdentity(input: NativeExecutionInput): {
   }
 }
 
+export function nativeCodexProviderEnvironment(
+  input: NativeExecutionInput,
+  environment?: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv | undefined {
+  const effective = environment ?? process.env;
+  if (input.provider.kind !== "codex" || !effective.PAPERCLIP_CODEX_PROVIDERS) {
+    return environment;
+  }
+  return { ...effective, PAPERCLIP_RUN_ID: input.binding.runId };
+}
+
 function createTransportBackedNativeSessionBackend(
   input: NativeExecutionInput,
   options: CodexNativeSessionBackendOptions,
@@ -182,7 +193,7 @@ function createTransportBackedNativeSessionBackend(
       dynamicTools: options.dynamicTools,
       dynamicToolHandler: options.dynamicToolHandler,
       completionFeedback: options.completionFeedback,
-      environment: options.environment,
+      environment: nativeCodexProviderEnvironment(input, options.environment),
       workingDirectoryAuthority: options.workingDirectoryAuthority,
       driverIdentity,
       capabilities: isCodex

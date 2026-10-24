@@ -12,6 +12,38 @@ import {
 } from "./codex-security-config.js";
 
 describe("Codex security configuration", () => {
+  it("routes Paperclip Runner Codex through the scoped LiteLLM Responses provider", () => {
+    const source = {
+      PAPERCLIP_CODEX_PROVIDERS: JSON.stringify({
+        model_provider: "litellm-responses",
+        providers: {
+          "litellm-responses": {
+            base_url: "http://litellm:4000/v1",
+            env_key: "PAPERCLIP_CODEX_LITELLM_KEY",
+            wire_api: "responses",
+          },
+        },
+      }),
+      PAPERCLIP_CODEX_LITELLM_KEY: "secret-must-not-enter-argv",
+      PAPERCLIP_RUN_ID: "run-123",
+    };
+    const args = createIsolatedCodexAppServerArgs(source).join("\n");
+
+    expect(args).toContain('model_provider="litellm-responses"');
+    expect(args).toContain('model_providers.litellm-responses.base_url="http://litellm:4000/v1"');
+    expect(args).toContain('model_providers.litellm-responses.env_key="PAPERCLIP_CODEX_LITELLM_KEY"');
+    expect(args).toContain('model_providers.litellm-responses.wire_api="responses"');
+    expect(args).toContain('"x-litellm-session-id"="PAPERCLIP_RUN_ID"');
+    expect(args).not.toContain("secret-must-not-enter-argv");
+    expect(args).not.toContain("run-123");
+  });
+
+  it("fails closed when an enabled LiteLLM provider map is malformed or unscoped", () => {
+    expect(() => createIsolatedCodexAppServerArgs({
+      PAPERCLIP_CODEX_PROVIDERS: JSON.stringify({ model_provider: "openai" }),
+    })).toThrow("paperclip_runner_codex_litellm_route_not_ready");
+  });
+
   it("allows only the registered private instruction directory while keeping shared context read-only", () => {
     const args = createIsolatedCodexAppServerArgs({ HOME: "/host/home" }, ["/runtime/immutable-context"], "/runtime/instruction-edits/run-1").join("\n");
     expect(args).toContain('"/runtime/instruction-edits/run-1"="write"');

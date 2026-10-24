@@ -166,6 +166,54 @@ function tomlString(value: string): string {
   return JSON.stringify(value);
 }
 
+function paperclipLiteLLMProviderArgs(source: NodeJS.ProcessEnv): string[] {
+  const raw = source.PAPERCLIP_CODEX_PROVIDERS?.trim();
+  if (!raw) return [];
+  let config: unknown;
+  try {
+    config = JSON.parse(raw);
+  } catch {
+    throw new Error("paperclip_runner_codex_litellm_config_invalid");
+  }
+  if (typeof config !== "object" || config === null) {
+    throw new Error("paperclip_runner_codex_litellm_config_invalid");
+  }
+  const root = config as Record<string, unknown>;
+  const providers = root.providers;
+  const provider = typeof providers === "object" && providers !== null
+    ? (providers as Record<string, unknown>)["litellm-responses"]
+    : undefined;
+  const route = typeof provider === "object" && provider !== null
+    ? provider as Record<string, unknown>
+    : undefined;
+  const baseUrl = typeof route?.base_url === "string" ? route.base_url : "";
+  let parsedUrl: URL | null = null;
+  try { parsedUrl = new URL(baseUrl); } catch { /* fail closed below */ }
+  if (
+    root.model_provider !== "litellm-responses"
+    || route?.env_key !== "PAPERCLIP_CODEX_LITELLM_KEY"
+    || route?.wire_api !== "responses"
+    || parsedUrl?.protocol !== "http:"
+    || parsedUrl.hostname !== "litellm"
+    || parsedUrl.port !== "4000"
+    || parsedUrl.pathname !== "/v1"
+    || !source.PAPERCLIP_CODEX_LITELLM_KEY
+    || !source.PAPERCLIP_RUN_ID
+  ) {
+    throw new Error("paperclip_runner_codex_litellm_route_not_ready");
+  }
+  const prefix = "model_providers.litellm-responses";
+  return [
+    "-c", 'model_provider="litellm-responses"',
+    "-c", `${prefix}.name="LiteLLM (ChatGPT subscription)"`,
+    "-c", `${prefix}.base_url="http://litellm:4000/v1"`,
+    "-c", `${prefix}.env_key="PAPERCLIP_CODEX_LITELLM_KEY"`,
+    "-c", `${prefix}.wire_api="responses"`,
+    "-c", `${prefix}.http_headers={"x-litellm-tags"="source:paperclip,adapter:paperclip_runner"}`,
+    "-c", `${prefix}.env_http_headers={"x-litellm-session-id"="PAPERCLIP_RUN_ID","x-litellm-end-user-id"="PAPERCLIP_RUN_ID"}`,
+  ];
+}
+
 export function createIsolatedCodexAppServerArgs(
   source: NodeJS.ProcessEnv = process.env,
   readOnlyRoots: string[] = [],
@@ -256,6 +304,7 @@ export function createIsolatedCodexAppServerArgs(
     ...(commandEnv.length > 0
       ? ["-c", `shell_environment_policy.set={${commandEnv}}`]
       : []),
+    ...paperclipLiteLLMProviderArgs(source),
     "--disable",
     "image_generation",
     ...(externalRunnerSandbox

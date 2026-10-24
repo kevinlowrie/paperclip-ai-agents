@@ -31,7 +31,7 @@ import {
   WORKSPACE,
 } from "../drivers/codex/codex-app-server-driver.test-support.js";
 import { createNativeSessionBackend } from "../index.js";
-import { createCodexNativeSessionBackend } from "./codex-native-backend.js";
+import { createCodexNativeSessionBackend, nativeCodexProviderEnvironment } from "./codex-native-backend.js";
 import { createOpenCodeNativeSessionBackend } from "./opencode-native-backend.js";
 
 function execution(
@@ -243,6 +243,21 @@ function managedExecution(
 }
 
 describe("native backend factory", () => {
+  it("binds Codex gateway attribution to the authenticated native run", () => {
+    const input = execution();
+    const projected = nativeCodexProviderEnvironment(input, {
+      PAPERCLIP_CODEX_PROVIDERS: "{}",
+      PAPERCLIP_CODEX_LITELLM_KEY: "gateway-key",
+      OPENAI_API_KEY: "must-not-cross",
+    });
+    expect(projected).toMatchObject({
+      PAPERCLIP_CODEX_PROVIDERS: "{}",
+      PAPERCLIP_CODEX_LITELLM_KEY: "gateway-key",
+      PAPERCLIP_RUN_ID: "run",
+    });
+    expect(projected?.OPENAI_API_KEY).toBe("must-not-cross");
+  });
+
   it("constructs the Codex backend without starting its transport", async () => {
     const backend = createNativeSessionBackend(execution(), {
       codexTransportFactory: () => {

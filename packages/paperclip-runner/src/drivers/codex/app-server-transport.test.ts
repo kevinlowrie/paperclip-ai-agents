@@ -52,6 +52,20 @@ describe("Codex app-server transport limits", () => {
     expect(invalid.GIT_CONFIG_KEY_0).toBeUndefined();
   });
 
+  it("projects only the scoped LiteLLM key and authenticated run ID to Codex app-server", () => {
+    expect(createSanitizedCodexEnvironment({
+      PATH: "/safe/bin",
+      PAPERCLIP_CODEX_LITELLM_KEY: "gateway-key",
+      PAPERCLIP_RUN_ID: "run-123",
+      OPENAI_API_KEY: "must-not-cross",
+      PAPERCLIP_API_KEY: "must-not-cross-either",
+    })).toEqual({
+      PATH: "/safe/bin",
+      PAPERCLIP_CODEX_LITELLM_KEY: "gateway-key",
+      PAPERCLIP_RUN_ID: "run-123",
+    });
+  });
+
   it("redacts real Basic credentials without corrupting ordinary question copy", () => {
     expect(redactCodexDiagnostic("Authorization: Basic dXNlcjpwYXNz"))
       .toBe("Authorization: Basic [REDACTED]");
