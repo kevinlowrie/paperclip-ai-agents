@@ -22,6 +22,21 @@ export interface SshEnvironmentConfig {
   strictHostKeyChecking: boolean;
 }
 
+/**
+ * Proposed lifecycle-backed SSH configuration. A trusted run controller, rather
+ * than an environment record, supplies the per-run endpoint and credentials.
+ * The runtime does not accept this mode until lease and target resolution are
+ * wired to a durable controller receipt.
+ */
+export interface LifecycleSshEnvironmentConfig {
+  mode: "lifecycle";
+  version: "ssh-lifecycle/v1";
+  /** Name of an operator-provisioned controller, never a caller-supplied URL. */
+  controllerRef: string;
+  /** Identity is derived from trusted Paperclip run context, not the caller. */
+  operationIdentitySource: "company_environment_agent_heartbeat";
+}
+
 export type SandboxEnvironmentProvider = "fake" | (string & {});
 
 export interface FakeSandboxEnvironmentConfig {
