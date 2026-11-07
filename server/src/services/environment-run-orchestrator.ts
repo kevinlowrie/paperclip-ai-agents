@@ -491,11 +491,16 @@ export function environmentRunOrchestrator(
       }
     }
 
+    const realizedRemoteCwd = ENVIRONMENT_DRIVER_TRAITS[environment.driver].runsWorkspaceOffHost
+      ? realizedWorkspaceCwd
+      : null;
+
     // Step 3: Persist realization metadata on lease and execution workspace
     if (Object.keys(workspaceRealization).length > 0) {
       const nextLeaseMetadata = {
         ...(lease.metadata ?? {}),
         workspaceRealization,
+        ...(realizedRemoteCwd ? { remoteCwd: realizedRemoteCwd } : {}),
       };
       const updatedLease = await environmentsSvc.updateLeaseMetadata(lease.id, nextLeaseMetadata);
       if (updatedLease) {

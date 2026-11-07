@@ -1,4 +1,37 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+const {
+  makeKubeClients,
+  waitForSandbox,
+  findSandboxPod,
+  performSyncIn,
+} = vi.hoisted(() => ({
+  makeKubeClients: vi.fn(() => ({})),
+  waitForSandbox: vi.fn().mockResolvedValue(undefined),
+  findSandboxPod: vi.fn().mockResolvedValue("agent-pod"),
+  performSyncIn: vi.fn().mockResolvedValue({ operations: [] }),
+}));
+
+vi.mock("../../src/kube-client.js", () => ({
+  createKubeConfig: vi.fn(() => ({})),
+  makeKubeClients,
+}));
+vi.mock("../../src/sandbox-cr-orchestrator.js", () => ({
+  sandboxCrOrchestrator: {
+    waitForCompletion: waitForSandbox,
+    findPod: findSandboxPod,
+  },
+}));
+vi.mock("../../src/file-sync.js", () => ({
+  performSyncIn,
+  performSyncOut: vi.fn(),
+}));
+vi.mock("../../src/pod-exec.js", () => ({
+  execInPod: vi.fn(),
+  execInPodStreaming: vi.fn(),
+  wrapCommandWithEnv: vi.fn(),
+}));
+
 import plugin from "../../src/plugin.js";
 
 describe("plugin", () => {
@@ -111,6 +144,50 @@ describe("plugin", () => {
         operations: [],
       }),
     ).rejects.toThrow(/workspace remote dir/);
+  });
+
+  it("uses the realized custom remote cwd for native file sync", async () => {
+    const realized = await plugin.definition.onEnvironmentRealizeWorkspace!({
+      driverKey: "kubernetes",
+      companyId: "co",
+      environmentId: "env",
+      config: { inCluster: true },
+      lease: {
+        providerLeaseId: "lease-1",
+        metadata: {
+          backend: "sandbox-cr",
+          namespace: "paperclip-co",
+          podName: "agent-pod",
+        },
+      },
+      workspace: { remotePath: "/workspace/custom-project" },
+    });
+
+    await plugin.definition.onEnvironmentSyncIn!({
+      driverKey: "kubernetes",
+      companyId: "co",
+      environmentId: "env",
+      config: { inCluster: true },
+      lease: {
+        providerLeaseId: "lease-1",
+        metadata: {
+          backend: "sandbox-cr",
+          namespace: "paperclip-co",
+          podName: "agent-pod",
+          remoteCwd: realized.cwd,
+        },
+      },
+      operations: [],
+    });
+
+    expect(realized).toMatchObject({
+      cwd: "/workspace/custom-project",
+      metadata: { remoteCwd: "/workspace/custom-project" },
+    });
+    expect(waitForSandbox).toHaveBeenCalledOnce();
+    expect(performSyncIn).toHaveBeenCalledWith(
+      expect.objectContaining({ remoteDir: "/workspace/custom-project" }),
+    );
   });
 
   it("file sync rejects the job backend (out of scope; sandbox-cr only)", async () => {

@@ -431,6 +431,60 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(result.persistedExecutionWorkspace).toEqual(updatedEw);
   });
 
+  it("persists the realized remote cwd on the lease for subsequent provider sync", async () => {
+    const remoteCwd = "/workspace/custom-project";
+    const updatedLease = makeLease({
+      metadata: {
+        remoteCwd,
+        workspaceRealization: { version: 1, driver: "sandbox", cwd: remoteCwd },
+      },
+    });
+    mockUpdateLeaseMetadata.mockResolvedValue(updatedLease);
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd,
+    });
+
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: remoteCwd,
+        metadata: {
+          workspaceRealization: {
+            version: 1,
+            mode: "copy",
+            authoritativeRoot: remoteCwd,
+            pathAliases: [],
+            outboundRestorePaths: [],
+            driver: "sandbox",
+          },
+        },
+      }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    const result = await orchestrator.realizeForRun(
+      makeRealizeInput({
+        environment: makeEnvironment("sandbox"),
+        lease: makeLease({ metadata: { backend: "sandbox-cr", provider: "kubernetes" } }),
+      }),
+    );
+
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
+      "lease-1",
+      expect.objectContaining({ remoteCwd }),
+    );
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leaseMetadata: expect.objectContaining({ remoteCwd }),
+        lease: expect.objectContaining({
+          metadata: expect.objectContaining({ remoteCwd }),
+        }),
+      }),
+    );
+    expect(result.lease.metadata).toMatchObject({ remoteCwd });
+  });
+
   it("runs a remote provision command after workspace realization when configured", async () => {
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,
