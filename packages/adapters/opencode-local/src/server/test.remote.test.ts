@@ -157,6 +157,18 @@ describe("opencode remote environment diagnostics", () => {
     const probeCall = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as
       | [string, AdapterExecutionTarget, string, string[], { cwd: string; env: Record<string, string> }]
       | undefined;
+    const directoryOptions = (ensureAdapterExecutionTargetDirectory.mock.calls as unknown as unknown[][])[0]?.[3] as
+      | { env?: Record<string, string> }
+      | undefined;
+    const installOptions = (maybeRunSandboxInstallCommand.mock.calls as unknown as unknown[][])[0]?.[0] as
+      | { env?: Record<string, string> }
+      | undefined;
+    const resolutionEnv = (ensureAdapterExecutionTargetCommandResolvable.mock.calls as unknown as unknown[][])[0]?.[3] as
+      | Record<string, string>
+      | undefined;
+    expect(directoryOptions?.env?.SCOPED_PROVIDER_KEY).toBeUndefined();
+    expect(installOptions?.env?.SCOPED_PROVIDER_KEY).toBeUndefined();
+    expect(resolutionEnv?.SCOPED_PROVIDER_KEY).toBeUndefined();
     expect(probeCall?.[4].cwd).toBe("/remote/workspace/.paperclip-runtime/runs/test/workspace");
     if (managed) {
       expect(probeCall?.[4].env.HOME).toContain("/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/home/");
