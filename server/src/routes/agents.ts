@@ -1466,6 +1466,21 @@ export function agentRoutes(
         realizedCwd
           ? { ...(leaseRecord.lease.metadata ?? {}), remoteCwd: realizedCwd }
           : (leaseRecord.lease.metadata as Record<string, unknown> | null) ?? null;
+      let leaseForTarget = leaseRecord.lease;
+      if (realizedCwd) {
+        // Provider target resolution (including native file sync) reads the
+        // workspace path from the lease itself. Persist the realized value and
+        // pass the updated lease, matching normal run orchestration.
+        const updatedLease = await environmentsSvc.updateLeaseMetadata(
+          leaseRecord.lease.id,
+          leaseMetadataForTarget,
+        );
+        if (!updatedLease || updatedLease.metadata?.remoteCwd !== realizedCwd) {
+          throw new Error("Could not persist the realized workspace path for the test lease.");
+        }
+        leaseRecord = { ...leaseRecord, lease: updatedLease };
+        leaseForTarget = updatedLease;
+      }
 
       target = await resolveEnvironmentExecutionTarget({
         db,
@@ -1477,8 +1492,9 @@ export function agentRoutes(
           config: testEnvironment.config ?? null,
         },
         leaseId: leaseRecord.lease.id,
-        leaseMetadata: leaseMetadataForTarget,
-        lease: leaseRecord.lease,
+        leaseMetadata:
+          (leaseForTarget.metadata as Record<string, unknown> | null) ?? leaseMetadataForTarget,
+        lease: leaseForTarget,
         environmentRuntime,
       });
     } catch (err) {

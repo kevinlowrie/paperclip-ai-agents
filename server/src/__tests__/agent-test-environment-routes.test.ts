@@ -29,6 +29,7 @@ const mockSecretService = vi.hoisted(() => ({
 
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
+  updateLeaseMetadata: vi.fn(),
   releaseLease: vi.fn(),
   listBoundCompanyIds: vi.fn(async () => [] as string[]),
   findManagedSandboxEnvironment: vi.fn(async () => null as Record<string, unknown> | null),
@@ -190,6 +191,14 @@ describe("agent test-environment route", () => {
     mockInstanceSettingsService.get.mockResolvedValue({ defaultEnvironmentId: null });
     mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableManagedSandboxOnly: false });
     mockEnvironmentService.findManagedSandboxEnvironment.mockResolvedValue(null);
+    mockEnvironmentService.updateLeaseMetadata.mockImplementation(
+      async (id: string, metadata: Record<string, unknown> | null) => ({
+        id,
+        provider: "daytona",
+        providerLeaseId: "provider-lease-1",
+        metadata,
+      }),
+    );
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       reason: "allow_explicit_grant",
@@ -594,6 +603,9 @@ describe("agent test-environment route", () => {
   });
 
   it("runs the adapter probe against the resolved sandbox target on the happy path and releases the lease on success", async () => {
+    mockEnvironmentRuntime.realizeWorkspace.mockResolvedValueOnce({
+      cwd: "/home/user/realized-test-workspace",
+    });
     mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({
       kind: "remote",
       transport: "sandbox",
@@ -624,6 +636,23 @@ describe("agent test-environment route", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(testEnvironmentSpy).toHaveBeenCalledTimes(1);
+    const realizedMetadata = {
+      remoteCwd: "/home/user/realized-test-workspace",
+      sandboxId: "sandbox-1",
+      sandboxName: "paperclip-probe",
+      templateKind: "snapshot",
+      templateRef: "snapshot-1",
+    };
+    expect(mockEnvironmentService.updateLeaseMetadata).toHaveBeenCalledWith(
+      "lease-1",
+      realizedMetadata,
+    );
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lease: expect.objectContaining({ id: "lease-1", metadata: realizedMetadata }),
+        leaseMetadata: realizedMetadata,
+      }),
+    );
     // Test leases boot fresh and stay debuggable: never resume a retained
     // agent lease, archive (not delete) the sandbox on release.
     expect(mockEnvironmentRuntime.acquireRunLease).toHaveBeenCalledWith(
@@ -668,7 +697,7 @@ describe("agent test-environment route", () => {
     expect(res.body.checks[0].detail).toContain("snapshotRef=snapshot-1");
     expect(mockReleaseRunLease).toHaveBeenCalledWith({
       environment: expect.objectContaining({ id: "11111111-1111-4111-8111-111111111111" }),
-      lease: expect.objectContaining({ id: "lease-1" }),
+      lease: expect.objectContaining({ id: "lease-1", metadata: realizedMetadata }),
       status: "released",
     });
   });
