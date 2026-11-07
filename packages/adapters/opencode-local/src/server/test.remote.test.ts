@@ -73,6 +73,22 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 
 import { testEnvironment } from "./test.js";
 
+const TEST_CA_PEM = `-----BEGIN CERTIFICATE-----
+MIICFDCCAX2gAwIBAgIUbAcXH/gLdZYHDyCg5uD9QkoU6dIwDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQT3BlbkNvZGUgdGVzdCBDQTAgFw0yNjExMDcyMTUzNDla
+GA8yMTI2MTAxNDIxNTM0OVowGzEZMBcGA1UEAwwQT3BlbkNvZGUgdGVzdCBDQTCB
+nzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEAt6JhKkjqhmQqsAVduWHKAjedHpgq
+mq9V64pHCUqCAQY1+iwLuk8y7Z7vVvEtYmwylbRX9fHpb1dvcd6bdvotPiCGErxQ
+C5FcoQZcOp4NX/CfMzHhrV4T5Gun5UDENjiF5JMTeASEOB2fXO9xIi2SQz88lLH6
+Zu2dah78veBx4pMCAwEAAaNTMFEwHQYDVR0OBBYEFMA2LZmKGJhTf6LFANr/inEa
+gZs5MB8GA1UdIwQYMBaAFMA2LZmKGJhTf6LFANr/inEagZs5MA8GA1UdEwEB/wQF
+MAMBAf8wDQYJKoZIhvcNAQELBQADgYEAs+N7JG+Sj0YZllh7Qb1vKxTb1WBxz6VW
+pj3iscD8veHT1r5Q9Qhh9fU+n2NrcOh6HxXrmRDoj18iVNxvRXxMmJ19ovzhXfxg
+SGOiW1iUdiPtY5hNAiORBB4f+Fo7ReTP2S8JyFqy6U682uE1YxyjwElrotZjKXWv
+nvUmXExeOTA=
+-----END CERTIFICATE-----
+`;
+
 describe("opencode remote environment diagnostics", () => {
   const configHomes: string[] = [];
   let configHome: string;
@@ -219,6 +235,90 @@ describe("opencode remote environment diagnostics", () => {
     }));
     expect(prepareAdapterExecutionTargetRuntime).not.toHaveBeenCalled();
     expect(ensureAdapterExecutionTargetDirectory).not.toHaveBeenCalled();
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+    expect(remoteExecute).not.toHaveBeenCalled();
+  });
+
+  it("stages and reapplies remote additive trust after env setup, and fails closed when staging omits xdgConfig", async () => {
+    const remoteTarget: AdapterExecutionTarget = {
+      kind: "remote", transport: "sandbox", providerKey: "cloudflare", remoteCwd: "/remote/workspace",
+      runner: { execute: vi.fn(async () => ({
+        exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null,
+        startedAt: new Date().toISOString(),
+      })) },
+    };
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "opencode_local",
+      config: {
+        command: "opencode",
+        model: "anthropic/claude-sonnet-4-5",
+        trustedCaPem: TEST_CA_PEM,
+        env: {
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            anthropic: {
+              options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" },
+              models: { "claude-sonnet-4-5": {} },
+            },
+          }),
+          SCOPED_PROVIDER_KEY: "fixture-scoped-key",
+          SSL_CERT_FILE: "/host/replace.pem",
+          SSL_CERT_DIR: "/host/certs",
+          REQUESTS_CA_BUNDLE: "/host/requests.pem",
+          NODE_OPTIONS: "--use-openssl-ca",
+          NODE_TLS_REJECT_UNAUTHORIZED: "0",
+          OPENSSL_CONF: "/host/openssl.cnf",
+        },
+      },
+      executionTarget: remoteTarget,
+    });
+
+    expect(result.status).toBe("pass");
+    const runtimeInput = (prepareAdapterExecutionTargetRuntime.mock.calls as unknown as Array<[
+      { assets?: Array<{ key: string; localDir: string }> },
+    ]>)[0]?.[0];
+    const configAsset = runtimeInput?.assets?.find((asset) => asset.key === "xdgConfig");
+    expect(configAsset?.localDir).toBeDefined();
+    const probeCall = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as
+      | [string, AdapterExecutionTarget, string, string[], { env: Record<string, string> }]
+      | undefined;
+    expect(probeCall?.[4].env.NODE_EXTRA_CA_CERTS).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/xdgConfig/trust/ca.pem",
+    );
+    for (const name of ["SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_OPTIONS", "NODE_TLS_REJECT_UNAUTHORIZED", "OPENSSL_CONF"]) {
+      expect(probeCall?.[4].env[name]).toBeUndefined();
+    }
+
+    const remoteExecute = remoteTarget.runner?.execute;
+    prepareAdapterExecutionTargetRuntime.mockImplementationOnce(async () => ({
+      target: null,
+      workspaceRemoteDir: "/remote/workspace/.paperclip-runtime/runs/test/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode",
+      assetDirs: {},
+      restoreWorkspace: vi.fn(async () => {}),
+    }) as never);
+    runAdapterExecutionTargetProcess.mockClear();
+    const missingAsset = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "opencode_local",
+      config: {
+        command: "opencode",
+        model: "anthropic/claude-sonnet-4-5",
+        trustedCaPem: TEST_CA_PEM,
+        env: {
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            anthropic: { options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" }, models: { "claude-sonnet-4-5": {} } },
+          }),
+          SCOPED_PROVIDER_KEY: "fixture-scoped-key",
+        },
+      },
+      executionTarget: remoteTarget,
+    });
+    expect(missingAsset.status).toBe("fail");
+    expect(missingAsset.checks).toContainEqual(expect.objectContaining({
+      code: "opencode_remote_trust_stage_failed",
+      level: "error",
+    }));
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
     expect(remoteExecute).not.toHaveBeenCalled();
   });

@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { X509Certificate } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
@@ -6,9 +7,73 @@ import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
   credentialEnv?: Record<string, string>;
+  trustedCaRelativePath?: string;
   notes: string[];
   cleanup: () => Promise<void>;
 };
+
+const REMOTE_TRUST_MAX_BYTES = 64 * 1024;
+const REMOTE_TRUST_MAX_CERTIFICATES = 8;
+const REMOTE_TRUST_CONFLICTING_ENV = [
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "REQUESTS_CA_BUNDLE",
+  "CURL_CA_BUNDLE",
+  "NODE_OPTIONS",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+  "OPENSSL_CONF",
+  "OPENSSL_MODULES",
+  "SSLKEYLOGFILE",
+  "NODE_EXTRA_CA_CERTS",
+];
+
+export function validateOpenCodeRemoteTrustedCaPem(value: unknown, now = new Date()): string {
+  if (typeof value !== "string" || Buffer.byteLength(value, "utf8") === 0) {
+    throw new Error("Remote OpenCode trusted CA bundle must be a non-empty PEM string.");
+  }
+  if (Buffer.byteLength(value, "utf8") > REMOTE_TRUST_MAX_BYTES) {
+    throw new Error("Remote OpenCode trusted CA bundle exceeds size limit.");
+  }
+  const matches = [...value.matchAll(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g)];
+  if (matches.length === 0 || matches.length > REMOTE_TRUST_MAX_CERTIFICATES) {
+    throw new Error("Remote OpenCode trusted CA bundle exceeds certificate limit or has no certificates.");
+  }
+  const remainder = value.replace(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g, "");
+  if (remainder.trim().length > 0) {
+    throw new Error("Remote OpenCode trusted CA bundle must contain only CA PEM certificate blocks and whitespace.");
+  }
+  for (const match of matches) {
+    let certificate: X509Certificate;
+    try {
+      certificate = new X509Certificate(match[0]);
+    } catch {
+      throw new Error("Remote OpenCode trusted CA bundle contains an invalid certificate.");
+    }
+    if (!certificate.ca) {
+      throw new Error("Remote OpenCode trusted CA bundle contains a certificate that is not a CA.");
+    }
+    const validFrom = Date.parse(certificate.validFrom);
+    const validTo = Date.parse(certificate.validTo);
+    const timestamp = now.getTime();
+    if (timestamp < validFrom) throw new Error("Remote OpenCode trusted CA certificate is not yet valid.");
+    if (timestamp > validTo) throw new Error("Remote OpenCode trusted CA certificate has expired.");
+  }
+  return value.endsWith("\n") ? value : `${value}\n`;
+}
+
+/** Apply a staged remote CA using Node's additive system-root trust behavior. */
+export function configureOpenCodeRemoteTrustedCa(input: {
+  env: Record<string, string>;
+  relativePath?: string;
+  stagedXdgConfigHome?: string;
+}): void {
+  if (!input.relativePath) return;
+  if (!input.stagedXdgConfigHome) {
+    throw new Error("Remote OpenCode trust asset was not staged.");
+  }
+  for (const name of REMOTE_TRUST_CONFLICTING_ENV) delete input.env[name];
+  input.env.NODE_EXTRA_CA_CERTS = path.posix.join(input.stagedXdgConfigHome, input.relativePath);
+}
 
 function resolveXdgConfigHome(env: Record<string, string>): string {
   return (
@@ -255,6 +320,10 @@ async function prepareRemoteOpenCodeRuntimeConfig(
     throw new Error("Remote OpenCode requires an explicit provider profile.");
   }
   const notes: string[] = [];
+  const trustedCaConfigured = Object.prototype.hasOwnProperty.call(input.config, "trustedCaPem");
+  const trustedCaPem = trustedCaConfigured
+    ? validateOpenCodeRemoteTrustedCaPem(input.config.trustedCaPem)
+    : undefined;
   const providers = parseProviderConfig(providerConfig, () => undefined, notes);
   const configuredSmallModel = input.env.PAPERCLIP_OPENCODE_SMALL_MODEL?.trim();
   const smallModelRef = configuredSmallModel
@@ -309,15 +378,29 @@ async function prepareRemoteOpenCodeRuntimeConfig(
   }
   const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-config-"));
   const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
-  await fs.mkdir(runtimeConfigDir, { recursive: true });
-  await fs.writeFile(path.join(runtimeConfigDir, "opencode.json"), `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+  try {
+    await fs.mkdir(runtimeConfigDir, { recursive: true });
+    await fs.writeFile(path.join(runtimeConfigDir, "opencode.json"), `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+    if (trustedCaPem) {
+      const trustDir = path.join(runtimeConfigHome, "trust");
+      await fs.mkdir(trustDir, { recursive: true });
+      await fs.writeFile(path.join(trustDir, "ca.pem"), trustedCaPem, { encoding: "utf8", mode: 0o600 });
+    }
+  } catch (err) {
+    await fs.rm(runtimeConfigHome, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
   const runtimeEnv = { ...input.env };
   delete runtimeEnv.PAPERCLIP_OPENCODE_PROVIDERS;
   delete runtimeEnv.PAPERCLIP_OPENCODE_SMALL_MODEL;
+  if (trustedCaPem) {
+    for (const name of REMOTE_TRUST_CONFLICTING_ENV) delete runtimeEnv[name];
+  }
   for (const name of Object.keys(credentialEnv)) delete runtimeEnv[name];
   return {
     env: { ...runtimeEnv, XDG_CONFIG_HOME: runtimeConfigHome },
     credentialEnv,
+    ...(trustedCaPem ? { trustedCaRelativePath: "trust/ca.pem" } : {}),
     notes: ["Created an isolated remote OpenCode config from the selected run provider/model."],
     cleanup: async () => fs.rm(runtimeConfigHome, { recursive: true, force: true }),
   };

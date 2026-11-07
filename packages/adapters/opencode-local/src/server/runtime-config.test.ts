@@ -2,7 +2,43 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import {
+  configureOpenCodeRemoteTrustedCa,
+  prepareOpenCodeRuntimeConfig,
+  validateOpenCodeRemoteTrustedCaPem,
+} from "./runtime-config.js";
+
+const TEST_CA_PEM = `-----BEGIN CERTIFICATE-----
+MIICFDCCAX2gAwIBAgIUbAcXH/gLdZYHDyCg5uD9QkoU6dIwDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQT3BlbkNvZGUgdGVzdCBDQTAgFw0yNjExMDcyMTUzNDla
+GA8yMTI2MTAxNDIxNTM0OVowGzEZMBcGA1UEAwwQT3BlbkNvZGUgdGVzdCBDQTCB
+nzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEAt6JhKkjqhmQqsAVduWHKAjedHpgq
+mq9V64pHCUqCAQY1+iwLuk8y7Z7vVvEtYmwylbRX9fHpb1dvcd6bdvotPiCGErxQ
+C5FcoQZcOp4NX/CfMzHhrV4T5Gun5UDENjiF5JMTeASEOB2fXO9xIi2SQz88lLH6
+Zu2dah78veBx4pMCAwEAAaNTMFEwHQYDVR0OBBYEFMA2LZmKGJhTf6LFANr/inEa
+gZs5MB8GA1UdIwQYMBaAFMA2LZmKGJhTf6LFANr/inEagZs5MA8GA1UdEwEB/wQF
+MAMBAf8wDQYJKoZIhvcNAQELBQADgYEAs+N7JG+Sj0YZllh7Qb1vKxTb1WBxz6VW
+pj3iscD8veHT1r5Q9Qhh9fU+n2NrcOh6HxXrmRDoj18iVNxvRXxMmJ19ovzhXfxg
+SGOiW1iUdiPtY5hNAiORBB4f+Fo7ReTP2S8JyFqy6U682uE1YxyjwElrotZjKXWv
+nvUmXExeOTA=
+-----END CERTIFICATE-----
+`;
+
+const TEST_LEAF_PEM = `-----BEGIN CERTIFICATE-----
+MIICFTCCAX6gAwIBAgIUfH5kBzQV9n4YHNd1SfngcCwfl1UwDQYJKoZIhvcNAQEL
+BQAwHTEbMBkGA1UEAwwST3BlbkNvZGUgdGVzdCBsZWFmMCAXDTI2MTEwNzIxNTM1
+NVoYDzIxMjYxMDE0MjE1MzU1WjAdMRswGQYDVQQDDBJPcGVuQ29kZSB0ZXN0IGxl
+YWYwgZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBANHAdcvHoIpNdSuhbJ+6TXQr
+UpcXa99TskHueb0E1qG2fbNKDDgse1W2elxan+4sF5nHKVym57TpTFbpd1W83qdu
+IoqKyZis5bpfpo200DACTUaSTnPFpTLJfyq3ggo2P7PIDgHBHLq8CnKw5sTmBgqJ
+xeMAf3f/XumMZsfFCGb7AgMBAAGjUDBOMB0GA1UdDgQWBBQKhEWowUpj0ab3VodR
+XEcN7A/4OzAfBgNVHSMEGDAWgBQKhEWowUpj0ab3VodRXEcN7A/4OzAMBgNVHRMB
+Af8EAjAAMA0GCSqGSIb3DQEBCwUAA4GBAJmwpwOajazfOqnGHVhKPJUtYtAAcIfA
+xBe0M5hiFqv5UXjVZKAG69k+GBYdwKySoinH6NQlXYM5ABjC95vDL94X/fVxp1kh
+SzSxDzcV3ktir26Fj+ibGaoDOIrzOmDNUyS1M0ZcMCvKjcgYlO58gTL9q1idVKhi
+0Ne4H9KNXnFt
+-----END CERTIFICATE-----
+`;
 
 const cleanupPaths = new Set<string>();
 
@@ -31,6 +67,95 @@ async function makeConfigHome(initialConfig?: Record<string, unknown>) {
 }
 
 describe("prepareOpenCodeRuntimeConfig", () => {
+  it("stages only the public CA asset in an isolated remote config and adds its path to Node trust", async () => {
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: {
+        PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+          gateway: { options: { apiKey: "{env:SCOPED_KEY}" }, models: { model: {} } },
+        }),
+        SCOPED_KEY: "fixture-scoped-key",
+        SSL_CERT_FILE: "/host/replace-roots.pem",
+        SSL_CERT_DIR: "/host/cert-dir",
+        REQUESTS_CA_BUNDLE: "/host/request-roots.pem",
+        CURL_CA_BUNDLE: "/host/curl-roots.pem",
+        NODE_OPTIONS: "--use-openssl-ca --require /host/preload.js",
+        NODE_TLS_REJECT_UNAUTHORIZED: "0",
+        OPENSSL_CONF: "/host/openssl.cnf",
+        OPENSSL_MODULES: "/host/openssl-modules",
+        SSLKEYLOGFILE: "/host/tls.keys",
+      },
+      config: { model: "gateway/model", trustedCaPem: TEST_CA_PEM },
+      targetIsRemote: true,
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    expect(prepared.trustedCaRelativePath).toBe("trust/ca.pem");
+    expect(await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "trust", "ca.pem"), "utf8")).toBe(TEST_CA_PEM);
+    expect(prepared.env.NODE_EXTRA_CA_CERTS).toBeUndefined();
+    for (const name of [
+      "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+      "NODE_OPTIONS", "NODE_TLS_REJECT_UNAUTHORIZED", "OPENSSL_CONF", "OPENSSL_MODULES", "SSLKEYLOGFILE",
+    ]) {
+      expect(prepared.env[name]).toBeUndefined();
+    }
+    expect(prepared.credentialEnv?.SCOPED_KEY).toBe("fixture-scoped-key");
+    expect(await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"))
+      .not.toContain("fixture-scoped-key");
+
+    const childEnv = { ...prepared.env };
+    configureOpenCodeRemoteTrustedCa({
+      env: childEnv,
+      relativePath: prepared.trustedCaRelativePath,
+      stagedXdgConfigHome: "/remote/runtime/xdgConfig",
+    });
+    expect(childEnv.NODE_EXTRA_CA_CERTS).toBe("/remote/runtime/xdgConfig/trust/ca.pem");
+    expect(childEnv.SSL_CERT_FILE).toBeUndefined();
+    await prepared.cleanup();
+    cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
+  });
+
+  it.each([
+    ["private key blocks", `${TEST_CA_PEM}-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----`],
+    ["non-CA certificates", TEST_LEAF_PEM],
+    ["extra text", `untrusted prefix\n${TEST_CA_PEM}`],
+    ["malformed certificates", "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----"],
+  ])("rejects remote trusted CA material containing %s", async (_label, trustedCaPem) => {
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({ gateway: { options: { apiKey: "{env:KEY}" }, models: { model: {} } } }), KEY: "fixture" },
+      config: { model: "gateway/model", trustedCaPem },
+      targetIsRemote: true,
+    })).rejects.toThrow(/trusted CA|certificate|PEM/i);
+  });
+
+  it("rejects expired, not-yet-valid, oversized, and excessive remote CA bundles", () => {
+    expect(() => validateOpenCodeRemoteTrustedCaPem(TEST_CA_PEM, new Date("2200-01-01T00:00:00Z")))
+      .toThrow(/expired|validity/i);
+    expect(() => validateOpenCodeRemoteTrustedCaPem(TEST_CA_PEM, new Date("2000-01-01T00:00:00Z")))
+      .toThrow(/not yet valid|validity/i);
+    expect(() => validateOpenCodeRemoteTrustedCaPem(TEST_CA_PEM.repeat(800)))
+      .toThrow(/size limit/i);
+    expect(() => validateOpenCodeRemoteTrustedCaPem(Array(10).fill(TEST_CA_PEM).join("\n")))
+      .toThrow(/certificate limit/i);
+  });
+
+  it("requires the staged remote trust asset and leaves local profile behavior unchanged", async () => {
+    const env = { SSL_CERT_FILE: "/local/roots.pem", NODE_OPTIONS: "--trace-warnings" };
+    expect(() => configureOpenCodeRemoteTrustedCa({ env, relativePath: "trust/ca.pem" }))
+      .toThrow(/trust asset.*not staged/i);
+    expect(env).toEqual({ SSL_CERT_FILE: "/local/roots.pem", NODE_OPTIONS: "--trace-warnings" });
+
+    const configHome = await makeConfigHome({ theme: "local-profile" });
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, SSL_CERT_FILE: "/local/roots.pem", NODE_OPTIONS: "--trace-warnings" },
+      config: { trustedCaPem: TEST_CA_PEM },
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    expect(prepared.env.SSL_CERT_FILE).toBe("/local/roots.pem");
+    expect(prepared.env.NODE_OPTIONS).toBe("--trace-warnings");
+    await expect(fs.access(path.join(prepared.env.XDG_CONFIG_HOME, "trust", "ca.pem"))).rejects.toThrow();
+    await prepared.cleanup();
+  });
+
   it("builds a minimal remote profile from run declarations and keeps the scoped key as an env reference", async () => {
     const hostConfig = await makeConfigHome({
       theme: "host-only-sentinel",

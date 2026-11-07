@@ -28,7 +28,11 @@ import {
 import { discoverOpenCodeModels, ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
 import { parseOpenCodeJsonl } from "./parse.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
-import { prepareOpenCodeRuntimeConfig, prepareOpenCodeRemoteHomes } from "./runtime-config.js";
+import {
+  configureOpenCodeRemoteTrustedCa,
+  prepareOpenCodeRuntimeConfig,
+  prepareOpenCodeRemoteHomes,
+} from "./runtime-config.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -189,6 +193,19 @@ export async function testEnvironment(
           await fs.rm(preparedRuntimeWorkspaceLocalDir, { recursive: true, force: true }).catch(() => {});
         }
       };
+      if (preparedRuntimeConfig.trustedCaRelativePath && !preparedExecutionTargetRuntime.assetDirs.xdgConfig) {
+        checks.push({
+          code: "opencode_remote_trust_stage_failed",
+          level: "error",
+          message: "Remote OpenCode trusted CA asset was not staged.",
+        });
+        return {
+          adapterType: ctx.adapterType,
+          status: "fail",
+          checks,
+          testedAt: new Date().toISOString(),
+        };
+      }
       runtimeCwd = preparedExecutionTargetRuntime.workspaceRemoteDir ?? runtimeCwd;
       runtimeTarget = overrideAdapterExecutionTargetRemoteCwd(target ?? null, runtimeCwd) ?? null;
       if (localRuntimeConfigHome && preparedExecutionTargetRuntime.assetDirs.xdgConfig) {
@@ -199,6 +216,11 @@ export async function testEnvironment(
         runtimeRootDir: preparedExecutionTargetRuntime.runtimeRootDir,
         runId,
         configDir: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
+      });
+      configureOpenCodeRemoteTrustedCa({
+        env: preparedRuntimeConfig.env,
+        relativePath: preparedRuntimeConfig.trustedCaRelativePath,
+        stagedXdgConfigHome: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
       });
     }
     const runtimeEnv = normalizeEnv(ensurePathInEnv(targetIsRemote
@@ -375,6 +397,11 @@ export async function testEnvironment(
       );
 
       try {
+        configureOpenCodeRemoteTrustedCa({
+          env: preparedRuntimeConfig.env,
+          relativePath: preparedRuntimeConfig.trustedCaRelativePath,
+          stagedXdgConfigHome: targetIsRemote ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : undefined,
+        });
         const probe = await runAdapterExecutionTargetProcess(
           runId,
           runtimeTarget,

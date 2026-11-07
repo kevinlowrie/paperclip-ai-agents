@@ -3,6 +3,22 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const TEST_CA_PEM = `-----BEGIN CERTIFICATE-----
+MIICFDCCAX2gAwIBAgIUbAcXH/gLdZYHDyCg5uD9QkoU6dIwDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQT3BlbkNvZGUgdGVzdCBDQTAgFw0yNjExMDcyMTUzNDla
+GA8yMTI2MTAxNDIxNTM0OVowGzEZMBcGA1UEAwwQT3BlbkNvZGUgdGVzdCBDQTCB
+nzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEAt6JhKkjqhmQqsAVduWHKAjedHpgq
+mq9V64pHCUqCAQY1+iwLuk8y7Z7vVvEtYmwylbRX9fHpb1dvcd6bdvotPiCGErxQ
+C5FcoQZcOp4NX/CfMzHhrV4T5Gun5UDENjiF5JMTeASEOB2fXO9xIi2SQz88lLH6
+Zu2dah78veBx4pMCAwEAAaNTMFEwHQYDVR0OBBYEFMA2LZmKGJhTf6LFANr/inEa
+gZs5MB8GA1UdIwQYMBaAFMA2LZmKGJhTf6LFANr/inEagZs5MA8GA1UdEwEB/wQF
+MAMBAf8wDQYJKoZIhvcNAQELBQADgYEAs+N7JG+Sj0YZllh7Qb1vKxTb1WBxz6VW
+pj3iscD8veHT1r5Q9Qhh9fU+n2NrcOh6HxXrmRDoj18iVNxvRXxMmJ19ovzhXfxg
+SGOiW1iUdiPtY5hNAiORBB4f+Fo7ReTP2S8JyFqy6U682uE1YxyjwElrotZjKXWv
+nvUmXExeOTA=
+-----END CERTIFICATE-----
+`;
+
 const {
   runChildProcess,
   ensureCommandResolvable,
@@ -156,6 +172,7 @@ describe("opencode remote execution", () => {
       config: {
         command: "opencode",
         model: "opencode/gpt-5-nano",
+        trustedCaPem: TEST_CA_PEM,
         ...(managed ? {
           managedAiConnection: { provider: "openrouter", method: "api_key" },
         } : {}),
@@ -167,6 +184,12 @@ describe("opencode remote execution", () => {
             opencode: { options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" }, models: { "gpt-5-nano": {} } },
           }),
           SCOPED_PROVIDER_KEY: "fixture-scoped-key",
+          SSL_CERT_FILE: "/host/replacement-roots.pem",
+          SSL_CERT_DIR: "/host/cert-dir",
+          REQUESTS_CA_BUNDLE: "/host/request-roots.pem",
+          NODE_OPTIONS: "--require /host/preload.js",
+          NODE_TLS_REJECT_UNAUTHORIZED: "0",
+          OPENSSL_CONF: "/host/openssl.cnf",
           ...(managed ? { HOME: "/var/folders/qa-managed", XDG_DATA_HOME: "/var/folders/qa-managed/data" } : {}),
         },
       },
@@ -244,6 +267,9 @@ describe("opencode remote execution", () => {
     expect(modelProbeCall?.[3].env.XDG_CONFIG_HOME).toBe(
       `${managedRemoteWorkspace}/.paperclip-runtime/opencode/xdgConfig`,
     );
+    expect(modelProbeCall?.[3].env.NODE_EXTRA_CA_CERTS).toBe(
+      `${managedRemoteWorkspace}/.paperclip-runtime/opencode/xdgConfig/trust/ca.pem`,
+    );
     expect(modelProbeCall?.[3].remoteExecution?.remoteCwd).toBe("/remote/workspace");
     const call = runCall as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
@@ -286,6 +312,12 @@ describe("opencode remote execution", () => {
     expect(call?.[3].env.OPENCODE_CONFIG_DIR).toBeUndefined();
     expect(call?.[3].env.HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/opencode/home/run-1`);
     expect(call?.[3].env.SCOPED_PROVIDER_KEY).toBe("fixture-scoped-key");
+    expect(call?.[3].env.NODE_EXTRA_CA_CERTS).toBe(
+      `${managedRemoteWorkspace}/.paperclip-runtime/opencode/xdgConfig/trust/ca.pem`,
+    );
+    for (const name of ["SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_OPTIONS", "NODE_TLS_REJECT_UNAUTHORIZED", "OPENSSL_CONF"]) {
+      expect(call?.[3].env[name]).toBeUndefined();
+    }
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);

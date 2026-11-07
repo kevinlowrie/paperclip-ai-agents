@@ -59,6 +59,7 @@ import {
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import {
+  configureOpenCodeRemoteTrustedCa,
   prepareOpenCodeRemoteHomes,
   prepareOpenCodeRuntimeConfig,
 } from "./runtime-config.js";
@@ -435,6 +436,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       restoreRemoteWorkspace = () =>
         preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line));
+      if (preparedRuntimeConfig.trustedCaRelativePath && !preparedExecutionTargetRuntime.assetDirs.xdgConfig) {
+        throw new Error("Remote OpenCode trusted CA asset was not staged.");
+      }
       effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir ?? effectiveExecutionCwd;
       refreshPaperclipWorkspaceEnvForExecution({
         env: preparedRuntimeConfig.env,
@@ -464,6 +468,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runId,
         configDir: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
       });
+      configureOpenCodeRemoteTrustedCa({
+        env: preparedRuntimeConfig.env,
+        relativePath: preparedRuntimeConfig.trustedCaRelativePath,
+        stagedXdgConfigHome: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
+      });
       runtimeEnv = Object.fromEntries(
         Object.entries(ensurePathInEnv(preparedRuntimeConfig.env)).filter(
           (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -484,6 +493,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
         );
       }
+      configureOpenCodeRemoteTrustedCa({
+        env: preparedRuntimeConfig.env,
+        relativePath: preparedRuntimeConfig.trustedCaRelativePath,
+        stagedXdgConfigHome: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
+      });
       await ensureRemoteOpenCodeModelConfiguredAndAvailable({
         runId,
         executionTarget,
@@ -666,6 +680,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       }
 
+      if (executionTargetIsRemote && preparedRuntimeConfig.trustedCaRelativePath) {
+        configureOpenCodeRemoteTrustedCa({
+          env: preparedRuntimeConfig.env,
+          relativePath: preparedRuntimeConfig.trustedCaRelativePath,
+          stagedXdgConfigHome: preparedRuntimeConfig.env.XDG_CONFIG_HOME,
+        });
+      }
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         onProcessStopped: providerStop.beginInvocation(),
         cwd,
