@@ -80,6 +80,9 @@ describe("opencode remote environment diagnostics", () => {
   beforeEach(async () => {
     configHome = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-test-config-"));
     vi.stubEnv("XDG_CONFIG_HOME", configHome);
+    vi.stubEnv("PAPERCLIP_OPENCODE_SMALL_MODEL", "ambient/host-only-model");
+    vi.stubEnv("DATABASE_URL", "ambient-db-sentinel");
+    vi.stubEnv("ANTHROPIC_API_KEY", "ambient-host-key-sentinel");
   });
 
   afterEach(async () => {
@@ -116,11 +119,22 @@ describe("opencode remote environment diagnostics", () => {
       config: {
         command: "opencode",
         model: "anthropic/claude-sonnet-4-5",
+        dangerouslySkipPermissions: false,
         ...(managed ? {
           managedAiConnection: { provider: "openrouter", method: "api_key" },
         } : {}),
         env: {
           XDG_CONFIG_HOME: configHome,
+          OPENCODE_CONFIG: "/host-only/config/opencode.json",
+          OPENCODE_CONFIG_DIR: "/host-only/config",
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            anthropic: {
+              npm: "@ai-sdk/anthropic",
+              options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" },
+              models: { "claude-sonnet-4-5": { name: "Claude Sonnet" }, "other-model": {} },
+            },
+          }),
+          SCOPED_PROVIDER_KEY: "scoped-test-key",
           ...(managed ? { OPENAI_API_KEY: "", OPENROUTER_API_KEY: "fixture", HOME: "/var/folders/qa-managed", XDG_DATA_HOME: "/var/folders/qa-managed/data" } : {}),
         },
       },
@@ -140,18 +154,60 @@ describe("opencode remote environment diagnostics", () => {
         key: "xdgConfig",
       }),
     ]);
-
     const probeCall = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as
       | [string, AdapterExecutionTarget, string, string[], { cwd: string; env: Record<string, string> }]
       | undefined;
     expect(probeCall?.[4].cwd).toBe("/remote/workspace/.paperclip-runtime/runs/test/workspace");
     if (managed) {
-      expect(probeCall?.[4].env.HOME).toContain("/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/managed-auth/");
+      expect(probeCall?.[4].env.HOME).toContain("/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/home/");
       expect(probeCall?.[4].env.XDG_DATA_HOME).toBe(`${probeCall?.[4].env.HOME}/data`);
       expect(probeCall?.[4].env.XDG_CACHE_HOME).toBe(`${probeCall?.[4].env.HOME}/cache`);
     }
     expect(probeCall?.[4].env.XDG_CONFIG_HOME).toBe(
       "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/xdgConfig",
     );
+    expect(probeCall?.[4].env.OPENCODE_CONFIG).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/xdgConfig/opencode/opencode.json",
+    );
+    expect(probeCall?.[4].env.OPENCODE_CONFIG_DIR).toBeUndefined();
+    expect(probeCall?.[4].env.SCOPED_PROVIDER_KEY).toBe("scoped-test-key");
+    expect(probeCall?.[4].env.OPENAI_API_KEY).toBe(managed ? "" : undefined);
+    expect(probeCall?.[4].env.DATABASE_URL).toBeUndefined();
+    expect(probeCall?.[4].env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(probeCall?.[4].env.PAPERCLIP_OPENCODE_SMALL_MODEL).toBeUndefined();
+    expect(probeCall?.[4].env.PAPERCLIP_OPENCODE_PROVIDERS).toBeUndefined();
+    expect(probeCall?.[4].env.PATH).toBeDefined();
+    expect(probeCall?.[4].env.XDG_DATA_HOME).toContain("/home/");
+    expect(probeCall?.[4].env.XDG_RUNTIME_DIR).toBe(`${probeCall?.[4].env.HOME}/runtime`);
+  });
+
+  it("rejects missing scoped key before any remote runner or process call", async () => {
+    const remoteExecute = vi.fn(async () => ({
+      exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null,
+      startedAt: new Date().toISOString(),
+    }));
+    const remoteTarget: AdapterExecutionTarget = {
+      kind: "remote", transport: "sandbox", providerKey: "cloudflare", remoteCwd: "/remote/workspace",
+      runner: { execute: remoteExecute },
+    };
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "opencode_local",
+      config: {
+        model: "example/model",
+        env: { PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({ example: { options: { apiKey: "{env:MISSING_SCOPED_KEY}" }, models: { model: {} } } }) },
+      },
+      executionTarget: remoteTarget,
+    });
+    expect(result.status).toBe("fail");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      code: "opencode_remote_profile_invalid",
+      level: "error",
+      message: expect.stringContaining("MISSING_SCOPED_KEY is missing or empty"),
+    }));
+    expect(prepareAdapterExecutionTargetRuntime).not.toHaveBeenCalled();
+    expect(ensureAdapterExecutionTargetDirectory).not.toHaveBeenCalled();
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+    expect(remoteExecute).not.toHaveBeenCalled();
   });
 });

@@ -108,6 +108,9 @@ describe("opencode remote execution", () => {
     const configHome = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-test-config-"));
     cleanupDirs.push(configHome);
     vi.stubEnv("XDG_CONFIG_HOME", configHome);
+    vi.stubEnv("DATABASE_URL", "ambient-db-sentinel");
+    vi.stubEnv("OPENROUTER_API_KEY", "ambient-provider-key-sentinel");
+    vi.stubEnv("PAPERCLIP_OPENCODE_SMALL_MODEL", "ambient/host-only-model");
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
   });
 
@@ -158,6 +161,12 @@ describe("opencode remote execution", () => {
         } : {}),
         env: {
           XDG_CONFIG_HOME: path.join(rootDir, "config"),
+          OPENCODE_CONFIG: "/host-only/config/opencode.json",
+          OPENCODE_CONFIG_DIR: "/host-only/config",
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            opencode: { options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" }, models: { "gpt-5-nano": {} } },
+          }),
+          SCOPED_PROVIDER_KEY: "fixture-scoped-key",
           ...(managed ? { HOME: "/var/folders/qa-managed", XDG_DATA_HOME: "/var/folders/qa-managed/data" } : {}),
         },
       },
@@ -240,17 +249,16 @@ describe("opencode remote execution", () => {
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
-    if (managed) {
-      const home = `${managedRemoteWorkspace}/.paperclip-runtime/opencode/managed-auth/run-1`;
-      expect(call?.[3].env.HOME).toBe(home);
-      expect(call?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
-      expect(modelProbeCall?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
-      expect(runSshCommand).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.stringContaining(`${home}/.claude/skills`),
-        expect.anything(),
-      );
-    }
+    const home = `${managedRemoteWorkspace}/.paperclip-runtime/opencode/home/run-1`;
+    expect(call?.[3].env.HOME).toBe(home);
+    expect(call?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
+    expect(modelProbeCall?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
+    expect(call?.[3].env.XDG_RUNTIME_DIR).toBe(`${home}/runtime`);
+    expect(runSshCommand).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining(`${home}/.claude/skills`),
+      expect.anything(),
+    );
     expect(JSON.parse(call?.[3].env.PAPERCLIP_WORKSPACES_JSON ?? "[]")).toEqual([
       {
         workspaceId: "workspace-1",
@@ -266,7 +274,17 @@ describe("opencode remote execution", () => {
     ]);
     expect(call?.[3].env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:4310");
     expect(call?.[3].env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+    expect(call?.[3].env.DATABASE_URL).toBeUndefined();
+    expect(call?.[3].env.OPENROUTER_API_KEY).not.toBe("ambient-provider-key-sentinel");
+    expect(call?.[3].env.PAPERCLIP_OPENCODE_SMALL_MODEL).toBeUndefined();
+    expect(call?.[3].env.PAPERCLIP_OPENCODE_PROVIDERS).toBeUndefined();
     expect(call?.[3].env.XDG_CONFIG_HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/opencode/xdgConfig`);
+    expect(call?.[3].env.OPENCODE_CONFIG).toBe(
+      `${managedRemoteWorkspace}/.paperclip-runtime/opencode/xdgConfig/opencode/opencode.json`,
+    );
+    expect(call?.[3].env.OPENCODE_CONFIG_DIR).toBeUndefined();
+    expect(call?.[3].env.HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/opencode/home/run-1`);
+    expect(call?.[3].env.SCOPED_PROVIDER_KEY).toBe("fixture-scoped-key");
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
@@ -307,6 +325,12 @@ describe("opencode remote execution", () => {
         config: {
           command: "opencode",
           model: "opencode/gpt-5-nano",
+          env: {
+            PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+              opencode: { options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" }, models: { "gpt-5-nano": {} } },
+            }),
+            SCOPED_PROVIDER_KEY: "fixture-scoped-key",
+          },
         },
         context: {
           paperclipWorkspace: {
@@ -333,6 +357,44 @@ describe("opencode remote execution", () => {
     expect(runChildProcess).toHaveBeenCalledTimes(1);
     expect((runChildProcess.mock.calls[0]?.[2] as string[] | undefined) ?? []).toEqual(["models"]);
     expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unresolved selected key binding before any remote command", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-no-key-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await expect(execute({
+      runId: "run-ssh-no-key",
+      agent: {
+        id: "agent-1", companyId: "company-1", name: "OpenCode Builder",
+        adapterType: "opencode_local", adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "opencode",
+        model: "opencode/gpt-5-nano",
+        env: {
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            opencode: { options: { apiKey: "{env:MISSING_SCOPED_KEY}" }, models: { "gpt-5-nano": {} } },
+          }),
+        },
+      },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace", privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    })).rejects.toThrow("MISSING_SCOPED_KEY is missing or empty");
+
+    expect(runChildProcess).not.toHaveBeenCalled();
+    expect(runSshCommand).not.toHaveBeenCalled();
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
   });
 
   it("resumes saved OpenCode sessions for remote SSH execution only when the identity matches", async () => {
@@ -370,6 +432,12 @@ describe("opencode remote execution", () => {
       config: {
         command: "opencode",
         model: "opencode/gpt-5-nano",
+        env: {
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            opencode: { options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" }, models: { "gpt-5-nano": {} } },
+          }),
+          SCOPED_PROVIDER_KEY: "fixture-scoped-key",
+        },
       },
       context: {
         paperclipWorkspace: {

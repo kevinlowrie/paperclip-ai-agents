@@ -28,7 +28,7 @@ import {
 import { discoverOpenCodeModels, ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
 import { parseOpenCodeJsonl } from "./parse.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
-import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
+import { prepareOpenCodeRuntimeConfig, prepareOpenCodeRemoteHomes } from "./runtime-config.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -88,26 +88,6 @@ export async function testEnvironment(
     });
   }
 
-  try {
-    await ensureAdapterExecutionTargetDirectory(runId, target, cwd, {
-      cwd,
-      env: {},
-      createIfMissing: false,
-    });
-    checks.push({
-      code: "opencode_cwd_valid",
-      level: "info",
-      message: `Working directory is valid: ${cwd}`,
-    });
-  } catch (err) {
-    checks.push({
-      code: "opencode_cwd_invalid",
-      level: "error",
-      message: err instanceof Error ? err.message : "Invalid working directory",
-      detail: cwd,
-    });
-  }
-
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(envConfig)) {
@@ -126,9 +106,32 @@ export async function testEnvironment(
 
   // Prevent OpenCode from writing an opencode.json into the working directory.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  let preparedRuntimeConfig: Awaited<ReturnType<typeof prepareOpenCodeRuntimeConfig>>;
+  try {
+    preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, targetIsRemote });
+  } catch (err) {
+    if (!targetIsRemote) throw err;
+    checks.push({
+      code: "opencode_remote_profile_invalid",
+      level: "error",
+      message: err instanceof Error ? err.message : "Remote OpenCode profile is invalid.",
+    });
+    return {
+      adapterType: ctx.adapterType,
+      status: summarizeStatus(checks),
+      checks,
+      testedAt: new Date().toISOString(),
+    };
+  }
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+  if (targetIsRemote) {
+    prepareOpenCodeRemoteHomes({
+      env: preparedRuntimeConfig.env,
+      runtimeRootDir: path.posix.join(cwd, ".paperclip-runtime", "opencode"),
+      runId,
+    });
+  }
   if (asBoolean(config.dangerouslySkipPermissions, true)) {
     checks.push({
       code: "opencode_headless_permissions_enabled",
@@ -142,6 +145,25 @@ export async function testEnvironment(
   // `fs.mkdtemp` directory leaks on the early-throw path.
   let preparedRuntimeWorkspaceLocalDir: string | null = null;
   try {
+    try {
+      await ensureAdapterExecutionTargetDirectory(runId, target, cwd, {
+        cwd,
+        env: targetIsRemote ? preparedRuntimeConfig.env : {},
+        createIfMissing: false,
+      });
+      checks.push({
+        code: "opencode_cwd_valid",
+        level: "info",
+        message: `Working directory is valid: ${cwd}`,
+      });
+    } catch (err) {
+      checks.push({
+        code: "opencode_cwd_invalid",
+        level: "error",
+        message: err instanceof Error ? err.message : "Invalid working directory",
+        detail: cwd,
+      });
+    }
     let runtimeTarget: AdapterExecutionTarget | null = target ?? null;
     let runtimeCwd = cwd;
     if (targetIsRemote) {
@@ -172,15 +194,16 @@ export async function testEnvironment(
       if (localRuntimeConfigHome && preparedExecutionTargetRuntime.assetDirs.xdgConfig) {
         preparedRuntimeConfig.env.XDG_CONFIG_HOME = preparedExecutionTargetRuntime.assetDirs.xdgConfig;
       }
-      prepareManagedOpenCodeRemoteHomes({
+      prepareOpenCodeRemoteHomes({
         env: preparedRuntimeConfig.env,
-        config,
         runtimeRootDir: preparedExecutionTargetRuntime.runtimeRootDir,
         runId,
         configDir: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
       });
     }
-    const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env }));
+    const runtimeEnv = normalizeEnv(ensurePathInEnv(targetIsRemote
+      ? preparedRuntimeConfig.env
+      : { ...process.env, ...preparedRuntimeConfig.env }));
 
     const cwdInvalid = checks.some((check) => check.code === "opencode_cwd_invalid");
     if (cwdInvalid) {
