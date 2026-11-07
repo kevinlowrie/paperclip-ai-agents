@@ -10,7 +10,6 @@ import {
   overrideAdapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
-  adapterExecutionTargetUsesManagedHome,
   adapterExecutionTargetUsesPaperclipBridge,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
@@ -19,7 +18,6 @@ import {
   adapterExecutionTargetDuplexObservabilityRecorder,
   adapterExecutionTargetEnablesSandboxDuplexBridge,
   readAdapterExecutionTarget,
-  readAdapterExecutionTargetHomeDir,
   resolveAdapterExecutionTargetTimeoutSec,
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
@@ -60,7 +58,10 @@ import {
   requireOpenCodeModelId,
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
-import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
+import {
+  prepareOpenCodeRemoteHomes,
+  prepareOpenCodeRuntimeConfig,
+} from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
 
@@ -328,12 +329,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env,
+    config,
+    targetIsRemote: executionTargetIsRemote,
+  });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+  if (executionTargetIsRemote) {
+    prepareOpenCodeRemoteHomes({
+      env: preparedRuntimeConfig.env,
+      runtimeRootDir: path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "opencode"),
+      runId,
+    });
+  }
   try {
-    const runtimeEnv = Object.fromEntries(
-      Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
+    let runtimeEnv = Object.fromEntries(
+      Object.entries(
+        ensurePathInEnv(
+          executionTargetIsRemote
+            ? preparedRuntimeConfig.env
+            : { ...process.env, ...preparedRuntimeConfig.env },
+        ),
+      ).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
@@ -428,32 +446,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         executionTargetIsRemote,
         executionCwd: effectiveExecutionCwd,
       });
+      delete preparedRuntimeConfig.env.PAPERCLIP_OPENCODE_PROVIDERS;
+      delete preparedRuntimeConfig.env.PAPERCLIP_OPENCODE_SMALL_MODEL;
       remoteRuntimeRootDir = preparedExecutionTargetRuntime.runtimeRootDir;
-      const managedHome = adapterExecutionTargetUsesManagedHome(executionTarget);
-      if (managedHome && preparedExecutionTargetRuntime.runtimeRootDir) {
-        preparedRuntimeConfig.env.HOME = preparedExecutionTargetRuntime.runtimeRootDir;
-      }
       if (localRuntimeConfigHome && preparedExecutionTargetRuntime.assetDirs.xdgConfig) {
         preparedRuntimeConfig.env.XDG_CONFIG_HOME = preparedExecutionTargetRuntime.assetDirs.xdgConfig;
       }
-      prepareManagedOpenCodeRemoteHomes({
+      prepareOpenCodeRemoteHomes({
         env: preparedRuntimeConfig.env,
-        config,
         runtimeRootDir: preparedExecutionTargetRuntime.runtimeRootDir,
         runId,
         configDir: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
       });
-      const remoteHomeDir = config.managedAiConnection
-        ? preparedRuntimeConfig.env.HOME
-        : managedHome && preparedExecutionTargetRuntime.runtimeRootDir
-          ? preparedExecutionTargetRuntime.runtimeRootDir
-          : await readAdapterExecutionTargetHomeDir(runId, executionTarget, {
-            cwd,
-            env: preparedRuntimeConfig.env,
-            timeoutSec,
-            graceSec,
-            onLog,
-          });
+      runtimeEnv = Object.fromEntries(
+        Object.entries(ensurePathInEnv(preparedRuntimeConfig.env)).filter(
+          (entry): entry is [string, string] => typeof entry[1] === "string",
+        ),
+      );
+      loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
+        runtimeEnv,
+        includeRuntimeKeys: ["HOME"],
+        resolvedCommand,
+      });
+      const remoteHomeDir = preparedRuntimeConfig.env.HOME;
       if (remoteHomeDir && preparedExecutionTargetRuntime.assetDirs.skills) {
         const remoteSkillsDir = path.posix.join(remoteHomeDir, ".claude", "skills");
         await runAdapterExecutionTargetShellCommand(

@@ -31,6 +31,123 @@ async function makeConfigHome(initialConfig?: Record<string, unknown>) {
 }
 
 describe("prepareOpenCodeRuntimeConfig", () => {
+  it("builds a minimal remote profile from run declarations and keeps the scoped key as an env reference", async () => {
+    const hostConfig = await makeConfigHome({
+      theme: "host-only-sentinel",
+      provider: { hostOnly: { options: { apiKey: "host-file-key-sentinel" } } },
+      small_model: "host-file-small-model",
+    });
+    const providers = {
+      gateway: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Gateway",
+        options: { baseURL: "https://gateway.invalid/v1", apiKey: "{env:SCOPED_KEY}" },
+        models: {
+          "selected-model": { name: "Selected" },
+          "title-model": { name: "Title" },
+          "unselected-model": {},
+        },
+      },
+      unrelated: { options: { apiKey: "raw-unselected-key" }, models: { other: {} } },
+    };
+    const oldProviders = process.env.PAPERCLIP_OPENCODE_PROVIDERS;
+    const oldSmallModel = process.env.PAPERCLIP_OPENCODE_SMALL_MODEL;
+    const oldScopedKey = process.env.SCOPED_KEY;
+    process.env.PAPERCLIP_OPENCODE_PROVIDERS = JSON.stringify({ ambient: { options: { apiKey: "{env:SCOPED_KEY}" } } });
+    process.env.PAPERCLIP_OPENCODE_SMALL_MODEL = "ambient/host-model";
+    process.env.SCOPED_KEY = "ambient-host-key";
+    try {
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: {
+          XDG_CONFIG_HOME: hostConfig,
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify(providers),
+          PAPERCLIP_OPENCODE_SMALL_MODEL: "gateway/title-model",
+          SCOPED_KEY: "explicit-scoped-key",
+        },
+        config: { model: "gateway/selected-model" },
+        targetIsRemote: true,
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as {
+        provider?: Record<string, { options?: { apiKey?: unknown }; models?: Record<string, unknown> }>;
+        small_model?: string;
+      };
+      expect(runtimeConfig).toMatchObject({
+        provider: {
+          gateway: {
+            options: { apiKey: "{env:SCOPED_KEY}" },
+            models: {
+              "selected-model": { name: "Selected" },
+              "title-model": { name: "Title" },
+            },
+          },
+        },
+        small_model: "gateway/title-model",
+      });
+      expect(runtimeConfig.provider?.unrelated).toBeUndefined();
+      expect(JSON.stringify(runtimeConfig)).not.toMatch(/host-only-sentinel|host-file-key-sentinel|host-file-small-model|raw-unselected-key|explicit-scoped-key|ambient-host-key|host-model/);
+      expect(prepared.env.SCOPED_KEY).toBe("explicit-scoped-key");
+      expect(prepared.env.PAPERCLIP_OPENCODE_PROVIDERS).toBeUndefined();
+      expect(prepared.env.PAPERCLIP_OPENCODE_SMALL_MODEL).toBeUndefined();
+      await prepared.cleanup();
+      cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
+    } finally {
+      if (oldProviders === undefined) delete process.env.PAPERCLIP_OPENCODE_PROVIDERS;
+      else process.env.PAPERCLIP_OPENCODE_PROVIDERS = oldProviders;
+      if (oldSmallModel === undefined) delete process.env.PAPERCLIP_OPENCODE_SMALL_MODEL;
+      else process.env.PAPERCLIP_OPENCODE_SMALL_MODEL = oldSmallModel;
+      if (oldScopedKey === undefined) delete process.env.SCOPED_KEY;
+      else process.env.SCOPED_KEY = oldScopedKey;
+    }
+  });
+
+  it("rejects an ambient-only remote credential binding", async () => {
+    const oldScopedKey = process.env.SCOPED_KEY;
+    process.env.SCOPED_KEY = "ambient-host-key";
+    try {
+      await expect(prepareOpenCodeRuntimeConfig({
+        env: {
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            gateway: { options: { apiKey: "{env:SCOPED_KEY}" }, models: { model: {} } },
+          }),
+        },
+        config: { model: "gateway/model" },
+        targetIsRemote: true,
+      })).rejects.toThrow("SCOPED_KEY is missing or empty");
+    } finally {
+      if (oldScopedKey === undefined) delete process.env.SCOPED_KEY;
+      else process.env.SCOPED_KEY = oldScopedKey;
+    }
+  });
+
+  it("rejects an empty selected remote credential", async () => {
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: {
+        PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+          gateway: { options: { apiKey: "{env:SCOPED_KEY}" }, models: { model: {} } },
+        }),
+        SCOPED_KEY: "  ",
+      },
+      config: { model: "gateway/model" },
+      targetIsRemote: true,
+    })).rejects.toThrow("SCOPED_KEY is missing or empty");
+  });
+
+  it("rejects a literal selected credential instead of an env binding", async () => {
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: {
+        PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+          gateway: { options: { apiKey: "literal-secret-fixture" }, models: { model: {} } },
+        }),
+        SCOPED_KEY: "literal-secret-fixture",
+      },
+      config: { model: "gateway/model" },
+      targetIsRemote: true,
+    })).rejects.toThrow("must bind apiKey to an explicit environment variable");
+  });
+
   it("allows all tools and connected tools by default", async () => {
     const configHome = await makeConfigHome({
       permission: {

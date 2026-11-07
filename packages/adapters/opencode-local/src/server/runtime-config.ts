@@ -21,6 +21,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function containsExactString(value: unknown, expected: string): boolean {
+  if (value === expected) return true;
+  if (Array.isArray(value)) return value.some((entry) => containsExactString(entry, expected));
+  if (isPlainObject(value)) return Object.values(value).some((entry) => containsExactString(entry, expected));
+  return false;
+}
+
 // Recursively replace {env:VAR} placeholders with the resolved value. Used to bake
 // gateway provider secrets (e.g. the LLM-gateway virtual key) into opencode.json
 // SERVER-SIDE, where the value is reliably present. OpenCode's own {env:...}
@@ -108,10 +115,11 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   targetIsRemote?: boolean;
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  // Provider setup is independent of tool permission policy. Credentials must be
-  // materialized server-side even when a sanitized child env cannot carry them.
-  const providerConfig = input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS;
-  if (!skipPermissions && !providerConfig?.trim()) {
+  // Remote execution must only use the run's declared provider profile. Never
+  // inherit the server's OpenCode profile or ambient provider settings.
+  const providerConfig = input.env.PAPERCLIP_OPENCODE_PROVIDERS ??
+    (input.targetIsRemote ? undefined : process.env.PAPERCLIP_OPENCODE_PROVIDERS);
+  if (!input.targetIsRemote && !skipPermissions && !providerConfig?.trim()) {
     return {
       env: input.env,
       notes: [],
@@ -119,17 +127,8 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     };
   }
 
-  // For remote execution targets the host XDG_CONFIG_HOME path is meaningless
-  // (and actively harmful — it leaks a macOS-only path into the remote Linux
-  // env). Callers that need to ship a runtime opencode config to the remote
-  // box do that via prepareAdapterExecutionTargetRuntime in execute.ts; this
-  // host-fs helper is local-only.
   if (input.targetIsRemote) {
-    return {
-      env: input.env,
-      notes: [],
-      cleanup: async () => {},
-    };
+    return prepareRemoteOpenCodeRuntimeConfig(input, providerConfig, skipPermissions);
   }
 
   const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
@@ -240,22 +239,99 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   };
 }
 
-/** Managed credentials must never leave host-only homes in a remote process. */
-export function prepareManagedOpenCodeRemoteHomes(input: {
+async function prepareRemoteOpenCodeRuntimeConfig(
+  input: { env: Record<string, string>; config: Record<string, unknown> },
+  providerConfig: string | undefined,
+  skipPermissions: boolean,
+): Promise<PreparedOpenCodeRuntimeConfig> {
+  const configuredModel = parseConfiguredModelRef(input.config.model);
+  if (!configuredModel) {
+    throw new Error("Remote OpenCode requires an explicit provider/model selection.");
+  }
+  if (!providerConfig?.trim()) {
+    throw new Error("Remote OpenCode requires an explicit provider profile.");
+  }
+  const notes: string[] = [];
+  const providers = parseProviderConfig(providerConfig, () => undefined, notes);
+  const configuredSmallModel = input.env.PAPERCLIP_OPENCODE_SMALL_MODEL?.trim();
+  const smallModelRef = configuredSmallModel
+    ? parseConfiguredModelRef(configuredSmallModel)
+    : configuredModel;
+  if (!smallModelRef) {
+    throw new Error("Remote OpenCode small_model must use an explicit provider/model reference.");
+  }
+  const requestedModels = [configuredModel, smallModelRef];
+  const minimalProviders: Record<string, Record<string, unknown>> = {};
+  for (const modelRef of requestedModels) {
+    const declaredProvider = providers?.[modelRef.provider];
+    if (!isPlainObject(declaredProvider)) {
+      throw new Error(`Remote OpenCode provider profile is missing ${modelRef.provider}.`);
+    }
+    const options = isPlainObject(declaredProvider.options) ? declaredProvider.options : {};
+    const keyReference = options.apiKey;
+    const keyMatch = typeof keyReference === "string"
+      ? /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(keyReference)
+      : null;
+    if (!keyMatch) {
+      throw new Error(`Remote OpenCode provider ${modelRef.provider} must bind apiKey to an explicit environment variable.`);
+    }
+    const keyValue = input.env[keyMatch[1]];
+    if (typeof keyValue !== "string" || keyValue.trim().length === 0) {
+      throw new Error(`Remote OpenCode credential binding ${keyMatch[1]} is missing or empty.`);
+    }
+    const providerModels = isPlainObject(declaredProvider.models) ? declaredProvider.models : {};
+    const existing = minimalProviders[modelRef.provider];
+    const minimalProvider: Record<string, unknown> = existing ?? {
+      ...declaredProvider,
+      options: { ...options, apiKey: keyReference },
+      models: {},
+    };
+    if (containsExactString(minimalProvider, keyValue)) {
+      throw new Error(`Remote OpenCode provider ${modelRef.provider} embeds the selected credential instead of referencing its environment binding.`);
+    }
+    const minimalModels = minimalProvider.models as Record<string, unknown>;
+    minimalModels[modelRef.model] = isPlainObject(providerModels[modelRef.model])
+      ? providerModels[modelRef.model]
+      : {};
+    minimalProviders[modelRef.provider] = minimalProvider;
+  }
+  const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-config-"));
+  const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
+  await fs.mkdir(runtimeConfigDir, { recursive: true });
+  const nextConfig: Record<string, unknown> = {
+    ...(skipPermissions ? { permission: "allow" } : {}),
+    provider: minimalProviders,
+  };
+  nextConfig.small_model = configuredSmallModel || `${configuredModel.provider}/${configuredModel.model}`;
+  await fs.writeFile(path.join(runtimeConfigDir, "opencode.json"), `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+  const runtimeEnv = { ...input.env };
+  delete runtimeEnv.PAPERCLIP_OPENCODE_PROVIDERS;
+  delete runtimeEnv.PAPERCLIP_OPENCODE_SMALL_MODEL;
+  return {
+    env: { ...runtimeEnv, XDG_CONFIG_HOME: runtimeConfigHome },
+    notes: ["Created an isolated remote OpenCode config from the selected run provider/model."],
+    cleanup: async () => fs.rm(runtimeConfigHome, { recursive: true, force: true }),
+  };
+}
+
+/** Every remote run gets a fresh HOME/XDG profile to prevent retained auth fallback. */
+export function prepareOpenCodeRemoteHomes(input: {
   env: Record<string, string>;
-  config: Record<string, unknown>;
   runtimeRootDir: string | null | undefined;
   runId: string;
   configDir?: string;
 }): void {
-  if (!input.config.managedAiConnection) return;
-  if (!input.runtimeRootDir) throw new Error("Managed OpenCode authentication requires an isolated remote runtime directory.");
-  const home = path.posix.join(input.runtimeRootDir, "managed-auth", input.runId);
+  if (!input.runtimeRootDir) throw new Error("Remote OpenCode requires an isolated runtime directory.");
+  const home = path.posix.join(input.runtimeRootDir, "home", input.runId);
+  const configHome = input.configDir ?? path.posix.join(home, "config");
   Object.assign(input.env, {
     HOME: home,
-    XDG_CONFIG_HOME: input.configDir ?? path.posix.join(home, "config"),
+    XDG_CONFIG_HOME: configHome,
     XDG_DATA_HOME: path.posix.join(home, "data"),
     XDG_CACHE_HOME: path.posix.join(home, "cache"),
     XDG_STATE_HOME: path.posix.join(home, "state"),
+    XDG_RUNTIME_DIR: path.posix.join(home, "runtime"),
+    OPENCODE_CONFIG: path.posix.join(configHome, "opencode", "opencode.json"),
   });
+  delete input.env.OPENCODE_CONFIG_DIR;
 }
