@@ -560,14 +560,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const resolvedInstructionsFilePath = instructionsFilePath
       ? path.resolve(cwd, instructionsFilePath)
       : "";
-    const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
+    const instructionsExecutionFilePath = asString(
+      config.instructionsExecutionFilePath,
+      instructionsFilePath,
+    ).trim();
+    const resolvedInstructionsExecutionFilePath = instructionsExecutionFilePath
+      ? path.resolve(cwd, instructionsExecutionFilePath)
+      : "";
+    const instructionsDir = resolvedInstructionsExecutionFilePath
+      ? `${path.dirname(resolvedInstructionsExecutionFilePath)}/`
+      : "";
     let instructionsPrefix = "";
     if (resolvedInstructionsFilePath) {
       try {
         const instructionsContents = await fs.readFile(resolvedInstructionsFilePath, "utf8");
         instructionsPrefix =
           `${instructionsContents}\n\n` +
-          `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
+          "The above agent instructions are available in this execution environment at " +
+          `${resolvedInstructionsExecutionFilePath || resolvedInstructionsFilePath}. ` +
           `Resolve any relative file references from ${instructionsDir}.\n\n`;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);

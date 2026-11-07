@@ -23571,7 +23571,14 @@ export function heartbeatService(
               await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
                 message: storageWarning, payload: instructionSave });
             }
-            runtimeConfig = { ...runtimeConfig, instructionsFilePath: path.join(instructionCopy.localRoot, instructionCopy.entryFile) };
+            runtimeConfig = {
+              ...runtimeConfig,
+              instructionsFilePath: path.join(instructionCopy.localRoot, instructionCopy.entryFile),
+              instructionsExecutionFilePath: path.join(
+                instructionCopy.executionRoot,
+                instructionCopy.entryFile,
+              ),
+            };
             if (isAgentDirectoryCopy(instructionCopy)) {
               const workspace = parseObject(context.paperclipWorkspace);
               context.paperclipWorkspace = { ...workspace, agentHome: instructionCopy.executionRoot,

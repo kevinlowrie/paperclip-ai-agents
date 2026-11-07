@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -326,6 +326,71 @@ describe("opencode remote execution", () => {
       const commandEnv = callArgs[2] as Record<string, string>;
       expect(commandEnv.SCOPED_PROVIDER_KEY).toBeUndefined();
     }
+  });
+
+  it("points remote instruction references at the staged execution copy", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-instructions-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const controllerInstructions = path.join(rootDir, "controller", "AGENTS.md");
+    const stagedInstructions =
+      "/remote/workspace/.paperclip-runtime/instruction-edits-run-instructions/instructions/AGENTS.md";
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(path.dirname(controllerInstructions), { recursive: true });
+    await writeFile(controllerInstructions, "Use the checked-in instructions.");
+
+    let invocationMeta: { prompt?: string } | undefined;
+    await execute({
+      runId: "run-instructions",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Builder",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "opencode",
+        model: "opencode/gpt-5-nano",
+        instructionsFilePath: controllerInstructions,
+        instructionsExecutionFilePath: stagedInstructions,
+        env: {
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            opencode: { options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" }, models: { "gpt-5-nano": {} } },
+          }),
+          SCOPED_PROVIDER_KEY: "fixture-scoped-key",
+        },
+      },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+      onMeta: async (meta) => {
+        invocationMeta = meta;
+      },
+    });
+
+    expect(invocationMeta?.prompt).toContain("Use the checked-in instructions.");
+    expect(invocationMeta?.prompt).toContain(
+      `available in this execution environment at ${stagedInstructions}`,
+    );
+    expect(invocationMeta?.prompt).toContain(
+      `relative file references from ${path.posix.dirname(stagedInstructions)}/`,
+    );
+    expect(invocationMeta?.prompt).not.toContain(controllerInstructions);
   });
 
   it("fails before the remote run when the configured model is unavailable on the SSH target", async () => {
