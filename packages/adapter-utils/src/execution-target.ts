@@ -2046,15 +2046,21 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   // can defer it until an upstream dependency (e.g. the paperclip bridge's env)
   // is ready without blocking the dir/script setup.
   const launchEnv = typeof input.env === "function" ? await input.env() : input.env;
+  const sanitizedLaunchEnv = sanitizeRemoteExecutionEnv(launchEnv);
+  // PATH is an explicit part of the remote runtime launch contract. Preserve
+  // that projected remote value even when it happens to equal the host PATH;
+  // every other inherited value remains subject to the normal sanitizer.
+  if (typeof launchEnv.PATH === "string") {
+    sanitizedLaunchEnv.PATH = launchEnv.PATH;
+  }
   const commandPayload = Buffer.from(JSON.stringify({
     command: input.command,
     args: input.args,
     cwd: input.cwd || target.remoteCwd,
-    // The ACP engine has already projected this launch env from explicit
-    // adapter/runtime inputs and registered contributions. Compare against an
-    // empty inherited baseline so an explicit identity value (notably PATH)
-    // is not reclassified as ambient merely because it equals the host value.
-    env: sanitizeRemoteExecutionEnv(launchEnv, {}),
+    // The ACP engine has projected explicit adapter/runtime inputs and
+    // registered contributions. Filter against the actual host baseline so
+    // unrelated server values cannot cross into the remote session.
+    env: sanitizedLaunchEnv,
   }), "utf8").toString("base64");
   // Base64 plus JSON escaping can push an otherwise valid child environment
   // past Linux's per-argument/per-variable exec limit. Keep small launches on

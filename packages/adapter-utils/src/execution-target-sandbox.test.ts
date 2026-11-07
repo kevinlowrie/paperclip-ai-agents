@@ -332,10 +332,11 @@ describe("sandbox adapter execution targets", () => {
     };
 
     expect(adapterExecutionTargetToRemoteSpec(target)).toBeNull();
+    vi.stubEnv("SERVER_INHERITED_TEST_MARKER", "ambient-server-value");
 
     const result = await runAdapterExecutionTargetProcess("run-1", target, "agent-cli", ["--json"], {
       cwd: "/local/workspace",
-      env: { TOKEN: "token" },
+      env: { TOKEN: "run-scoped-token", SERVER_INHERITED_TEST_MARKER: "ambient-server-value" },
       stdin: "prompt",
       timeoutSec: 5,
       graceSec: 1,
@@ -347,7 +348,7 @@ describe("sandbox adapter execution targets", () => {
       command: "agent-cli",
       args: ["--json"],
       cwd: "/workspace",
-      env: { TOKEN: "token" },
+      env: { TOKEN: "run-scoped-token" },
       stdin: "prompt",
       timeoutMs: 5000,
     }));
@@ -477,18 +478,28 @@ describe("sandbox adapter execution targets", () => {
       const explicitHostPath = `${nodeBinDir}:/explicit-host-bin`;
       const sandboxNativePath = `/usr/bin:/bin:${nodeBinDir}`;
       vi.stubEnv("PATH", explicitHostPath);
+      vi.stubEnv("SERVER_INHERITED_TEST_MARKER", "ambient-server-value");
 
       const delegate = createLocalSandboxRunner();
+      let serializedLaunchEnv: Record<string, string> | null = null;
       const runner = {
         execute: vi.fn(
-          async (input: Parameters<typeof delegate.execute>[0]) =>
-            delegate.execute({
+          async (input: Parameters<typeof delegate.execute>[0]) => {
+            const script = input.args?.join(" ") ?? "";
+            const inlineCommand = script.match(/PAPERCLIP_PROCESS_SESSION_COMMAND_B64='([A-Za-z0-9+/=]+)'/);
+            const encodedCommand = input.env?.PAPERCLIP_PROCESS_SESSION_COMMAND_B64 ?? inlineCommand?.[1];
+            if (encodedCommand) {
+              const commandPayload = JSON.parse(Buffer.from(encodedCommand, "base64").toString("utf8"));
+              serializedLaunchEnv = commandPayload.env;
+            }
+            return delegate.execute({
               ...input,
               // The local fake otherwise inherits the test host PATH. Give the
               // wrapper a distinct sandbox-native PATH so the child proves the
               // explicit equal-to-host value survived payload serialization.
               env: { ...input.env, PATH: sandboxNativePath },
-            }),
+            });
+          },
         ),
       };
       const target: AdapterSandboxExecutionTarget = {
@@ -508,7 +519,11 @@ describe("sandbox adapter execution targets", () => {
         command: process.execPath,
         args: [childPath],
         cwd: rootDir,
-        env: { PATH: explicitHostPath },
+        env: {
+          PATH: explicitHostPath,
+          SERVER_INHERITED_TEST_MARKER: "ambient-server-value",
+          PAPERCLIP_API_TOKEN: "scoped-session-token",
+        },
         timeoutSec: 5,
         onLog: async () => {},
         streamOutputViaSession,
@@ -519,6 +534,10 @@ describe("sandbox adapter execution targets", () => {
         const result = await runProxyWithInput(bridge!.agentCommand, "");
         expect(result.code).toBe(0);
         expect(result.stdout).toBe(explicitHostPath);
+        expect(serializedLaunchEnv).toEqual({
+          PATH: explicitHostPath,
+          PAPERCLIP_API_TOKEN: "scoped-session-token",
+        });
       } finally {
         await bridge?.stop();
       }
