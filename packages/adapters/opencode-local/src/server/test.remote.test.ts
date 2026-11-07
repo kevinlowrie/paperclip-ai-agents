@@ -239,6 +239,46 @@ describe("opencode remote environment diagnostics", () => {
     expect(remoteExecute).not.toHaveBeenCalled();
   });
 
+  it.each(["NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS"])(
+    "rejects reserved remote TLS credential binding %s before remote setup",
+    async (reservedName) => {
+      const remoteExecute = vi.fn(async () => ({
+        exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null,
+        startedAt: new Date().toISOString(),
+      }));
+      const remoteTarget: AdapterExecutionTarget = {
+        kind: "remote", transport: "sandbox", providerKey: "cloudflare", remoteCwd: "/remote/workspace",
+        runner: { execute: remoteExecute },
+      };
+      const result = await testEnvironment({
+        companyId: "company-1",
+        adapterType: "opencode_local",
+        config: {
+          model: "example/model",
+          trustedCaPem: TEST_CA_PEM,
+          env: {
+            PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+              example: { options: { apiKey: `{env:${reservedName}}` }, models: { model: {} } },
+            }),
+            [reservedName]: "fixture-credential-value",
+          },
+        },
+        executionTarget: remoteTarget,
+      });
+
+      expect(result.status).toBe("fail");
+      expect(result.checks).toContainEqual(expect.objectContaining({
+        code: "opencode_remote_profile_invalid",
+        level: "error",
+        message: expect.stringContaining(`credential binding ${reservedName} uses a reserved TLS-control`),
+      }));
+      expect(prepareAdapterExecutionTargetRuntime).not.toHaveBeenCalled();
+      expect(ensureAdapterExecutionTargetDirectory).not.toHaveBeenCalled();
+      expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+      expect(remoteExecute).not.toHaveBeenCalled();
+    },
+  );
+
   it("stages and reapplies remote additive trust after env setup, and fails closed when staging omits xdgConfig", async () => {
     const remoteTarget: AdapterExecutionTarget = {
       kind: "remote", transport: "sandbox", providerKey: "cloudflare", remoteCwd: "/remote/workspace",

@@ -26,6 +26,7 @@ const REMOTE_TRUST_CONFLICTING_ENV = [
   "SSLKEYLOGFILE",
   "NODE_EXTRA_CA_CERTS",
 ];
+const REMOTE_RESERVED_CREDENTIAL_ENV = new Set(REMOTE_TRUST_CONFLICTING_ENV.map((name) => name.toUpperCase()));
 
 export function validateOpenCodeRemoteTrustedCaPem(value: unknown, now = new Date()): string {
   if (typeof value !== "string" || Buffer.byteLength(value, "utf8") === 0) {
@@ -42,6 +43,7 @@ export function validateOpenCodeRemoteTrustedCaPem(value: unknown, now = new Dat
   if (remainder.trim().length > 0) {
     throw new Error("Remote OpenCode trusted CA bundle must contain only CA PEM certificate blocks and whitespace.");
   }
+  const canonicalCertificates: string[] = [];
   for (const match of matches) {
     let certificate: X509Certificate;
     try {
@@ -57,8 +59,9 @@ export function validateOpenCodeRemoteTrustedCaPem(value: unknown, now = new Dat
     const timestamp = now.getTime();
     if (timestamp < validFrom) throw new Error("Remote OpenCode trusted CA certificate is not yet valid.");
     if (timestamp > validTo) throw new Error("Remote OpenCode trusted CA certificate has expired.");
+    canonicalCertificates.push(certificate.toString().trimEnd());
   }
-  return value.endsWith("\n") ? value : `${value}\n`;
+  return `${canonicalCertificates.join("\n")}\n`;
 }
 
 /** Apply a staged remote CA using Node's additive system-root trust behavior. */
@@ -347,6 +350,9 @@ async function prepareRemoteOpenCodeRuntimeConfig(
       : null;
     if (!keyMatch) {
       throw new Error(`Remote OpenCode provider ${modelRef.provider} must bind apiKey to an explicit environment variable.`);
+    }
+    if (REMOTE_RESERVED_CREDENTIAL_ENV.has(keyMatch[1].toUpperCase())) {
+      throw new Error(`Remote OpenCode credential binding ${keyMatch[1]} uses a reserved TLS-control environment variable.`);
     }
     const keyValue = input.env[keyMatch[1]];
     if (typeof keyValue !== "string" || keyValue.trim().length === 0) {

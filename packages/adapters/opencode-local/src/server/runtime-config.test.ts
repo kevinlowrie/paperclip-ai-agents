@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { X509Certificate } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -119,12 +120,19 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     ["non-CA certificates", TEST_LEAF_PEM],
     ["extra text", `untrusted prefix\n${TEST_CA_PEM}`],
     ["malformed certificates", "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----"],
+    ["malformed data inside a certificate", TEST_CA_PEM.replace("MIICFD", "MIICFDjunk")],
+    ["DER data after a certificate", TEST_CA_PEM.replace("-----END CERTIFICATE-----", "AAAA-----END CERTIFICATE-----")],
   ])("rejects remote trusted CA material containing %s", async (_label, trustedCaPem) => {
     await expect(prepareOpenCodeRuntimeConfig({
       env: { PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({ gateway: { options: { apiKey: "{env:KEY}" }, models: { model: {} } } }), KEY: "fixture" },
       config: { model: "gateway/model", trustedCaPem },
       targetIsRemote: true,
     })).rejects.toThrow(/trusted CA|certificate|PEM/i);
+  });
+
+  it("canonicalizes certificate bytes from the parsed X509 certificate", () => {
+    const canonicalPem = new X509Certificate(TEST_CA_PEM).toString();
+    expect(validateOpenCodeRemoteTrustedCaPem(`\n${TEST_CA_PEM.trim()}\n\n`)).toBe(`${canonicalPem.trimEnd()}\n`);
   });
 
   it("rejects expired, not-yet-valid, oversized, and excessive remote CA bundles", () => {
