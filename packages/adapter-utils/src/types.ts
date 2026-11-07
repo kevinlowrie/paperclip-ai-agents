@@ -682,6 +682,8 @@ export interface CreateConfigValues {
   paperclipRunnerIdleTimeoutMs?: number;
   cwd: string;
   instructionsFilePath?: string;
+  /** Adapter-visible path to the instruction bundle in its execution environment. */
+  instructionsExecutionFilePath?: string;
   promptTemplate: string;
   model: string;
   thinkingEffort: string;
