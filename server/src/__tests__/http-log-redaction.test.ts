@@ -307,7 +307,7 @@ describe("HTTP logger redaction", () => {
     });
   });
 
-  it("defines the HTTP auth and cookie header paths that must be redacted", () => {
+  it("defines the HTTP auth, identity, and cookie header paths that must be redacted", () => {
     expect(HTTP_LOG_REDACT_PATHS).toContain("req.headers.authorization");
     expect(HTTP_LOG_REDACT_PATHS).toContain("req.headers.cookie");
     expect(HTTP_LOG_REDACT_PATHS).toContain('req.headers["set-cookie"]');
@@ -321,6 +321,16 @@ describe("HTTP logger redaction", () => {
     expect(HTTP_LOG_REDACT_PATHS).toContain(
       'req.headers["x-telegram-bot-api-secret-token"]',
     );
+    for (const header of [
+      "cf-access-jwt-assertion",
+      "cf-access-client-id",
+      "cf-access-client-secret",
+      "cf-authorization",
+      "cf-access-authenticated-user-email",
+    ]) {
+      expect(HTTP_LOG_REDACT_PATHS).toContain(`req.headers["${header}"]`);
+      expect(HTTP_LOG_REDACT_PATHS).toContain(`res.headers["${header}"]`);
+    }
     expect(HTTP_LOG_REDACT_PATHS).toContain("reqBody.credentials");
     expect(HTTP_LOG_REDACT_PATHS).toContain("errorContext.details.credentials");
   });
@@ -478,6 +488,48 @@ describe("HTTP logger redaction", () => {
       expect(log.errorContext.message).toBe("Synthetic cloud request failure");
       expect(log.err.message).toBe("Synthetic cloud request failure");
     }
+  });
+
+  it.each([200, 500])("redacts Cloudflare Access credentials and identity from HTTP %i logs", async (status) => {
+    const headers = {
+      "Cf-Access-Jwt-Assertion": "cf-jwt-assertion-canary",
+      "Cf-Access-Client-Id": "cf-client-id-canary",
+      "Cf-Access-Client-Secret": "cf-client-secret-canary",
+      "Cf-Authorization": "cf-authorization-canary",
+      "Cf-Access-Authenticated-User-Email": "identity-email-canary@example.invalid",
+    };
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.get("/api/companies", (_req, res, next) => {
+      for (const [header, value] of Object.entries(headers)) {
+        res.setHeader(header, value);
+      }
+      if (status === 500) {
+        next(new Error("Synthetic Cloudflare Access request failure"));
+        return;
+      }
+      res.status(status).json({ status });
+    });
+    app.use(errorHandler);
+
+    await request(app).get("/api/companies").set(headers).expect(status);
+
+    const output = chunks.join("");
+    const log = JSON.parse(output.trim());
+    for (const [header, value] of Object.entries(headers)) {
+      expect(output).not.toContain(value);
+      expect(log.req.headers[header.toLowerCase()]).toBe("[Redacted]");
+      expect(log.res.headers[header.toLowerCase()]).toBe("[Redacted]");
+    }
+    expect(log.req.url).toBe("/api/companies");
+    expect(log.res.statusCode).toBe(status);
   });
 
   it("drops OAuth callback query data from the message and structured request", async () => {

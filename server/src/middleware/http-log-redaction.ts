@@ -17,6 +17,18 @@ export const HTTP_LOG_REDACT_PATHS = [
   'req.headers["x-paperclip-cloud-control"]',
   // Runtime GitHub capabilities authorize credential acquisition for a live run.
   'req.headers["x-paperclip-github-capability"]',
+  // Cloudflare Access credentials and authenticated identity are present on
+  // proxied requests. They can also be reflected by upstreams into responses.
+  'req.headers["cf-access-jwt-assertion"]',
+  'req.headers["cf-access-client-id"]',
+  'req.headers["cf-access-client-secret"]',
+  'req.headers["cf-authorization"]',
+  'req.headers["cf-access-authenticated-user-email"]',
+  'res.headers["cf-access-jwt-assertion"]',
+  'res.headers["cf-access-client-id"]',
+  'res.headers["cf-access-client-secret"]',
+  'res.headers["cf-authorization"]',
+  'res.headers["cf-access-authenticated-user-email"]',
   // Telegram's optional webhook verification header is a reusable bearer
   // secret sent on every provider callback.
   'req.headers["x-telegram-bot-api-secret-token"]',
