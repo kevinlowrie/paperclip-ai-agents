@@ -220,7 +220,7 @@ export async function testEnvironment(
         adapterKey: "opencode",
         installCommand: SANDBOX_INSTALL_COMMAND,
         detectCommand: command,
-        env,
+        env: targetIsRemote ? preparedRuntimeConfig.env : env,
       });
       if (installCheck) checks.push(installCheck);
       try {
@@ -382,7 +382,10 @@ export async function testEnvironment(
           args,
           {
             cwd: runtimeCwd,
-            env: runtimeEnv,
+            env: {
+              ...runtimeEnv,
+              ...(targetIsRemote ? preparedRuntimeConfig.credentialEnv : {}),
+            },
             timeoutSec: helloProbeTimeoutSec,
             graceSec: 5,
             stdin: "Respond with hello.",

@@ -334,6 +334,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     config,
     targetIsRemote: executionTargetIsRemote,
   });
+  const remoteCredentialEnv = executionTargetIsRemote
+    ? preparedRuntimeConfig.credentialEnv ?? {}
+    : {};
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   if (executionTargetIsRemote) {
@@ -446,6 +449,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         executionTargetIsRemote,
         executionCwd: effectiveExecutionCwd,
       });
+      for (const name of Object.keys(remoteCredentialEnv)) {
+        delete preparedRuntimeConfig.env[name];
+      }
       delete preparedRuntimeConfig.env.PAPERCLIP_OPENCODE_PROVIDERS;
       delete preparedRuntimeConfig.env.PAPERCLIP_OPENCODE_SMALL_MODEL;
       remoteRuntimeRootDir = preparedExecutionTargetRuntime.runtimeRootDir;
@@ -484,7 +490,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         command,
         model,
         cwd,
-        env: preparedRuntimeConfig.env,
+        env: { ...preparedRuntimeConfig.env, ...remoteCredentialEnv },
         timeoutSec,
         graceSec,
       });
@@ -663,7 +669,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         onProcessStopped: providerStop.beginInvocation(),
         cwd,
-        env: preparedRuntimeConfig.env,
+        env: { ...preparedRuntimeConfig.env, ...remoteCredentialEnv },
         stdin: prompt,
         timeoutSec,
         graceSec,

@@ -5,6 +5,7 @@ import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
+  credentialEnv?: Record<string, string>;
   notes: string[];
   cleanup: () => Promise<void>;
 };
@@ -21,10 +22,12 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function containsExactString(value: unknown, expected: string): boolean {
-  if (value === expected) return true;
-  if (Array.isArray(value)) return value.some((entry) => containsExactString(entry, expected));
-  if (isPlainObject(value)) return Object.values(value).some((entry) => containsExactString(entry, expected));
+function containsCredential(value: unknown, expected: string): boolean {
+  if (typeof value === "string") {
+    return value.includes(expected);
+  }
+  if (Array.isArray(value)) return value.some((entry) => containsCredential(entry, expected));
+  if (isPlainObject(value)) return Object.values(value).some((entry) => containsCredential(entry, expected));
   return false;
 }
 
@@ -262,6 +265,7 @@ async function prepareRemoteOpenCodeRuntimeConfig(
   }
   const requestedModels = [configuredModel, smallModelRef];
   const minimalProviders: Record<string, Record<string, unknown>> = {};
+  const credentialEnv: Record<string, string> = {};
   for (const modelRef of requestedModels) {
     const declaredProvider = providers?.[modelRef.provider];
     if (!isPlainObject(declaredProvider)) {
@@ -279,6 +283,7 @@ async function prepareRemoteOpenCodeRuntimeConfig(
     if (typeof keyValue !== "string" || keyValue.trim().length === 0) {
       throw new Error(`Remote OpenCode credential binding ${keyMatch[1]} is missing or empty.`);
     }
+    credentialEnv[keyMatch[1]] = keyValue;
     const providerModels = isPlainObject(declaredProvider.models) ? declaredProvider.models : {};
     const existing = minimalProviders[modelRef.provider];
     const minimalProvider: Record<string, unknown> = existing ?? {
@@ -286,29 +291,33 @@ async function prepareRemoteOpenCodeRuntimeConfig(
       options: { ...options, apiKey: keyReference },
       models: {},
     };
-    if (containsExactString(minimalProvider, keyValue)) {
-      throw new Error(`Remote OpenCode provider ${modelRef.provider} embeds the selected credential instead of referencing its environment binding.`);
-    }
     const minimalModels = minimalProvider.models as Record<string, unknown>;
     minimalModels[modelRef.model] = isPlainObject(providerModels[modelRef.model])
       ? providerModels[modelRef.model]
       : {};
     minimalProviders[modelRef.provider] = minimalProvider;
   }
-  const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-config-"));
-  const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
-  await fs.mkdir(runtimeConfigDir, { recursive: true });
   const nextConfig: Record<string, unknown> = {
     ...(skipPermissions ? { permission: "allow" } : {}),
     provider: minimalProviders,
   };
   nextConfig.small_model = configuredSmallModel || `${configuredModel.provider}/${configuredModel.model}`;
+  for (const [name, value] of Object.entries(credentialEnv)) {
+    if (containsCredential(nextConfig, value)) {
+      throw new Error(`Remote OpenCode profile embeds credential ${name} instead of keeping it in the runtime environment.`);
+    }
+  }
+  const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-config-"));
+  const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
+  await fs.mkdir(runtimeConfigDir, { recursive: true });
   await fs.writeFile(path.join(runtimeConfigDir, "opencode.json"), `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
   const runtimeEnv = { ...input.env };
   delete runtimeEnv.PAPERCLIP_OPENCODE_PROVIDERS;
   delete runtimeEnv.PAPERCLIP_OPENCODE_SMALL_MODEL;
+  for (const name of Object.keys(credentialEnv)) delete runtimeEnv[name];
   return {
     env: { ...runtimeEnv, XDG_CONFIG_HOME: runtimeConfigHome },
+    credentialEnv,
     notes: ["Created an isolated remote OpenCode config from the selected run provider/model."],
     cleanup: async () => fs.rm(runtimeConfigHome, { recursive: true, force: true }),
   };

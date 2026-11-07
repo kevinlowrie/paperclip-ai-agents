@@ -254,6 +254,7 @@ describe("opencode remote execution", () => {
     expect(call?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
     expect(modelProbeCall?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
     expect(call?.[3].env.XDG_RUNTIME_DIR).toBe(`${home}/runtime`);
+    expect(modelProbeCall?.[3].env.SCOPED_PROVIDER_KEY).toBe("fixture-scoped-key");
     expect(runSshCommand).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining(`${home}/.claude/skills`),
@@ -288,6 +289,11 @@ describe("opencode remote execution", () => {
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    expect(ensureCommandResolvable).toHaveBeenCalled();
+    for (const callArgs of ensureCommandResolvable.mock.calls as unknown as unknown[][]) {
+      const commandEnv = callArgs[2] as Record<string, string>;
+      expect(commandEnv.SCOPED_PROVIDER_KEY).toBeUndefined();
+    }
   });
 
   it("fails before the remote run when the configured model is unavailable on the SSH target", async () => {

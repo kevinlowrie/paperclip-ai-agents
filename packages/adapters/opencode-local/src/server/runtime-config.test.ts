@@ -88,7 +88,8 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       });
       expect(runtimeConfig.provider?.unrelated).toBeUndefined();
       expect(JSON.stringify(runtimeConfig)).not.toMatch(/host-only-sentinel|host-file-key-sentinel|host-file-small-model|raw-unselected-key|explicit-scoped-key|ambient-host-key|host-model/);
-      expect(prepared.env.SCOPED_KEY).toBe("explicit-scoped-key");
+      expect(prepared.env.SCOPED_KEY).toBeUndefined();
+      expect(prepared.credentialEnv?.SCOPED_KEY).toBe("explicit-scoped-key");
       expect(prepared.env.PAPERCLIP_OPENCODE_PROVIDERS).toBeUndefined();
       expect(prepared.env.PAPERCLIP_OPENCODE_SMALL_MODEL).toBeUndefined();
       await prepared.cleanup();
@@ -146,6 +147,22 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       config: { model: "gateway/model" },
       targetIsRemote: true,
     })).rejects.toThrow("must bind apiKey to an explicit environment variable");
+  });
+
+  it("rejects a selected credential copied into model metadata", async () => {
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: {
+        PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+          gateway: {
+            options: { apiKey: "{env:SCOPED_KEY}" },
+            models: { model: { description: "untrusted metadata contains fixture-model-key-value exactly" } },
+          },
+        }),
+        SCOPED_KEY: "fixture-model-key-value",
+      },
+      config: { model: "gateway/model" },
+      targetIsRemote: true,
+    })).rejects.toThrow("Remote OpenCode profile embeds credential SCOPED_KEY");
   });
 
   it("allows all tools and connected tools by default", async () => {
