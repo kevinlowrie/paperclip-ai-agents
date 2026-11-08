@@ -111,6 +111,9 @@ describe("ensureTenant", () => {
     ["unrestricted unknown selector grant", (policy: any) => { policy.spec.egress.push({ toEndpoints: [{}] }); }],
     ["portless world entity grant", (policy: any) => { policy.spec.egress.push({ toEntities: ["world"] }); }],
     ["endpoint selector expressions", (policy: any) => { policy.spec.egress[0].toEndpoints[0].matchExpressions = []; }],
+    ["unconfigured FQDN", (policy: any) => { policy.spec.egress.find((rule: any) => rule.toFQDNs).toFQDNs.push({ matchName: "extra.example.invalid" }); }],
+    ["duplicate FQDN", (policy: any) => { const rule = policy.spec.egress.find((item: any) => item.toFQDNs); rule.toFQDNs.push({ ...rule.toFQDNs[0] }); }],
+    ["missing configured FQDN", (policy: any) => { policy.spec.egress = policy.spec.egress.filter((rule: any) => !rule.toFQDNs); }],
   ])("rejects %s in strict Cilium mode", async (_label, mutate) => {
     const clients = makeMockClients();
     const policy = buildCiliumNetworkPolicyManifest({
@@ -124,6 +127,28 @@ describe("ensureTenant", () => {
     clients.custom.getNamespacedCustomObject.mockResolvedValue({ body: policy });
     await expect(ensureTenant(clients as never, { ...baseInput, egressMode: "cilium", dnsQueryAllowFqdns: ["api.example.invalid"] })).rejects.toThrow(/DNS/i);
     expect(clients.custom.createNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it("rejects any FQDN policy rule when none is configured", async () => {
+    const clients = makeMockClients();
+    const policy = buildCiliumNetworkPolicyManifest({
+      namespace: baseInput.namespace,
+      paperclipServerNamespace: baseInput.paperclipServerNamespace,
+      egressAllowFqdns: [],
+      egressAllowCidrs: [],
+      dnsQueryAllowFqdns: ["api.example.invalid"],
+    });
+    policy.spec.egress.push({
+      toFQDNs: [{ matchName: "extra.example.invalid" }],
+      toPorts: [{ ports: [{ port: "443", protocol: "TCP" }] }],
+    });
+    clients.custom.getNamespacedCustomObject.mockResolvedValue({ body: policy });
+    await expect(ensureTenant(clients as never, {
+      ...baseInput,
+      egressMode: "cilium",
+      egressAllowFqdns: [],
+      dnsQueryAllowFqdns: ["api.example.invalid"],
+    })).rejects.toThrow(/DNS/i);
   });
 
   it("applies serviceAccountAnnotations to the ServiceAccount", async () => {

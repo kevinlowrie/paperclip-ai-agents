@@ -228,7 +228,11 @@ async function ensureNetworkPolicies(clients: KubeClients, input: EnsureTenantIn
     await ensureCiliumNetworkPolicy(clients, input.namespace, cnp);
     if (input.dnsQueryAllowFqdns !== undefined) {
       await assertCiliumDnsQueries(
-        clients, input.namespace, input.paperclipServerNamespace, input.dnsQueryAllowFqdns,
+        clients,
+        input.namespace,
+        input.paperclipServerNamespace,
+        input.dnsQueryAllowFqdns,
+        input.egressAllowFqdns,
       );
     }
   } else {
@@ -258,6 +262,7 @@ async function assertCiliumDnsQueries(
   namespace: string,
   paperclipServerNamespace: string,
   expectedNames: string[],
+  expectedFqdns: string[],
 ): Promise<void> {
   const result = await clients.custom.getNamespacedCustomObject({
     group: "cilium.io",
@@ -272,6 +277,7 @@ async function assertCiliumDnsQueries(
   if (!Array.isArray(egress)) throw dnsPolicyMismatch();
 
   let dnsRuleCount = 0;
+  let fqdnRuleCount = 0;
   for (const candidate of egress) {
     const rule = asRecord(candidate);
     if (!rule) throw dnsPolicyMismatch();
@@ -279,13 +285,19 @@ async function assertCiliumDnsQueries(
       dnsRuleCount += 1;
       continue;
     }
-    if (isExactPaperclipServerRule(rule, paperclipServerNamespace) || isExactFqdn443Rule(rule)) continue;
+    if (isExactPaperclipServerRule(rule, paperclipServerNamespace)) continue;
+    if (isExactFqdn443Rule(rule, expectedFqdns)) {
+      fqdnRuleCount += 1;
+      continue;
+    }
     // Only the known generated rule forms are accepted. Any broader or
     // unfamiliar selector/port shape could reach a DNS resolver without the
     // exact L7 name restriction, so strict mode fails closed.
     throw dnsPolicyMismatch();
   }
-  if (dnsRuleCount !== 1) throw dnsPolicyMismatch();
+  if (dnsRuleCount !== 1 || fqdnRuleCount !== (expectedFqdns.length > 0 ? 1 : 0)) {
+    throw dnsPolicyMismatch();
+  }
 }
 
 function isExactKubeDnsRule(rule: Record<string, unknown>, expectedNames: string[]): boolean {
@@ -344,15 +356,24 @@ function isExactPaperclipServerRule(
   return hasExactPortList(port.ports, [{ port: "3100", protocol: "TCP" }]);
 }
 
-function isExactFqdn443Rule(rule: Record<string, unknown>): boolean {
+function isExactFqdn443Rule(rule: Record<string, unknown>, expectedNames: string[]): boolean {
   if (!hasOnlyKeys(rule, ["toFQDNs", "toPorts"])) return false;
   const names = rule.toFQDNs;
   const ports = rule.toPorts;
-  if (!Array.isArray(names) || names.length === 0 || !Array.isArray(ports) || ports.length !== 1) return false;
-  if (names.some((item) => {
+  if (expectedNames.length === 0 || !Array.isArray(names) || !Array.isArray(ports) || ports.length !== 1) return false;
+  const actualNames = names.map((item) => {
     const name = asRecord(item);
-    return !name || !hasOnlyKeys(name, ["matchName"]) || typeof name.matchName !== "string";
-  })) return false;
+    return name && hasOnlyKeys(name, ["matchName"]) && typeof name.matchName === "string"
+      ? name.matchName
+      : undefined;
+  });
+  if (
+    actualNames.some((name) => name === undefined) ||
+    actualNames.length !== expectedNames.length ||
+    new Set(actualNames).size !== actualNames.length
+  ) return false;
+  const expected = [...expectedNames].sort();
+  if (![...actualNames].sort().every((name, index) => name === expected[index])) return false;
   const port = asRecord(ports[0]);
   return !!port && hasOnlyKeys(port, ["ports"]) && hasExactPortList(port.ports, [{ port: "443", protocol: "TCP" }]);
 }

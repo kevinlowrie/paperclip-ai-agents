@@ -129,7 +129,10 @@ const manifest: PaperclipPluginManifestV1 = {
         allOf: [
           {
             if: { required: ["dnsQueryAllowFqdns"] },
-            then: { properties: { egressMode: { const: "cilium" } }, required: ["egressMode"] },
+            then: {
+              properties: { egressMode: { const: "cilium" }, egressAllowCidrs: { maxItems: 0 } },
+              required: ["egressMode"],
+            },
           },
         ],
       },

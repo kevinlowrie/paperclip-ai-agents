@@ -92,6 +92,10 @@ export const kubernetesProviderConfigSchema = z
   .refine((cfg) => cfg.dnsQueryAllowFqdns === undefined || cfg.egressMode === "cilium", {
     message: "dnsQueryAllowFqdns requires egressMode=cilium",
     path: ["dnsQueryAllowFqdns"],
+  })
+  .refine((cfg) => cfg.dnsQueryAllowFqdns === undefined || cfg.egressAllowCidrs.length === 0, {
+    message: "egressAllowCidrs cannot be combined with dnsQueryAllowFqdns",
+    path: ["egressAllowCidrs"],
   });
 
 export type KubernetesProviderConfig = z.infer<typeof kubernetesProviderConfigSchema>;

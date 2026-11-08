@@ -42,6 +42,15 @@ describe("kubernetesProviderConfigSchema", () => {
     expect(strict.dnsQueryAllowFqdns).toEqual(["api.example.invalid", "svc.namespace.svc"]);
   });
 
+  it("rejects CIDR grants when exact DNS query restrictions are configured", () => {
+    expect(() => parseKubernetesProviderConfig({
+      inCluster: true,
+      egressMode: "cilium",
+      dnsQueryAllowFqdns: ["api.example.invalid"],
+      egressAllowCidrs: ["192.0.2.0/24"],
+    })).toThrow(/egressAllowCidrs/);
+  });
+
   it("requires Cilium mode for DNS query restrictions", () => {
     expect(() =>
       parseKubernetesProviderConfig({ inCluster: true, dnsQueryAllowFqdns: ["api.example.invalid"] }),

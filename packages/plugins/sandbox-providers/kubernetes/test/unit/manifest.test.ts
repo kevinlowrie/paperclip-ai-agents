@@ -5,6 +5,7 @@ describe("Kubernetes provider manifest", () => {
   it("publishes the bounded exact DNS query capability", () => {
     const configSchema = manifest.environmentDrivers?.[0].configSchema as {
       properties?: Record<string, { minItems?: number; maxItems?: number; uniqueItems?: boolean }>;
+      allOf?: Array<{ then?: { properties?: Record<string, { maxItems?: number }> } }>;
     };
     const property = configSchema.properties?.dnsQueryAllowFqdns as {
       minItems?: number;
@@ -17,5 +18,6 @@ describe("Kubernetes provider manifest", () => {
     for (const ipLikeName of ["192.0.2.1", "127.1", "127.0.1", "0x7f.0x1"]) {
       expect(pattern.test(ipLikeName)).toBe(false);
     }
+    expect(configSchema.allOf?.some((rule) => rule.then?.properties?.egressAllowCidrs?.maxItems === 0)).toBe(true);
   });
 });
