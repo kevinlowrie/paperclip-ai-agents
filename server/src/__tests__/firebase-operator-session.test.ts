@@ -22,9 +22,11 @@ import {
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { firebaseOperatorSessionPlugin } from "../auth/firebase-operator-session-plugin.js";
+import * as firebaseOperatorSessionModule from "../auth/firebase-operator-session-plugin.js";
 import { firebaseOperatorPreAuthRequestHandler } from "../auth/firebase-operator-session-preflight.js";
 import { FirebaseOperatorVerificationError, type FirebaseOperatorProof } from "../auth/firebase-operator-verifier.js";
 import { createHttpLogger } from "../middleware/logger.js";
+import { logger } from "../middleware/logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 
 const PUBLIC = "https://paperclip.example.test";
@@ -42,6 +44,82 @@ const proof = (overrides: Partial<FirebaseOperatorProof> = {}): FirebaseOperator
   totpFactors: [{ factorId: "totp", uid: "totp-factor-1" }],
   ...overrides,
 } as FirebaseOperatorProof);
+
+type CapturedSpan = {
+  name: string;
+  options: unknown;
+  parent: unknown;
+  attributes: Record<string, unknown>;
+  exceptions: string[];
+  statuses: Array<{ code: number; message?: string }>;
+  ended: boolean;
+};
+type RecordingTelemetry = {
+  spans: CapturedSpan[];
+  api: Record<string, any>;
+  deregisterResolutionHook(): void;
+};
+let recordingTelemetry: RecordingTelemetry | undefined;
+
+async function installActualApiRecordingTracer(): Promise<RecordingTelemetry> {
+  if (recordingTelemetry) return recordingTelemetry;
+  const { createRequire, registerHooks } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const apiPath = createRequire(import.meta.url).resolve("@opentelemetry/api");
+  const resolutionHook = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "@opentelemetry/api") return nextResolve(pathToFileURL(apiPath).href, context);
+      return nextResolve(specifier, context);
+    },
+  });
+  const api = await import(pathToFileURL(apiPath).href) as Record<string, any>;
+  let activeContext = api.ROOT_CONTEXT;
+  const contextManager = {
+    active() { return activeContext; },
+    with<T>(context: unknown, callback: (...args: unknown[]) => T, thisArg?: unknown, ...args: unknown[]): T {
+      const previous = activeContext;
+      activeContext = context;
+      try { return callback.apply(thisArg, args); } finally { activeContext = previous; }
+    },
+    bind<T>(context: unknown, target: T): T {
+      if (typeof target !== "function") return target;
+      const manager = this;
+      return function (this: unknown, ...args: unknown[]) { return manager.with(context, target as (...values: unknown[]) => unknown, this, ...args); } as T;
+    },
+    enable() { return this; },
+    disable() { activeContext = api.ROOT_CONTEXT; return this; },
+  };
+  expect(api.context.setGlobalContextManager(contextManager)).toBe(true);
+  const spans: CapturedSpan[] = [];
+  const tracer = {
+    startSpan(name: string, options?: unknown, parent?: unknown) {
+      const captured: CapturedSpan = { name, options, parent, attributes: {}, exceptions: [], statuses: [], ended: false };
+      spans.push(captured);
+      return {
+        setAttribute(key: string, value: unknown) { captured.attributes[key] = value; return this; },
+        setAttributes(values: Record<string, unknown>) { Object.assign(captured.attributes, values); return this; },
+        addEvent(name: string, attributes?: Record<string, unknown>) { captured.attributes[`event:${name}`] = attributes ?? {}; return this; },
+        recordException(error: unknown) { captured.exceptions.push(error instanceof Error ? error.message : String(error)); },
+        setStatus(status: { code: number; message?: string }) { captured.statuses.push(status); },
+        updateName(name: string) { captured.name = name; return this; },
+        end() { captured.ended = true; },
+        isRecording() { return true; },
+        spanContext() { return { traceId: "11111111111111111111111111111111", spanId: "2222222222222222", traceFlags: 1, traceState: undefined, isRemote: false }; },
+      };
+    },
+    startActiveSpan(name: string, optionsOrCallback: unknown, contextOrCallback: unknown, callback?: (span: unknown) => unknown) {
+      const span = this.startSpan(name, typeof optionsOrCallback === "function" ? undefined : optionsOrCallback);
+      const run = typeof optionsOrCallback === "function" ? optionsOrCallback
+        : typeof contextOrCallback === "function" ? contextOrCallback : callback;
+      return typeof run === "function" ? run(span) : span;
+    },
+  };
+  const provider = { getTracer: () => tracer };
+  const registered = api.trace.setGlobalTracerProvider(provider);
+  expect(registered).toBe(true);
+  recordingTelemetry = { spans, api, deregisterResolutionHook: () => resolutionHook.deregister() };
+  return recordingTelemetry;
+}
 
 describe("Firebase operator browser session exchange (real PostgreSQL + Better Auth 1.7.18)", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -91,8 +169,18 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     hooks?: Record<string, unknown>;
     cookieDomain?: string;
     httpLogs?: string[];
+    audit?: (event: unknown) => void;
+    unsafeAuthOptions?: boolean;
   } = {}) {
-    const auth = betterAuth({
+    const pluginDependencies = {
+      db,
+      verifier: { verify: options.verify ?? (async (token: string) => token === TOKEN_SENTINEL ? proof({ uid: f.uid }) : Promise.reject(new Error(`bad token ${token}`))) },
+      trustedOrigins: new Set([PUBLIC, LAB]),
+      allowedCompanyIds: new Set([f.companyId]),
+      now: options.now ?? (() => NOW),
+      ...(options.audit ? { audit: options.audit } : {}),
+    };
+    const rawAuthOptions = {
       secret: "real-test-secret-for-better-auth-session-exchange",
       baseURL: PUBLIC,
       trustedOrigins: [PUBLIC, LAB],
@@ -104,14 +192,13 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
       advanced: { crossSubDomainCookies: { enabled: Boolean(options.cookieDomain), domain: options.cookieDomain }, useSecureCookies: true },
       logger: { log: (level: string, message: string, ...args: unknown[]) => options.onLogger?.({ level, message, args }) } as never,
       databaseHooks: options.hooks as never,
-      plugins: [firebaseOperatorSessionPlugin({
-        db,
-        verifier: { verify: options.verify ?? (async (token) => token === TOKEN_SENTINEL ? proof({ uid: f.uid }) : Promise.reject(new Error(`bad token ${token}`))) },
-        trustedOrigins: new Set([PUBLIC, LAB]),
-        allowedCompanyIds: new Set([f.companyId]),
-        now: options.now ?? (() => NOW),
-      })],
-    });
+      plugins: [firebaseOperatorSessionPlugin(pluginDependencies)],
+    };
+    const safeOptionsFactory = (firebaseOperatorSessionModule as unknown as {
+      firebaseOperatorSafeAuthOptions?: (input: Record<string, unknown>, audit?: (event: unknown) => void) => Record<string, unknown>;
+    }).firebaseOperatorSafeAuthOptions;
+    const authOptions = options.unsafeAuthOptions ? rawAuthOptions : safeOptionsFactory?.(rawAuthOptions, options.audit) ?? rawAuthOptions;
+    const auth = betterAuth(authOptions as never);
     const app = express();
     if (options.httpLogs) {
       const stream = new Writable({ write(chunk, _encoding, callback) { options.httpLogs!.push(chunk.toString()); callback(); } });
@@ -203,6 +290,329 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
       },
     };
   }
+
+  async function blockTransactionInsert() {
+    const lockKey = 7_351_923;
+    await db.execute(sql.raw(`
+      create or replace function pclip_block_test_login_transaction() returns trigger
+      language plpgsql as $$ begin perform pg_advisory_xact_lock(${lockKey}); return new; end $$
+    `));
+    await db.execute(sql.raw(`
+      create trigger pclip_block_test_login_transaction before insert on firebase_operator_login_transactions
+      for each row execute function pclip_block_test_login_transaction()
+    `));
+    const blockerDb = createDb(temporary.connectionString);
+    let releaseLock!: () => void;
+    let signalLock!: () => void;
+    const blocked = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockAcquired = new Promise<void>((resolve) => { signalLock = resolve; });
+    const holding = blockerDb.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${lockKey})`);
+      signalLock();
+      await blocked;
+    });
+    await lockAcquired;
+    let released = false;
+    let cleaned = false;
+    return {
+      async waitForInsert() {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const waits = await db.execute(sql`
+            select pid from pg_stat_activity
+            where wait_event_type = 'Lock' and query ilike '%firebase_operator_login_transactions%'
+          `) as unknown as Array<{ pid: number }>;
+          if (waits.length > 0) return true;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        return false;
+      },
+      async release() {
+        if (released) return;
+        released = true;
+        releaseLock();
+        await holding;
+      },
+      async cleanup() {
+        if (cleaned) return;
+        cleaned = true;
+        await this.release();
+        await blockerDb.$client.end();
+        await db.execute(sql.raw("drop trigger if exists pclip_block_test_login_transaction on firebase_operator_login_transactions"));
+        await db.execute(sql.raw("drop function if exists pclip_block_test_login_transaction()"));
+      },
+    };
+  }
+
+  it("records Better Auth 1.7.18's real post-create exception before the endpoint catch under unsafe options", async () => {
+    const telemetry = await installActualApiRecordingTracer();
+    telemetry.spans.length = 0;
+    const f = await fixture();
+    const sdkSentinel = "SDK-TRACE-ERROR-SENTINEL-REWORK1";
+    const { app } = appFor(f, {
+      unsafeAuthOptions: true,
+      hooks: { session: { create: { after: async () => { throw new Error(sdkSentinel); } } } },
+    });
+    const started = await begin(app);
+    const response = await exchange(app, started, started.body.state);
+    const sdkSpans = telemetry.spans.filter((span) => span.name.includes("session"));
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(sdkSpans.some((span) => span.exceptions.includes(sdkSentinel))).toBe(true);
+    expect(sdkSpans.some((span) => span.statuses.some((status) => status.message === sdkSentinel))).toBe(true);
+  });
+
+  it("builds safe Better Auth options, suppresses raw SDK arguments, and rejects unsafe plugin initialization", async () => {
+    const factory = (firebaseOperatorSessionModule as unknown as {
+      firebaseOperatorSafeAuthOptions?: (input: Record<string, unknown>, audit?: (event: unknown) => void) => Record<string, unknown>;
+    }).firebaseOperatorSafeAuthOptions;
+    expect(factory).toBeTypeOf("function");
+    if (!factory) return;
+
+    const events: unknown[] = [];
+    const source = {
+      secret: "safe-options-secret",
+      baseURL: PUBLIC,
+      trustedOrigins: [PUBLIC],
+      experimental: { instrumentation: { enabled: true }, unrelatedFeature: { enabled: true } },
+      logger: { level: "debug", disabled: false, log: () => undefined },
+      emailAndPassword: { enabled: true },
+    };
+    const safe = factory(source, (event) => events.push(event));
+    expect(safe).not.toBe(source);
+    expect(safe.secret).toBe(source.secret);
+    expect(safe.trustedOrigins).toEqual([PUBLIC]);
+    expect((safe.experimental as Record<string, unknown>).unrelatedFeature).toEqual({ enabled: true });
+    expect(((safe.experimental as Record<string, unknown>).instrumentation as Record<string, unknown>).enabled).toBe(false);
+    const loggerOptions = safe.logger as { disabled?: boolean; log?: (...args: unknown[]) => void };
+    expect(loggerOptions.disabled).not.toBe(true);
+    expect(loggerOptions.log).toBeTypeOf("function");
+    loggerOptions.log?.("error", "SDK-RAW-MESSAGE-SENTINEL", { state: "SDK-RAW-ARG-SENTINEL", token: TOKEN_SENTINEL });
+    expect(events).toHaveLength(1);
+    const event = events[0] as Record<string, unknown>;
+    expect(event).toMatchObject({ event: "better_auth_log_suppressed", outcome: "suppressed", reason: "sdk_message_suppressed", sdkLevel: "error" });
+    expect(Object.keys(event).sort()).toEqual(["correlationId", "event", "outcome", "reason", "sdkLevel"].sort());
+    expect(event.correlationId).toEqual(expect.any(String));
+    expect(JSON.stringify(events)).not.toContain("SDK-RAW-MESSAGE-SENTINEL");
+    expect(JSON.stringify(events)).not.toContain("SDK-RAW-ARG-SENTINEL");
+    expect(JSON.stringify(events)).not.toContain(TOKEN_SENTINEL);
+
+    const f = await fixture();
+    const unsafe = appFor(f, { unsafeAuthOptions: true }).auth;
+    const unsafeRejected = await Promise.resolve(unsafe.$context).then(() => false, () => true);
+    expect(unsafeRejected).toBe(true);
+    const safeAuth = appFor(f).auth;
+    const safeResolved = await Promise.resolve(safeAuth.$context).then(() => true, () => false);
+    expect(safeResolved).toBe(true);
+    const clonedCallback = { ...loggerOptions, log: (...args: unknown[]) => loggerOptions.log?.(...args) };
+    const forged = { ...safe, logger: clonedCallback };
+    const forgedAuth = betterAuth({ ...forged, plugins: [firebaseOperatorSessionPlugin({
+      db, verifier: { verify: async () => proof() }, trustedOrigins: new Set([PUBLIC]), allowedCompanyIds: new Set([f.companyId]),
+    })] } as never);
+    const forgedRejected = await Promise.resolve(forgedAuth.$context).then(() => false, () => true);
+    expect(forgedRejected).toBe(true);
+  });
+
+  it("fails plugin initialization when Better Auth retains ordinary tracing and logger configuration", async () => {
+    const f = await fixture();
+    const unsafe = appFor(f, { unsafeAuthOptions: true }).auth;
+    const rejected = await Promise.resolve(unsafe.$context).then(() => false, () => true);
+    expect(rejected).toBe(true);
+  });
+
+  it("keeps safe auth spans and audit while removing SDK exception telemetry", async () => {
+    const telemetry = await installActualApiRecordingTracer();
+    telemetry.spans.length = 0;
+    const f = await fixture();
+    const events: unknown[] = [];
+    const sdkSentinel = "SAFE-TEST-SDK-TRACE-SENTINEL";
+    const loggerEntries: unknown[] = [];
+    const httpLogs: string[] = [];
+    const pinoSpies = ["debug", "info", "warn", "error"].map((level) => vi.spyOn(logger, level as "debug").mockImplementation(() => undefined as never));
+    const { app } = appFor(f, {
+      audit: (event) => events.push(event),
+      onLogger: (entry) => loggerEntries.push(entry),
+      httpLogs,
+      hooks: { session: { create: { after: async () => { throw new Error(`${sdkSentinel} ${TOKEN_SENTINEL} TOTP-SENTINEL SQL-DETAIL-SENTINEL ${SESSION_SENTINEL}`); } } } },
+    });
+    const started = await begin(app);
+    const response = await exchange(app, started, started.body.state);
+    try {
+      const capturedSurfaces = [telemetry.spans, events, loggerEntries, httpLogs, response.body, response.headers].map((value) => JSON.stringify(value));
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      for (const sentinel of [sdkSentinel, TOKEN_SENTINEL, "TOTP-SENTINEL", "SQL-DETAIL-SENTINEL", SESSION_SENTINEL]) {
+        expect(capturedSurfaces.some((surface) => surface.includes(sentinel))).toBe(false);
+      }
+      expect(events.length).toBeGreaterThan(0);
+      expect(telemetry.spans.some((span) => span.name.toLowerCase().includes("firebase") || span.name.toLowerCase().includes("operator"))).toBe(true);
+      expect(telemetry.spans.some((span) => span.exceptions.length > 0 || span.statuses.some((status) => status.message !== undefined))).toBe(false);
+      for (const span of telemetry.spans) {
+        expect(Object.values(span.attributes).join(" ")).not.toContain(TOKEN_SENTINEL);
+        expect(span.name).not.toContain(sdkSentinel);
+      }
+      const span = telemetry.spans.find((item) => item.name.toLowerCase().includes("firebase") || item.name.toLowerCase().includes("operator"));
+      expect(span?.parent).toBe(telemetry.api.ROOT_CONTEXT);
+      expect(response.headers["set-cookie"]?.join("\n") ?? "").not.toMatch(/session_token=[^;\s]+/);
+    } finally {
+      for (const spy of pinoSpies) spy.mockRestore();
+    }
+  });
+
+  it("uses the HTTP instrumentation ignore hook for reserved routes and preserves ordinary API spans", async () => {
+    const instrumentation = await import("../instrumentation.js") as unknown as {
+      firebaseOperatorHttpInstrumentationOptions?: () => { ignoreIncomingRequestHook(req: { method?: string; url?: string }): boolean };
+    };
+    expect(instrumentation.firebaseOperatorHttpInstrumentationOptions).toBeTypeOf("function");
+    if (!instrumentation.firebaseOperatorHttpInstrumentationOptions) return;
+    const telemetry = await installActualApiRecordingTracer();
+    telemetry.spans.length = 0;
+    const hook = instrumentation.firebaseOperatorHttpInstrumentationOptions().ignoreIncomingRequestHook;
+    const reserved = { method: "POST", url: `/api/auth/firebase-session/unknown?credential=${TOKEN_SENTINEL}&state=HTTP-STATE-SENTINEL` };
+    expect(hook(reserved)).toBe(true);
+    expect(hook({ method: "GET", url: "/api/auth/firebase-session/EXCHANGE/" })).toBe(true);
+    expect(hook({ method: "POST", url: "/api/companies/current/issues?cursor=ordinary" })).toBe(false);
+
+    const tracer = telemetry.api.trace.getTracer("paperclip.rework1.http-test");
+    const tracedApp = express();
+    tracedApp.use((req, res, next) => {
+      const requestInfo = { method: req.method, url: req.originalUrl };
+      if (hook(requestInfo)) {
+        const suppressedContext = telemetry.api.suppressTracing(telemetry.api.context.active());
+        telemetry.api.context.with(suppressedContext, () => {
+          expect(telemetry.api.isTracingSuppressed(telemetry.api.context.active())).toBe(true);
+          // This models the installed HTTP instrumentation's documented ignore-hook behavior.
+          if (!telemetry.api.isTracingSuppressed(telemetry.api.context.active())) {
+            tracer.startActiveSpan("http.request.reserved", {}, (span: { end(): void }) => span.end());
+          }
+          next();
+        });
+        return;
+      }
+      tracer.startActiveSpan("http.request.ordinary", {}, (httpSpan: { end(): void }) => {
+        tracer.startActiveSpan("pg.query.ordinary", {}, (databaseSpan: { end(): void }) => databaseSpan.end());
+        tracer.startActiveSpan("business.handler.ordinary", {}, (businessSpan: { end(): void }) => businessSpan.end());
+        httpSpan.end();
+      });
+      next();
+    });
+    tracedApp.all("/api/auth/firebase-session/*splat", (_req, res) => res.sendStatus(404));
+    tracedApp.get("/api/companies/current/issues", (_req, res) => res.sendStatus(200));
+    const reservedResponse = await request(tracedApp).post(`/api/auth/firebase-session/unknown?credential=${TOKEN_SENTINEL}&state=HTTP-STATE-SENTINEL`);
+    expect(reservedResponse.status).toBe(404);
+    expect(telemetry.spans).toHaveLength(0);
+    expect((await request(tracedApp).get("/api/companies/current/issues")).status).toBe(200);
+    expect(telemetry.spans.map((span) => span.name)).toEqual([
+      "http.request.ordinary", "pg.query.ordinary", "business.handler.ordinary",
+    ]);
+    expect(JSON.stringify(telemetry.spans)).not.toContain(TOKEN_SENTINEL);
+    expect(JSON.stringify(telemetry.spans)).not.toContain("HTTP-STATE-SENTINEL");
+  });
+
+  it("emits closed audit events with fresh non-request correlation IDs for issuance and denial", async () => {
+    const events: unknown[] = [];
+    const f = await fixture();
+    const { app } = appFor(f, { audit: (event) => events.push(event) });
+    const started = await begin(app);
+    const success = await exchange(app, started, started.body.state);
+    const replay = await exchange(app, started, started.body.state);
+    expect(success.status).toBe(200);
+    expect(replay.status).toBeGreaterThanOrEqual(400);
+
+    const deniedFixture = await fixture();
+    const deniedApp = appFor(deniedFixture, {
+      audit: (event) => events.push(event),
+      verify: async () => { throw new FirebaseOperatorVerificationError(401); },
+    }).app;
+    const deniedStarted = await begin(deniedApp);
+    const denied = await exchange(deniedApp, deniedStarted, deniedStarted.body.state);
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+
+    const parsed = events as Array<Record<string, unknown>>;
+    expect(parsed.some((event) => event.event === "begin" && event.outcome === "created" && event.reason === "accepted")).toBe(true);
+    expect(parsed.some((event) => event.event === "exchange" && event.outcome === "issued" && event.reason === "accepted")).toBe(true);
+    expect(parsed.some((event) => event.event === "exchange" && event.outcome === "denied" && event.reason === "proof_denied")).toBe(true);
+    expect(parsed.every((event) => Object.keys(event).every((key) => ["event", "outcome", "reason", "correlationId", "sdkLevel"].includes(key)))).toBe(true);
+    const correlations = parsed.map((event) => event.correlationId).filter((id) => typeof id === "string");
+    expect(correlations.length).toBeGreaterThanOrEqual(5);
+    expect(new Set(correlations).size).toBe(correlations.length);
+    const surfaces = JSON.stringify({ events, state: started.body.state, transactionId: started.body.transactionId, uid: f.uid, token: TOKEN_SENTINEL });
+    expect(surfaces).not.toContain(started.body.state);
+    expect(surfaces).not.toContain(started.body.transactionId);
+    expect(surfaces).not.toContain(f.uid);
+    expect(surfaces).not.toContain(TOKEN_SENTINEL);
+  });
+
+  it("writes bounded default audit events through the repository Pino logger", async () => {
+    const f = await fixture();
+    const spies = ["debug", "info", "warn", "error"].map((level) => vi.spyOn(logger, level as "debug").mockImplementation(() => undefined as never));
+    try {
+      const { app } = appFor(f);
+      const started = await begin(app);
+      const response = await exchange(app, started, started.body.state);
+      expect(response.status).toBe(200);
+      const calls = spies.flatMap((spy) => spy.mock.calls);
+      expect(calls.length).toBeGreaterThan(0);
+      const serialized = JSON.stringify(calls);
+      expect(serialized).toMatch(/begin|exchange/);
+      expect(serialized).not.toContain(started.body.state);
+      expect(serialized).not.toContain(started.body.transactionId);
+      expect(serialized).not.toContain(f.uid);
+      expect(serialized).not.toContain(TOKEN_SENTINEL);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("limits transaction-cookie lifetime to the remaining persisted begin deadline", async () => {
+    const f = await fixture();
+    let clock = NOW;
+    const { app } = appFor(f, { now: () => clock });
+    const beforeIds = new Set((await db.select({ id: firebaseOperatorLoginTransactions.id }).from(firebaseOperatorLoginTransactions)).map((row) => row.id));
+    const transactionBlock = await blockTransactionInsert();
+    let pending: Promise<request.Response> | undefined;
+    try {
+      pending = begin(app);
+      expect(await transactionBlock.waitForInsert()).toBe(true);
+      clock = NOW + 7_000;
+      await transactionBlock.release();
+      const started = await pending;
+      expect(started.status).toBe(200);
+      const row = await db.select().from(firebaseOperatorLoginTransactions)
+        .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+      expect(row[0]?.expiresAt.getTime()).toBe(NOW + 300_000);
+      const maxAge = Number(started.headers["set-cookie"]?.[0]?.match(/Max-Age=(\d+)/i)?.[1]);
+      expect(maxAge).toBeLessThanOrEqual(Math.floor((row[0]!.expiresAt.getTime() - clock) / 1000));
+      expect(maxAge).toBeLessThan(300);
+    } finally {
+      await transactionBlock.release();
+      await pending?.catch(() => undefined);
+      await transactionBlock.cleanup();
+    }
+  });
+
+  it("does not issue a new transaction cookie when begin persistence outlives the 300-second deadline", async () => {
+    const f = await fixture();
+    let clock = NOW;
+    const { app } = appFor(f, { now: () => clock });
+    const transactionBlock = await blockTransactionInsert();
+    let pending: Promise<request.Response> | undefined;
+    try {
+      pending = begin(app);
+      expect(await transactionBlock.waitForInsert()).toBe(true);
+      clock = NOW + 300_001;
+      await transactionBlock.release();
+      const started = await pending;
+      expect(started.status).toBeGreaterThanOrEqual(400);
+      expect(started.headers["set-cookie"] ?? []).toHaveLength(0);
+      const rows = await db.select().from(firebaseOperatorLoginTransactions)
+        .where(eq(firebaseOperatorLoginTransactions.origin, PUBLIC));
+      const justCreated = rows.find((row) => !beforeIds.has(row.id));
+      expect(justCreated?.expiresAt.getTime()).toBe(NOW + 300_000);
+    } finally {
+      await transactionBlock.release();
+      await pending?.catch(() => undefined);
+      await transactionBlock.cleanup();
+    }
+  });
 
   it("issues only the normal Better Auth cookie after durable assurance and returns safe metadata", async () => {
     const f = await fixture();
