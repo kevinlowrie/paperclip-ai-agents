@@ -174,6 +174,7 @@ describe("opencode remote execution", () => {
         command: "opencode",
         model: "opencode/gpt-5-nano",
         trustedCaPem: TEST_CA_PEM,
+        remoteMcpServers: [{ name: "search", url: "https://search.internal/mcp", tokenEnvName: "CONTEXT_KEY" }],
         ...(managed ? {
           managedAiConnection: { provider: "openrouter", method: "api_key" },
         } : {}),
@@ -185,6 +186,7 @@ describe("opencode remote execution", () => {
             opencode: { options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" }, models: { "gpt-5-nano": {} } },
           }),
           SCOPED_PROVIDER_KEY: "fixture-scoped-key",
+          CONTEXT_KEY: "fixture-context-bearer",
           SSL_CERT_FILE: "/host/replacement-roots.pem",
           SSL_CERT_DIR: "/host/cert-dir",
           REQUESTS_CA_BUNDLE: "/host/request-roots.pem",
@@ -261,6 +263,18 @@ describe("opencode remote execution", () => {
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
     expect(modelProbeCall?.[2]).toEqual(["models"]);
+    for (const runnerCall of runChildProcess.mock.calls as unknown as Array<[
+      string,
+      string,
+      string[],
+      { env?: Record<string, string> },
+    ]>) {
+      if (runnerCall[2].includes("run")) {
+        expect(runnerCall[3].env?.CONTEXT_KEY).toBe("fixture-context-bearer");
+      } else {
+        expect(runnerCall[3].env?.CONTEXT_KEY).toBeUndefined();
+      }
+    }
     // The model probe runs after the runtime workspace is prepared (so XDG
     // points at the managed subdirectory) but the SSH session targets the
     // original target remoteCwd — the per-run subdirectory is layered
@@ -282,6 +296,7 @@ describe("opencode remote execution", () => {
     expect(modelProbeCall?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
     expect(call?.[3].env.XDG_RUNTIME_DIR).toBe(`${home}/runtime`);
     expect(modelProbeCall?.[3].env.SCOPED_PROVIDER_KEY).toBe("fixture-scoped-key");
+    expect(modelProbeCall?.[3].env.CONTEXT_KEY).toBeUndefined();
     expect(modelProbeCall?.[3].env.PAPERCLIP_API_KEY).toBeUndefined();
     expect(runSshCommand).toHaveBeenCalledWith(
       expect.anything(),
@@ -314,6 +329,7 @@ describe("opencode remote execution", () => {
     expect(call?.[3].env.OPENCODE_CONFIG_DIR).toBeUndefined();
     expect(call?.[3].env.HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/opencode/home/run-1`);
     expect(call?.[3].env.SCOPED_PROVIDER_KEY).toBe("fixture-scoped-key");
+    expect(call?.[3].env.CONTEXT_KEY).toBe("fixture-context-bearer");
     expect(call?.[3].env.NODE_EXTRA_CA_CERTS).toBe(
       `${managedRemoteWorkspace}/.paperclip-runtime/opencode/xdgConfig/trust/ca.pem`,
     );
@@ -332,6 +348,9 @@ describe("opencode remote execution", () => {
     expect(JSON.stringify(runSshCommand.mock.calls)).not.toContain("trusted-host-bearer-sentinel");
     expect(JSON.stringify(syncDirectoryToSsh.mock.calls)).not.toContain("trusted-host-bearer-sentinel");
     expect(JSON.stringify(ensureCommandResolvable.mock.calls)).not.toContain("trusted-host-bearer-sentinel");
+    for (const calls of [runSshCommand.mock.calls, syncDirectoryToSsh.mock.calls, ensureCommandResolvable.mock.calls]) {
+      expect(JSON.stringify(calls)).not.toContain("fixture-context-bearer");
+    }
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(ensureCommandResolvable).toHaveBeenCalled();
     for (const callArgs of ensureCommandResolvable.mock.calls as unknown as unknown[][]) {

@@ -448,6 +448,9 @@ async function prepareRemoteOpenCodeRuntimeConfig(
       if (typeof token !== "string" || token.trim().length === 0) {
         throw new Error(`Remote OpenCode MCP credential ${tokenEnvName} is missing or empty.`);
       }
+      if (/\{env:[^}]+\}|\$\{[^}]+\}/.test(token)) {
+        throw new Error(`Remote OpenCode MCP credential ${tokenEnvName} is unresolved.`);
+      }
       if (modelValues.has(token) || token === input.hostBearerToken || token === input.env.PAPERCLIP_API_KEY) {
         throw new Error("Remote OpenCode MCP credential cannot reuse another authority value.");
       }
@@ -457,11 +460,16 @@ async function prepareRemoteOpenCodeRuntimeConfig(
       servers[name] = {
         type: "remote",
         url,
-        headers: { Authorization: `{env:${tokenEnvName}}` },
+        headers: { Authorization: `Bearer {env:${tokenEnvName}}` },
         oauth: false,
       };
     }
     nextConfig.mcp = servers;
+    for (const [name, value] of Object.entries(mcpCredentialEnv)) {
+      if (containsCredential(nextConfig, value)) {
+        throw new Error(`Remote OpenCode profile embeds MCP credential ${name} instead of keeping it in the runtime environment.`);
+      }
+    }
   }
   for (const [name, value] of Object.entries(credentialEnv)) {
     if (containsCredential(nextConfig, value)) {
