@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { activityLog, companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { activityLog, authUsers, companies, companyMemberships, firebaseOperatorBindings, firebaseOperatorSessionAssurance, instanceUserRoles } from "@paperclipai/db";
 import {
   actorMiddleware,
   humanizeCloudStackSlug,
@@ -10,25 +10,32 @@ import {
 import { errorHandler } from "../middleware/error-handler.js";
 import { assertCompanyAccess } from "../routes/authz.js";
 
-function createSelectChain(rows: unknown[]) {
-  return {
-    from() {
-      return {
-        where() {
-          return Promise.resolve(rows);
-        },
-      };
+function createSelectChain(rows: unknown[] | ((table: unknown) => unknown[]), onTable?: (table: unknown) => void) {
+  let selectedTable: unknown;
+  const query = {
+    from(table: unknown) { selectedTable = table; onTable?.(table); return query; },
+    where() { return query; },
+    innerJoin() { return query; },
+    for() { return query; },
+    limit() { return query; },
+    then(resolve: (value: unknown) => unknown, reject?: (error: unknown) => unknown) {
+      return Promise.resolve(typeof rows === "function" ? rows(selectedTable) : rows).then(resolve, reject);
     },
   };
+  return query;
 }
 
 function createDb() {
-  return {
-    select: vi
-      .fn()
-      .mockImplementationOnce(() => createSelectChain([]))
-      .mockImplementationOnce(() => createSelectChain([])),
-  } as any;
+  const db: any = { selectedTables: [] as unknown[] };
+  db.select = vi.fn(() => createSelectChain((table) => {
+    if (table === authUsers) return [{ id: "user-1" }];
+    if (table === firebaseOperatorBindings || table === firebaseOperatorSessionAssurance) return [];
+    return [];
+  }, (table) => db.selectedTables.push(table)));
+  Object.assign(db, {
+    transaction: vi.fn(async (run: (tx: any) => Promise<unknown>) => run(db)),
+  });
+  return db;
 }
 
 describe("actorMiddleware authenticated session profile", () => {
@@ -41,8 +48,9 @@ describe("actorMiddleware authenticated session profile", () => {
 
   it("preserves the signed-in user name and email on the board actor", async () => {
     const app = express();
+    const db = createDb();
     app.use(
-      actorMiddleware(createDb(), {
+      actorMiddleware(db, {
         deploymentMode: "authenticated",
         resolveSession: async () => ({
           session: { id: "session-1", userId: "user-1" },
@@ -61,6 +69,9 @@ describe("actorMiddleware authenticated session profile", () => {
     const res = await request(app).get("/actor");
 
     expect(res.status).toBe(200);
+    expect(db.selectedTables).toContain(authUsers);
+    expect(db.selectedTables).toContain(firebaseOperatorBindings);
+    expect(db.selectedTables).toContain(firebaseOperatorSessionAssurance);
     expect(res.body).toMatchObject({
       type: "board",
       userId: "user-1",
@@ -76,11 +87,13 @@ describe("actorMiddleware authenticated session profile", () => {
   it("trusts Cloud tenant identity headers and seeds board access", async () => {
     process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = "tenant-token";
     const inserts: Array<{ values: Record<string, unknown> }> = [];
-    const db = {
-      insert: vi.fn(() => {
+    let userExists = false;
+    const db: any = {
+      insert: vi.fn((table: unknown) => {
         const chain = {
           values(values: Record<string, unknown>) {
             inserts.push({ values });
+            if (table === authUsers) userExists = true;
             return chain;
           },
           onConflictDoUpdate() {
@@ -100,8 +113,10 @@ describe("actorMiddleware authenticated session profile", () => {
         return chain;
       }),
       delete: vi.fn(() => ({ where: () => Promise.resolve(undefined) })),
-      select: vi.fn(() => createSelectChain([])),
-    } as any;
+      update: vi.fn(() => ({ set: () => ({ where: () => Promise.resolve(undefined) }) })),
+      select: vi.fn(() => createSelectChain((table) => table === authUsers && userExists ? [{ id: "global-user-1" }] : [])),
+    };
+    db.transaction = vi.fn(async (run: (tx: typeof db) => Promise<void>) => run(db));
     const app = express();
     app.use(
       actorMiddleware(db, {
@@ -155,8 +170,10 @@ describe("actorMiddleware authenticated session profile", () => {
     // seeded primary company.
     const importedCompanyId = "33333333-3333-4333-8333-333333333333";
     const unrelatedCompanyId = "44444444-4444-4444-8444-444444444444";
+    let userExists = false;
     const insertChain = {
-      values() {
+      values(values: Record<string, unknown>) {
+        if (values.id === "global-user-1") userExists = true;
         return insertChain;
       },
       onConflictDoUpdate() {
@@ -172,20 +189,18 @@ describe("actorMiddleware authenticated session profile", () => {
         return Promise.resolve(undefined).then(resolve);
       },
     };
-    const db = {
-      select: vi.fn(() => ({
-        from: (table: unknown) => ({
-          where: () =>
-            Promise.resolve(
-              table === companyMemberships
-                ? [{ companyId: importedCompanyId, membershipRole: "member", status: "active" }]
-                : [],
-            ),
-        }),
+    const db: any = {
+      select: vi.fn(() => createSelectChain((table) => {
+        if (table === authUsers && userExists) return [{ id: "global-user-1" }];
+        return table === companyMemberships
+          ? [{ companyId: importedCompanyId, membershipRole: "member", status: "active" }]
+          : [];
       })),
       insert: vi.fn(() => insertChain),
       delete: vi.fn(() => ({ where: () => Promise.resolve(undefined) })),
-    } as any;
+      update: vi.fn(() => ({ set: () => ({ where: () => Promise.resolve(undefined) }) })),
+    };
+    db.transaction = vi.fn(async (run: (tx: typeof db) => Promise<unknown>) => run(db));
     const app = express();
     app.use(
       actorMiddleware(db, {
@@ -229,8 +244,10 @@ describe("actorMiddleware authenticated session profile", () => {
     process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = "tenant-token";
     const updates: Array<Record<string, unknown>> = [];
     const activities: Array<Record<string, unknown>> = [];
+    let userExists = false;
     const insertChain = {
-      values() {
+      values(values: Record<string, unknown>) {
+        if (values.id === "global-user-1") userExists = true;
         return insertChain;
       },
       onConflictDoUpdate() {
@@ -248,16 +265,10 @@ describe("actorMiddleware authenticated session profile", () => {
         return Promise.resolve(undefined).then(resolve);
       },
     };
-    const db = {
-      select: vi.fn(() => ({
-        from: (table: unknown) => ({
-          where: () =>
-            Promise.resolve(
-              table === companies
-                ? [{ name: "paperclip-stack-purple-rain" }]
-                : [],
-            ),
-        }),
+    const db: any = {
+      select: vi.fn(() => createSelectChain((table) => {
+        if (table === authUsers && userExists) return [{ id: "global-user-1" }];
+        return table === companies ? [{ name: "paperclip-stack-purple-rain" }] : [];
       })),
       insert: vi.fn((table: unknown) => {
         if (table !== activityLog) return insertChain;
@@ -304,8 +315,9 @@ describe("actorMiddleware authenticated session profile", () => {
       .set("x-paperclip-cloud-stack-role", "owner");
 
     expect(res.status).toBe(200);
-    expect(updates).toHaveLength(1);
-    expect(updates[0]).toMatchObject({ name: "Purple Rain" });
+    expect(updates).toHaveLength(2);
+    expect(updates).toContainEqual(expect.objectContaining({ email: "owner@example.com", emailVerified: true }));
+    expect(updates).toContainEqual(expect.objectContaining({ name: "Purple Rain" }));
     expect(activities).toEqual([
       expect.objectContaining({
         companyId: expect.any(String),
@@ -346,13 +358,9 @@ describe("actorMiddleware authenticated session profile", () => {
       },
     };
     const db = {
-      select: vi.fn(() => ({
-        from: (table: unknown) => ({
-          where: () =>
-            Promise.resolve(
-              table === instanceUserRoles && state.staleInstanceAdminRow ? [{ id: "stale-role-row" }] : [],
-            ),
-        }),
+      select: vi.fn(() => createSelectChain((table) => {
+        if (table === authUsers) return [{ id: "global-user-1" }];
+        return table === instanceUserRoles && state.staleInstanceAdminRow ? [{ id: "stale-role-row" }] : [];
       })),
       insert: vi.fn(() => insertChain),
       delete: vi.fn((table: unknown) => ({
@@ -361,7 +369,9 @@ describe("actorMiddleware authenticated session profile", () => {
           return Promise.resolve(undefined);
         },
       })),
+      update: vi.fn(() => ({ set: () => ({ where: () => Promise.resolve(undefined) }) })),
     } as any;
+    db.transaction = vi.fn(async (run: (tx: typeof db) => Promise<unknown>) => run(db));
     const app = express();
     app.use(
       actorMiddleware(db, {

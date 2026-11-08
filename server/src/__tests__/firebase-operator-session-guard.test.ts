@@ -17,7 +17,10 @@ import {
 } from "@paperclipai/db";
 import { actorMiddleware, resolveCloudTenantActor } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { assertCompanyAccess } from "../routes/authz.js";
 import { logger } from "../middleware/logger.js";
+import { authorizationService } from "../services/authorization.js";
+import { accessService } from "../services/access.js";
 import { hashBearerToken } from "../services/board-auth.js";
 import { FirebaseOperatorVerificationError } from "../auth/firebase-operator-verifier.js";
 import {
@@ -260,6 +263,38 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     expect.soft(await cloudSideEffects(userId)).toEqual(before);
   });
 
+  it("keeps a closed idle denial when owned-session cleanup fails", async () => {
+    const fixture = await assuredUser();
+    let clock = Date.now();
+    const realGuard = await createGuard({ now: () => clock }) as Record<string, any>;
+    const wrappedGuard = {
+      ...realGuard,
+      check: async (input: { sessionId: string; userId: string }) => {
+        const decision = await realGuard.check(input);
+        clock += 30 * 60_000;
+        return decision;
+      },
+      cleanupOwnedSession: vi.fn(async () => { throw new Error("cleanup unavailable"); }),
+    };
+    let routeCalls = 0;
+    const app = express();
+    app.use(actorMiddleware(db, {
+      deploymentMode: "authenticated",
+      resolveSession: async () => ({ session: fixture.session, user: fixture.user }),
+      firebaseOperatorSessionGuard: wrappedGuard as never,
+    } as never));
+    app.get("/dispatch", (_req, res) => { routeCalls += 1; res.sendStatus(200); });
+    app.use(errorHandler);
+
+    const response = await request(app).get("/dispatch");
+    expect.soft(response.status).toBe(401);
+    expect.soft(routeCalls).toBe(0);
+    expect.soft(wrappedGuard.cleanupOwnedSession).toHaveBeenCalledWith({ sessionId: fixture.session.id, userId: fixture.userId });
+    await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(1);
+    await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id))).resolves.toHaveLength(1);
+  });
+
   it("denies a Cloud principal that differs from an otherwise allowed assured cookie", async () => {
     const cloudUserId = await boundUser();
     const cookie = await assuredUser();
@@ -403,6 +438,46 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     }
   });
 
+  it("rechecks operator state in the exported resolver after a real user-row lock wait", async () => {
+    const ordinary = await unrelatedOrdinarySession();
+    const blockerDb = createDb(database.connectionString);
+    const controlDb = createDb(database.connectionString);
+    const blockerReleased = deferred();
+    let signalBlocker!: (pid: number) => void;
+    const blockerReady = new Promise<number>((resolve) => { signalBlocker = resolve; });
+    const blockerTransaction = blockerDb.transaction(async (tx) => {
+      const [{ pid }] = await tx.execute(sql`select pg_backend_pid()::int as pid`) as unknown as Array<{ pid: number }>;
+      await tx.select({ id: authUsers.id }).from(authUsers)
+        .where(eq(authUsers.id, ordinary.id)).for("update");
+      signalBlocker(pid);
+      await blockerReleased.promise;
+      await tx.insert(firebaseOperatorBindings).values({
+        firebaseUid: `uid-${ordinary.id}`,
+        userId: ordinary.id,
+        createdByUserId: ordinary.id,
+        updatedByUserId: ordinary.id,
+      });
+    });
+
+    let resolverPromise: Promise<Awaited<ReturnType<typeof resolveCloudTenantActor>>> | undefined;
+    try {
+      const pid = await blockerReady;
+      resolverPromise = resolveCloudTenantActor(db, cloudHeaderSource(ordinary.id, `stack-firebase-direct-race-${randomUUID()}`));
+      await waitForCloudSyncLock(controlDb, pid);
+      blockerReleased.release();
+      await blockerTransaction;
+      await expect(resolverPromise).resolves.toBeNull();
+      await expect(cloudSideEffects(ordinary.id)).resolves.toEqual({ memberships: [], grants: [] });
+      await expect(db.select().from(authUsers).where(eq(authUsers.id, ordinary.id))).resolves.toHaveLength(1);
+    } finally {
+      blockerReleased.release();
+      await blockerTransaction.catch(() => undefined);
+      if (resolverPromise) await resolverPromise.catch(() => undefined);
+      await blockerDb.$client.end();
+      await controlDb.$client.end();
+    }
+  });
+
   it("classifies disabled bindings as operator state instead of ordinary users", async () => {
     const ordinary = await unrelatedOrdinarySession();
     const guard = await createGuard() as {
@@ -471,6 +546,32 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
 
   it("denies the selected company when another active membership remains", async () => {
     const fixture = await assuredUser();
+    const unrelated = await assuredUser();
+    const sameUserSessionId = `firebase-guard-same-user-session-${randomUUID()}`;
+    const sameUserSessionNow = new Date();
+    await db.insert(authSessions).values({
+      id: sameUserSessionId,
+      userId: fixture.userId,
+      token: `firebase-guard-same-user-token-${randomUUID()}`,
+      expiresAt: new Date(sameUserSessionNow.getTime() + 60 * 60_000),
+      createdAt: sameUserSessionNow,
+      updatedAt: sameUserSessionNow,
+    });
+    const [sameUserAssurance] = await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+    await db.insert(firebaseOperatorSessionAssurance).values({
+      sessionId: sameUserSessionId,
+      bindingId: sameUserAssurance!.bindingId,
+      userId: fixture.userId,
+      firebaseUid: sameUserAssurance!.firebaseUid,
+      bindingRevision: sameUserAssurance!.bindingRevision,
+      authTimeSeconds: sameUserAssurance!.authTimeSeconds,
+      totpFactors: sameUserAssurance!.totpFactors,
+      issuedAt: sameUserSessionNow,
+      lastAuthoritativeCheckAt: sameUserSessionNow,
+      lastInteractiveAt: sameUserSessionNow,
+      absoluteExpiresAt: new Date(sameUserSessionNow.getTime() + 60 * 60_000),
+    });
     const [otherCompany] = await db.insert(companies).values({
       name: `Guard second company ${randomUUID()}`,
       issuePrefix: `H${randomUUID().replaceAll("-", "").slice(0, 8)}`,
@@ -490,8 +591,191 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
       .resolves.toMatchObject({ kind: "allowed" });
     await db.update(companyMemberships).set({ status: "inactive" })
       .where(and(eq(companyMemberships.principalId, fixture.userId), eq(companyMemberships.companyId, fixture.companyId)));
+    const beforeDenied = await cloudSideEffects(fixture.userId);
     await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId, companyId: fixture.companyId }))
       .resolves.toMatchObject({ kind: "denied", status: 403, reason: "company_forbidden" });
+    await expect.soft(cloudSideEffects(fixture.userId)).resolves.toEqual(beforeDenied);
+    await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(0);
+    await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id))).resolves.toHaveLength(0);
+    await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, unrelated.session.id))).resolves.toHaveLength(1);
+    await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, unrelated.session.id))).resolves.toHaveLength(1);
+    await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, sameUserSessionId))).resolves.toHaveLength(1);
+    await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, sameUserSessionId))).resolves.toHaveLength(1);
+    await expect.soft(db.select().from(companyMemberships)
+      .where(eq(companyMemberships.principalId, fixture.userId))).resolves.toHaveLength(2);
+  });
+
+  it("keeps a guarded Firebase actor inside the membership snapshot validated by the guard", async () => {
+    const fixture = await assuredUser();
+    const [inactiveCompany] = await db.insert(companies).values({
+      name: `Guard inactive company ${randomUUID()}`,
+      status: "inactive",
+      issuePrefix: `I${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+    }).returning({ id: companies.id });
+    await db.insert(companyMemberships).values({
+      companyId: inactiveCompany!.id,
+      principalType: "user",
+      principalId: fixture.userId,
+      status: "active",
+      membershipRole: "member",
+    });
+    const guard = await createGuard() as {
+      check: (input: { sessionId: string; userId: string; companyId?: string }) => Promise<Record<string, unknown>>;
+      [key: string]: unknown;
+    };
+    await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId, companyId: fixture.companyId }))
+      .resolves.toMatchObject({ kind: "allowed" });
+    const app = express();
+    app.use(actorMiddleware(db, {
+      deploymentMode: "authenticated",
+      resolveSession: async () => ({ session: fixture.session, user: fixture.user }),
+      firebaseOperatorSessionGuard: guard as never,
+    } as never));
+    app.get("/company/:companyId", (req, res) => {
+      try {
+        assertCompanyAccess(req, req.params.companyId!);
+        res.status(200).json(req.actor);
+      } catch {
+        res.status(403).end();
+      }
+    });
+    app.use(errorHandler);
+
+    const allowed = await request(app).get(`/company/${fixture.companyId}`);
+    const denied = await request(app).get(`/company/${inactiveCompany!.id}`);
+    expect.soft(allowed.status).toBe(200);
+    expect.soft(allowed.body.companyIds).toEqual([fixture.companyId]);
+    expect.soft(denied.status).toBe(403);
+  });
+
+  it("does not accept an admin role committed after the guard snapshot", async () => {
+    const fixture = await assuredUser();
+    const [outsideCompany] = await db.insert(companies).values({
+      name: `Guard outside company ${randomUUID()}`,
+      issuePrefix: `O${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+    }).returning({ id: companies.id });
+    const realGuard = await createGuard() as {
+      check: (input: { sessionId: string; userId: string }) => Promise<Record<string, any>>;
+      [key: string]: unknown;
+    };
+    const guarded = {
+      ...realGuard,
+      check: async (input: { sessionId: string; userId: string }) => {
+        const result = await realGuard.check(input);
+        await db.insert(instanceUserRoles).values({ userId: fixture.userId, role: "instance_admin" });
+        return result;
+      },
+    };
+    const app = express();
+    app.use(actorMiddleware(db, {
+      deploymentMode: "authenticated",
+      resolveSession: async () => ({ session: fixture.session, user: fixture.user }),
+      firebaseOperatorSessionGuard: guarded as never,
+    } as never));
+    app.get("/actor", (req, res) => res.json(req.actor));
+    app.use(errorHandler);
+    const response = await request(app).get("/actor");
+
+    expect(response.status).toBe(200);
+    expect.soft(response.body).toMatchObject({ source: "session", isInstanceAdmin: false });
+    const assignment = await authorizationService(db).decide({
+      actor: response.body,
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: outsideCompany!.id },
+    });
+    expect.soft(assignment.reason).not.toBe("allow_instance_admin");
+    await expect.soft(accessService(db).isInstanceAdmin(fixture.userId)).resolves.toBe(false);
+    await expect.soft(accessService(db).canUser(outsideCompany!.id, fixture.userId, "tasks:assign"))
+      .resolves.toBe(false);
+  });
+
+  it("excludes enabled-bound, disabled-bound, and assured users from DB-backed instance-admin eligibility", async () => {
+    const enabledBound = await assuredUser();
+    const disabledBound = await assuredUser();
+    const assured = await assuredUser();
+    const assuranceOnly = await unrelatedOrdinarySession();
+    const unbound = await unrelatedOrdinarySession();
+    const foreignBindingUserId = await boundUser();
+    const [outsideCompany] = await db.insert(companies).values({
+      name: `Guard admin policy target ${randomUUID()}`,
+      issuePrefix: `P${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+    }).returning({ id: companies.id });
+    const [foreignBinding] = await db.select().from(firebaseOperatorBindings)
+      .where(eq(firebaseOperatorBindings.userId, foreignBindingUserId));
+    const assuranceNow = new Date();
+    await db.insert(firebaseOperatorSessionAssurance).values({
+      sessionId: assuranceOnly.sessionId,
+      bindingId: foreignBinding!.id,
+      userId: assuranceOnly.id,
+      firebaseUid: foreignBinding!.firebaseUid,
+      bindingRevision: foreignBinding!.revision,
+      authTimeSeconds: Math.floor(assuranceNow.getTime() / 1000),
+      totpFactors: [{ factorId: "totp", uid: `factor-${assuranceOnly.id}` }],
+      issuedAt: assuranceNow,
+      lastAuthoritativeCheckAt: assuranceNow,
+      lastInteractiveAt: assuranceNow,
+      absoluteExpiresAt: new Date(assuranceNow.getTime() + 8 * 60 * 60_000),
+    });
+    for (const userId of [enabledBound.userId, disabledBound.userId, assured.userId, assuranceOnly.id, unbound.id]) {
+      await db.insert(instanceUserRoles).values({ userId, role: "instance_admin" });
+    }
+    await db.update(firebaseOperatorBindings).set({ enabled: false })
+      .where(eq(firebaseOperatorBindings.userId, disabledBound.userId));
+
+    for (const userId of [enabledBound.userId, disabledBound.userId, assured.userId, assuranceOnly.id]) {
+      await expect.soft(accessService(db).isInstanceAdmin(userId)).resolves.toBe(false);
+      const decision = await authorizationService(db).decide({
+        actor: { type: "board", userId, source: "session" },
+        action: "tasks:assign",
+        resource: { type: "issue", companyId: outsideCompany!.id },
+      });
+      expect.soft(decision.reason).not.toBe("allow_instance_admin");
+      await expect.soft(accessService(db).canUser(outsideCompany!.id, userId, "tasks:assign"))
+        .resolves.toBe(false);
+    }
+    await expect.soft(accessService(db).isInstanceAdmin(unbound.id)).resolves.toBe(true);
+    const legacyAdmin = await authorizationService(db).decide({
+      actor: { type: "board", userId: unbound.id, source: "session" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: outsideCompany!.id },
+    });
+    expect.soft(legacyAdmin.reason).toBe("allow_instance_admin");
+    await expect.soft(accessService(db).canUser(outsideCompany!.id, unbound.id, "tasks:assign"))
+      .resolves.toBe(true);
+    const nonadminId = `nonadmin-${randomUUID()}`;
+    const [noGrantCompany] = await db.insert(companies).values({
+      name: `Guard no-grant ${randomUUID()}`,
+      issuePrefix: `N${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+    }).returning({ id: companies.id });
+    await db.insert(companyMemberships).values({
+      companyId: noGrantCompany!.id,
+      principalType: "user",
+      principalId: nonadminId,
+      status: "active",
+      membershipRole: "viewer",
+    });
+    await expect.soft(accessService(db).isInstanceAdmin(nonadminId)).resolves.toBe(false);
+    await expect.soft(authorizationService(db).decide({
+      actor: { type: "board", userId: nonadminId, source: "session", companyIds: [noGrantCompany!.id] },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: noGrantCompany!.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    await expect.soft(accessService(db).canUser(noGrantCompany!.id, nonadminId, "tasks:assign"))
+      .resolves.toBe(false);
+  });
+
+  it("keeps failed instance-admin eligibility queries closed without a fallback", async () => {
+    const failedDb: any = { select: vi.fn(() => { throw new Error("role lookup unavailable"); }) };
+    await expect(accessService(failedDb).isInstanceAdmin(`failed-${randomUUID()}`)).rejects.toThrow("role lookup unavailable");
+    await expect(authorizationService(failedDb).decide({
+      actor: { type: "board", userId: `failed-${randomUUID()}`, source: "session" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: `outside-${randomUUID()}` },
+    })).rejects.toThrow("role lookup unavailable");
+    expect(failedDb.select).toHaveBeenCalled();
   });
 
   it("does not slide a positive cache hit past its original 60-second deadline", async () => {
@@ -521,6 +805,50 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId }))
       .resolves.toMatchObject({ kind: "denied", status: 503, reason: "dependency_unavailable" });
     expect(providerCalls).toBe(2);
+  });
+
+  it.each([
+    { label: "provider evidence", advance: 60_000, expectedStatus: 503, cleanup: false },
+    { label: "interactive idle authority", advance: 30 * 60_000, expectedStatus: 401, cleanup: true },
+    { label: "absolute session authority", advance: 8 * 60 * 60_000, expectedStatus: 401, cleanup: true },
+  ])("finalizes $label at dispatch after the real guard check returns", async ({ advance, expectedStatus, cleanup }) => {
+    const fixture = await assuredUser();
+    const unrelated = await assuredUser();
+    let clock = Date.now();
+    const realGuard = await createGuard({ now: () => clock }) as Record<string, any>;
+    const wrappedGuard = {
+      ...realGuard,
+      check: async (input: { sessionId: string; userId: string }) => {
+        const decision = await realGuard.check(input);
+        clock += advance;
+        return decision;
+      },
+    };
+    let routeCalls = 0;
+    const app = express();
+    app.use(actorMiddleware(db, {
+      deploymentMode: "authenticated",
+      resolveSession: async () => ({ session: fixture.session, user: fixture.user }),
+      firebaseOperatorSessionGuard: wrappedGuard as never,
+    } as never));
+    app.get("/dispatch", (_req, res) => { routeCalls += 1; res.sendStatus(200); });
+    app.use(errorHandler);
+
+    const response = await request(app).get("/dispatch");
+    expect.soft(response.status).toBe(expectedStatus);
+    expect.soft(routeCalls).toBe(0);
+    if (cleanup) {
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(0);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id))).resolves.toHaveLength(0);
+    } else {
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id))).resolves.toHaveLength(1);
+    }
+    await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, unrelated.session.id))).resolves.toHaveLength(1);
+    await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, unrelated.session.id))).resolves.toHaveLength(1);
   });
 
   it.each([
@@ -570,6 +898,41 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
 
     await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId }))
       .resolves.toMatchObject({ kind: "denied" });
+  });
+
+  it("denies a direct guard check when provider evidence completes exactly at its fixed 60-second deadline", async () => {
+    const fixture = await assuredUser();
+    let clock = Date.now();
+    let providerCheckedAtMs = 0;
+    let signalProvider!: () => void;
+    let releaseProvider!: (proof: Record<string, unknown>) => void;
+    const providerStarted = new Promise<void>((resolve) => { signalProvider = resolve; });
+    const providerResult = new Promise<Record<string, unknown>>((resolve) => { releaseProvider = resolve; });
+    const guard = await createGuard({
+      now: () => clock,
+      checkUser: async (proof) => {
+        providerCheckedAtMs = proof.checkedAtMs;
+        signalProvider();
+        return providerResult;
+      },
+    }) as {
+      check: (input: { sessionId: string; userId: string }) => Promise<Record<string, unknown>>;
+    };
+    const pending = guard.check({ sessionId: fixture.session.id, userId: fixture.userId });
+    await providerStarted;
+    clock = providerCheckedAtMs + 60_000;
+    releaseProvider({
+      projectId: "thl-pclipd-api",
+      userId: fixture.userId,
+      uid: `uid-${fixture.userId}`,
+      authTimeSeconds: fixture.authTimeSeconds,
+      totpFactors: [{ factorId: "totp", uid: `factor-${fixture.userId}` }],
+      checkedAtMs: providerCheckedAtMs,
+    });
+
+    await expect(pending).resolves.toMatchObject({
+      kind: "denied", status: 503, reason: "dependency_unavailable",
+    });
   });
 
   it.each([
