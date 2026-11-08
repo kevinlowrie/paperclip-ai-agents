@@ -22,8 +22,20 @@
   "implemented_scope": [
     "PFS001/CFT001\u2013003 project-pinned production token proof primitive",
     "PFS002 five-minute authentication freshness primitive",
-    "PFS012 current-user revocation/factor snapshot primitives; no persisted session lifecycle"
+    "PFS012 current-user revocation/factor snapshot primitives; no persisted session lifecycle",
+    "PFS003/004/010 provisioning storage, Firebase UID directory proof, and reviewed existing-user binding service",
+    "PFS008/009/011/012/013 persistence prerequisites: assurance storage, one-use provisioning packet state, append-only audit events, and atomic session revocation"
   ],
+  "provisioning_snapshot": {
+    "date": "2026-11-08",
+    "migration": "0295_loose_ghost_rider.sql",
+    "service": "server/src/auth/firebase-operator-provisioning.ts",
+    "review_packets_expire_seconds": 300,
+    "identity_lookup_max_age_seconds": 60,
+    "binding_revision": "positive and monotonic; disabled bindings remain stored",
+    "scope": "explicitly reviewed active companies; add-only matching human-role defaults",
+    "activation_allowed": false
+  },
   "not_implemented": [
     "PFS003 through PFS011 and PFS013 through PFS014",
     "identity binding, provisioner, transaction exchange, routes, cookies, local roles, session persistence, HTTP/stream enforcement, UI, live acceptance, deployment"

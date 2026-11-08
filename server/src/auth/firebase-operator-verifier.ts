@@ -229,3 +229,46 @@ export function createProductionFirebaseOperatorVerifier() {
     },
   });
 }
+
+export type FirebaseOperatorIdentity = {
+  projectId: typeof PROJECT_ID;
+  uid: string;
+  checkedAtMs: number;
+};
+
+/**
+ * Current provider-side identity lookup for reviewed local account binding.
+ * This deliberately does not require TOTP enrollment: TOTP is checked by the
+ * interactive session verifier, while provisioning only proves the Google
+ * identity's current UID and eligibility.
+ */
+export function createProductionFirebaseOperatorIdentityDirectory() {
+  const app = productionApp();
+  let auth: Auth;
+  try {
+    auth = getAuth(app);
+  } catch {
+    unavailable();
+  }
+  return {
+    async lookup(uid: string): Promise<FirebaseOperatorIdentity> {
+      assertEmulatorOff();
+      if (!validUid(uid) || uid.trim() !== uid) deny();
+      const lookupStartedAtMs = Date.now();
+      let user: unknown;
+      try {
+        assertEmulatorOff();
+        user = await auth.getUser(uid);
+      } catch (error) {
+        assertEmulatorOff();
+        classifyProviderError(error);
+      }
+      assertEmulatorOff();
+      if (!record(user) || user.uid !== uid || user.disabled !== false || user.emailVerified !== true) deny();
+      if (user.tenantId !== undefined && user.tenantId !== null) deny();
+      if (!Array.isArray(user.providerData) || !user.providerData.some((provider) =>
+        record(provider) && provider.providerId === "google.com" && validUid(provider.uid))) deny();
+      return { projectId: PROJECT_ID, uid, checkedAtMs: lookupStartedAtMs };
+    },
+  };
+}

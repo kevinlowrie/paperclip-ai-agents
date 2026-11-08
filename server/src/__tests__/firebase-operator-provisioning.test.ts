@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   authSessions,
   authUsers,
@@ -24,6 +24,26 @@ if (!postgresSupport.supported) {
 const NOW = Date.UTC(2026, 10, 8, 12, 0, 0);
 const PROJECT = "thl-pclipd-api" as const;
 let testCounter = 0;
+
+async function expectPostgresSqlState(operation: Promise<unknown>, expected: string) {
+  let error: unknown;
+  try {
+    await operation;
+  } catch (caught) {
+    error = caught;
+  }
+  let current = error;
+  let code: unknown;
+  for (let depth = 0; depth < 3 && current && typeof current === "object"; depth += 1) {
+    const record = current as { code?: unknown; cause?: unknown };
+    if (typeof record.code === "string") {
+      code = record.code;
+      break;
+    }
+    current = record.cause;
+  }
+  expect(code).toBe(expected);
+}
 
 describe("Firebase operator provisioning", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -109,14 +129,20 @@ describe("Firebase operator provisioning", () => {
     const f = await fixture();
     const p = makeProvisioner(f);
     await expect(p.dryRun({ ...actor(f), isInstanceAdmin: false }, intent(f))).resolves.toMatchObject({ packetId: expect.any(String) });
+    await expect(p.dryRun({ ...actor(f), source: "board_key" }, intent(f))).resolves.toMatchObject({ packetId: expect.any(String) });
     await db.delete(instanceUserRoles).where(eq(instanceUserRoles.userId, f.actorId));
     await expect(p.dryRun({ ...actor(f), isInstanceAdmin: true }, intent(f))).rejects.toMatchObject({ status: 403 });
   });
 
-  it.each(["agent", "cloud", "local_implicit"] as const)("denies untrusted %s actor context", async (type) => {
+  it.each([
+    { type: "agent", source: "agent_key" },
+    { type: "board", source: "cloud_tenant" },
+    { type: "board", source: "local_implicit" },
+    { type: "none", source: "none" },
+  ] as const)("denies untrusted $type/$source actor context", async ({ type, source }) => {
     const f = await fixture();
     const p = makeProvisioner(f);
-    await expect(p.dryRun({ type, userId: f.actorId } as never, intent(f))).rejects.toMatchObject({ status: 403 });
+    await expect(p.dryRun({ type, source, userId: f.actorId } as never, intent(f))).rejects.toMatchObject({ status: 403 });
   });
 
   it("requires a separate active nonviewer membership and users:manage_permissions grant", async () => {
@@ -150,7 +176,7 @@ describe("Firebase operator provisioning", () => {
     await expect(p.dryRun(actor(f), intent(f, { targetUserId: "missing-target" }))).rejects.toMatchObject({ status: 404 });
     await db.insert(instanceUserRoles).values({ userId: f.targetId, role: "instance_admin" });
     await expect(p.dryRun(actor(f), intent(f))).rejects.toMatchObject({ status: 400 });
-    expect(await db.select().from(authUsers)).toHaveLength(2);
+    expect(await db.select().from(authUsers).where(inArray(authUsers.id, [f.actorId, f.targetId]))).toHaveLength(2);
   });
 
   it("stores only an opaque expiring packet during dry run and leaves all authority state unchanged", async () => {
@@ -187,11 +213,16 @@ describe("Firebase operator provisioning", () => {
 
   it("uses a fresh current UID lookup at apply and maps directory outage to 503 without state change", async () => {
     const f = await fixture();
-    const p = makeProvisioner(f, { lookup: async () => { throw new Error("provider-secret-detail"); } });
+    let lookups = 0;
+    const p = makeProvisioner(f, { lookup: async (uid) => {
+      lookups += 1;
+      if (lookups > 1) throw new Error("provider-secret-detail");
+      return { projectId: PROJECT, uid, checkedAtMs: f.now };
+    } });
     const packet = await p.dryRun(actor(f), intent(f));
     await expect(p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash })).rejects.toMatchObject({ status: 503 });
     expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, f.targetId))).toHaveLength(0);
-    expect(await db.select().from(authUsers)).toHaveLength(2);
+    expect(await db.select().from(authUsers).where(inArray(authUsers.id, [f.actorId, f.targetId]))).toHaveLength(2);
   });
 
   it("applies once, adds reviewed memberships and defaults, preserves unrelated sessions, and never promotes the target", async () => {
@@ -207,13 +238,14 @@ describe("Firebase operator provisioning", () => {
     ]);
     expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.targetId))).toHaveLength(applied.createdGrantIds.length);
     expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, f.targetId))).toHaveLength(0);
-    expect(await db.select().from(authSessions).then((rows) => rows.map((row) => row.id))).toEqual([f.actorSessionId]);
+    expect(await db.select().from(authSessions).where(inArray(authSessions.userId, [f.actorId, f.targetId])).then((rows) => rows.map((row) => row.id))).toEqual([f.actorSessionId]);
     await expect(p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash })).rejects.toMatchObject({ status: 409 });
   });
 
   it("preserves a matching active target membership and existing custom grant", async () => {
     const f = await fixture();
     await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, status: "active", membershipRole: "operator" });
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, permissionKey: "tasks:assign", scope: null, grantedByUserId: f.actorId });
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, permissionKey: "custom:kept", scope: { marker: "preexisting" }, grantedByUserId: f.actorId });
     const before = await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.targetId));
     const p = makeProvisioner(f);
@@ -236,7 +268,7 @@ describe("Firebase operator provisioning", () => {
     const packet = await p.dryRun(actor(f), intent(f));
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, permissionKey: "custom:concurrent", scope: null, grantedByUserId: f.actorId });
     await expect(p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash })).rejects.toMatchObject({ status: 409 });
-    expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.targetId))).toHaveLength(1);
+    expect(await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.targetId), eq(principalPermissionGrants.permissionKey, "custom:concurrent")))).toHaveLength(1);
   });
 
   it("rechecks actor and company permission after dry run and leaves sessions untouched on denial", async () => {
@@ -287,7 +319,7 @@ describe("Firebase operator provisioning", () => {
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, permissionKey: "custom:concurrent", scope: null, grantedByUserId: f.actorId });
     const result = await p.rollback(actor(f), { packetId: packet.packetId, expectedBindingRevision: applied.bindingRevision });
     expect(result).toMatchObject({ status: "partial", bindingDisabled: true });
-    expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.permissionKey, "custom:concurrent"))).toHaveLength(1);
+    expect(await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.targetId), eq(principalPermissionGrants.permissionKey, "custom:concurrent")))).toHaveLength(1);
   });
 
   it("requires explicit expected UID and revision for reassignment and increments the binding revision", async () => {
@@ -301,7 +333,7 @@ describe("Firebase operator provisioning", () => {
     const reassignment = intent(f, { targetUserId: secondTarget, binding: { mode: "reassign", expectedRevision: first.bindingRevision, expectedUserId: f.targetId } });
     const packet = await p.dryRun(actor(f), reassignment);
     await expect(p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash })).resolves.toMatchObject({ bindingRevision: first.bindingRevision + 1, status: "applied" });
-    await expect(p.dryRun(actor(f), intent(f, { targetUserId: "wrong", binding: { mode: "reassign", expectedRevision: first.bindingRevision, expectedUserId: "wrong" } }))).rejects.toMatchObject({ status: 409 });
+    await expect(p.dryRun(actor(f), intent(f, { targetUserId: f.targetId, binding: { mode: "reassign", expectedRevision: first.bindingRevision, expectedUserId: secondTarget } }))).rejects.toMatchObject({ status: 409 });
   });
 
   it("reassignment revokes the old and new target prebinding sessions", async () => {
@@ -314,28 +346,31 @@ describe("Firebase operator provisioning", () => {
     const secondSession = `second-target-prebinding-${randomUUID()}`;
     const timestamp = new Date(NOW);
     await db.insert(authUsers).values({ id: secondTarget, name: "Replacement", email: `${secondTarget}@example.test`, emailVerified: true, createdAt: timestamp, updatedAt: timestamp });
+    await addSession(`fresh-old-target-session-${randomUUID()}`, f.targetId);
     await addSession(secondSession, secondTarget);
     const nextIntent = intent(f, { targetUserId: secondTarget, binding: { mode: "reassign", expectedRevision: first.bindingRevision, expectedUserId: f.targetId } });
     const packet = await p.dryRun(actor(f), nextIntent);
     const result = await p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash });
     expect(result.revokedSessionCount).toBe(2);
-    expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.targetId))).toHaveLength(0);
-    expect(await db.select().from(authSessions).where(eq(authSessions.userId, secondTarget))).toHaveLength(0);
+    expect(await db.select().from(authSessions).where(inArray(authSessions.userId, [f.targetId, secondTarget]))).toHaveLength(0);
   });
 
   it("records append-only bounded audit events without token or provider error details", async () => {
     const f = await fixture();
-    const p = makeProvisioner(f, { lookup: async () => { throw new Error("private-provider-detail"); } });
+    let lookups = 0;
+    const p = makeProvisioner(f, { lookup: async (uid) => {
+      lookups += 1;
+      if (lookups > 1) throw new Error("private-provider-detail");
+      return { projectId: PROJECT, uid, checkedAtMs: f.now };
+    } });
     const packet = await p.dryRun(actor(f), intent(f));
     await expect(p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash })).rejects.toMatchObject({ status: 503 });
     const rows = await db.execute(sql`select id, packet_id, actor_user_id, action, outcome, details::text as details, created_at from firebase_operator_provision_events where packet_id = ${packet.packetId}`);
     const eventText = JSON.stringify(rows);
     expect(eventText).not.toContain("private-provider-detail");
     expect(eventText).not.toContain("synthetic-");
-    await expect(db.execute(sql`update firebase_operator_provision_events set outcome = 'changed' where packet_id = ${packet.packetId}`))
-      .rejects.toMatchObject({ code: "42501" });
-    await expect(db.execute(sql`delete from firebase_operator_provision_events where packet_id = ${packet.packetId}`))
-      .rejects.toMatchObject({ code: "42501" });
-    await expect(db.execute(sql`truncate firebase_operator_provision_events`)).rejects.toMatchObject({ code: "42501" });
+    await expectPostgresSqlState(db.execute(sql`update firebase_operator_provision_events set outcome = 'changed' where packet_id = ${packet.packetId}`), "42501");
+    await expectPostgresSqlState(db.execute(sql`delete from firebase_operator_provision_events where packet_id = ${packet.packetId}`), "42501");
+    await expectPostgresSqlState(db.execute(sql`truncate firebase_operator_provision_events`), "42501");
   });
 });

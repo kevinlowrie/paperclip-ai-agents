@@ -5,7 +5,7 @@ const firebaseAdminMocks = vi.hoisted(() => {
   const auth = { getUser: vi.fn() };
   return {
     auth,
-    getApps: vi.fn(() => []),
+    getApps: vi.fn((): Array<{ name: string; options: { projectId: string } }> => []),
     initializeApp: vi.fn((_options?: Record<string, unknown>, _name?: string) => ({
       name: "synthetic-paperclip-app",
       options: { projectId: "thl-pclipd-api" },
