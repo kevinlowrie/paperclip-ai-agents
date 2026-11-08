@@ -115,6 +115,49 @@ export function createFirebaseOperatorSessionGuard(deps: {
     return { session: sessions[0], assurance, binding, anyBinding: anyBindings.length > 0, anyAssurance: anyAssurances.length > 0 };
   }
 
+  async function denyIfCurrentLocalAuthorityExpired(
+    input: { sessionId: string; userId: string },
+    expected: Snapshot,
+  ): Promise<FirebaseOperatorGuardDecision | null> {
+    let expiredReason: "session_expired" | "idle_expired" | undefined;
+    try {
+      return await deps.db.transaction(async (tx) => {
+        await tx.select({ id: authUsers.id }).from(authUsers)
+          .where(eq(authUsers.id, input.userId)).for("update").limit(1);
+        await tx.select({ id: firebaseOperatorBindings.id }).from(firebaseOperatorBindings)
+          .where(eq(firebaseOperatorBindings.userId, input.userId)).for("update");
+        const [assurance] = await tx.select().from(firebaseOperatorSessionAssurance)
+          .where(eq(firebaseOperatorSessionAssurance.sessionId, input.sessionId)).for("update").limit(1);
+        const [session] = await tx.select().from(authSessions).where(and(
+          eq(authSessions.id, input.sessionId), eq(authSessions.userId, input.userId),
+        )).for("update").limit(1);
+        if (!session || !assurance || !expected.assurance || !expected.binding
+          || assurance.id !== expected.assurance.id || assurance.userId !== input.userId
+          || assurance.bindingId !== expected.binding.id || assurance.bindingRevision !== expected.binding.revision
+          || assurance.projectId !== expected.assurance.projectId
+          || assurance.firebaseUid !== expected.assurance.firebaseUid) return unavailable();
+
+        const checkedAt = now();
+        if (session.expiresAt.getTime() <= checkedAt || assurance.absoluteExpiresAt.getTime() <= checkedAt
+          || session.createdAt.getTime() + 8 * 60 * 60_000 <= checkedAt) {
+          expiredReason = "session_expired";
+        } else if (assurance.lastInteractiveAt.getTime() + 30 * 60_000 <= checkedAt) {
+          expiredReason = "idle_expired";
+        }
+        if (!expiredReason) return null;
+
+        await tx.delete(authSessions).where(and(
+          eq(authSessions.id, input.sessionId), eq(authSessions.userId, input.userId),
+        ));
+        return denied(401, expiredReason);
+      }, { isolationLevel: "read committed" });
+    } catch {
+      // If cleanup fails after expiry was established while holding the owned
+      // rows, preserve the original closed denial. Otherwise state is uncertain.
+      return expiredReason ? denied(401, expiredReason) : unavailable();
+    }
+  }
+
   async function removeOwned(sessionId: string, userId: string): Promise<void> {
     try {
       await deps.db.delete(authSessions).where(and(eq(authSessions.id, sessionId), eq(authSessions.userId, userId)));
@@ -168,10 +211,10 @@ export function createFirebaseOperatorSessionGuard(deps: {
             .where(eq(firebaseOperatorSessionAssurance.sessionId, input.sessionId));
         }
         const afterAwaitNow = now();
-        if (afterAwaitNow >= checkedAtMs + 60_000) return unavailable();
         if (session.expiresAt.getTime() <= afterAwaitNow || assurance.absoluteExpiresAt.getTime() <= afterAwaitNow
           || session.createdAt.getTime() + 8 * 60 * 60_000 <= afterAwaitNow) return denied(401, "session_expired");
         if (assurance.lastInteractiveAt.getTime() + 30 * 60_000 <= afterAwaitNow) return denied(401, "idle_expired");
+        if (afterAwaitNow >= checkedAtMs + 60_000) return unavailable();
         return {
           kind: "allowed", checkedAtMs, bindingId: binding.id, bindingRevision: binding.revision,
           absoluteExpiresAt: assurance.absoluteExpiresAt,
@@ -248,10 +291,13 @@ export function createFirebaseOperatorSessionGuard(deps: {
         return unavailable();
       }
       checkedAtMs = result.checkedAtMs;
-      if (!Number.isSafeInteger(checkedAtMs) || checkedAtMs > now() || atStart >= checkedAtMs + 60_000 || now() >= atStart + 60_000
+      if (!Number.isSafeInteger(checkedAtMs) || checkedAtMs > now()
         || result.projectId !== assurance.projectId || result.uid !== assurance.firebaseUid
         || result.authTimeSeconds !== assurance.authTimeSeconds
         || factorsHash(result.totpFactors) !== factorsHash(assurance.totpFactors)) return unavailable();
+      if (atStart >= checkedAtMs + 60_000 || now() >= atStart + 60_000) {
+        return await denyIfCurrentLocalAuthorityExpired(input, initial) ?? unavailable();
+      }
     }
     const cacheHit = Boolean(cached && atStart < cached.deadline);
     let decision = await authorizeCurrent(input, initial, checkedAtMs, !cacheHit);
@@ -264,6 +310,9 @@ export function createFirebaseOperatorSessionGuard(deps: {
           || latest.binding.id !== initial.binding.id
           || latest.binding.revision !== initial.binding.revision) {
           decision = denied(401, "binding_invalid");
+        } else {
+          const localExpiry = await denyIfCurrentLocalAuthorityExpired(input, initial);
+          if (localExpiry?.kind === "denied" && localExpiry.status === 401) decision = localExpiry;
         }
       } catch { /* retain closed unavailable decision */ }
     }
