@@ -1,5 +1,5 @@
 import express from "express";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -21,6 +21,7 @@ import { assertCompanyAccess } from "../routes/authz.js";
 import { logger } from "../middleware/logger.js";
 import { authorizationService } from "../services/authorization.js";
 import { accessService } from "../services/access.js";
+import { cloudTenantPrimaryCompanyId } from "../services/cloud-instance.js";
 import { hashBearerToken } from "../services/board-auth.js";
 import { FirebaseOperatorVerificationError } from "../auth/firebase-operator-verifier.js";
 import {
@@ -42,6 +43,31 @@ function deferred() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => { release = resolve; });
   return { promise, release };
+}
+
+function assertDeadlineIsolation(input: {
+  target: "session" | "absolute" | "created-cap" | "idle" | "provider";
+  checkedAtMs: number;
+  finalAtMs: number;
+  sessionExpiresAt: Date;
+  sessionCreatedAt: Date;
+  absoluteExpiresAt: Date;
+  lastInteractiveAt: Date;
+  providerStaleAlso?: boolean;
+}) {
+  const deadlines = {
+    session: input.sessionExpiresAt.getTime(),
+    absolute: input.absoluteExpiresAt.getTime(),
+    "created-cap": input.sessionCreatedAt.getTime() + 8 * 60 * 60_000,
+    idle: input.lastInteractiveAt.getTime() + 30 * 60_000,
+  };
+  for (const [name, deadline] of Object.entries(deadlines)) {
+    if (name === input.target) expect(deadline).toBeLessThanOrEqual(input.finalAtMs);
+    else expect(deadline).toBeGreaterThan(input.finalAtMs);
+  }
+  const providerDeadline = input.checkedAtMs + 60_000;
+  if (input.target === "provider" || input.providerStaleAlso) expect(input.finalAtMs).toBeGreaterThanOrEqual(providerDeadline);
+  else expect(input.finalAtMs).toBeLessThan(providerDeadline);
 }
 
 describe("Firebase operator guard core and common HTTP boundary", () => {
@@ -155,6 +181,69 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     };
   }
 
+  async function addSameUserAssuredSession(fixture: Awaited<ReturnType<typeof assuredUser>>) {
+    const [source] = await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+    const now = new Date();
+    const sessionId = `firebase-guard-same-user-${randomUUID()}`;
+    await db.insert(authSessions).values({
+      id: sessionId,
+      userId: fixture.userId,
+      token: `firebase-guard-same-user-token-${randomUUID()}`,
+      expiresAt: new Date(now.getTime() + 8 * 60 * 60_000),
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(firebaseOperatorSessionAssurance).values({
+      sessionId,
+      bindingId: source!.bindingId,
+      userId: fixture.userId,
+      firebaseUid: source!.firebaseUid,
+      bindingRevision: source!.bindingRevision,
+      authTimeSeconds: source!.authTimeSeconds,
+      totpFactors: source!.totpFactors,
+      issuedAt: now,
+      lastAuthoritativeCheckAt: now,
+      lastInteractiveAt: now,
+      absoluteExpiresAt: new Date(now.getTime() + 8 * 60 * 60_000),
+    });
+    return { id: sessionId, userId: fixture.userId };
+  }
+
+  async function setCoherentGuardDeadlines(
+    fixture: Awaited<ReturnType<typeof assuredUser>>,
+    nowMs: number,
+    target: "idle" | "absolute" | "live",
+  ) {
+    const now = new Date(nowMs);
+    const sessionCreatedAt = target === "idle"
+      ? new Date(nowMs - 32 * 60_000)
+      : new Date(nowMs - 60 * 60_000);
+    const issuedAt = target === "idle"
+      ? new Date(nowMs - 31 * 60_000)
+      : new Date(nowMs - 30 * 60_000);
+    const lastInteractiveAt = target === "idle"
+      ? new Date(nowMs - 30 * 60_000 + 1_000)
+      : new Date(nowMs - 30_000);
+    const absoluteExpiresAt = target === "absolute"
+      ? new Date(nowMs + 1_000)
+      : new Date(nowMs + 6 * 60 * 60_000);
+    const sessionExpiresAt = new Date(nowMs + 8 * 60 * 60_000);
+    await db.update(authSessions).set({
+      createdAt: sessionCreatedAt,
+      updatedAt: now,
+      expiresAt: sessionExpiresAt,
+    }).where(eq(authSessions.id, fixture.session.id));
+    await db.update(firebaseOperatorSessionAssurance).set({
+      issuedAt,
+      lastAuthoritativeCheckAt: now,
+      lastInteractiveAt,
+      absoluteExpiresAt,
+      authTimeSeconds: Math.floor(issuedAt.getTime() / 1000) - 301,
+    }).where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+    return { sessionCreatedAt, sessionExpiresAt, issuedAt, lastInteractiveAt, absoluteExpiresAt };
+  }
+
   async function createGuard(options: { now?: () => number; checkUser?: (proof: Record<string, unknown>) => Promise<Record<string, unknown>> } = {}) {
     const moduleSpecifier = "../auth/firebase-operator-session-guard.js";
     let guardModule: Record<string, unknown> | undefined;
@@ -185,7 +274,7 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     };
   }
 
-  function cloudHeaderSource(userId: string, stackId: string, companyName?: string) {
+  function cloudHeaderSource(userId: string, stackId: string, companyName?: string, companyId?: string) {
     const headers: Record<string, string> = {
       "x-paperclip-cloud-tenant-token": CLOUD_TOKEN,
       "x-paperclip-cloud-user-id": userId,
@@ -195,6 +284,7 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
       "x-paperclip-cloud-stack-role": "owner",
     };
     if (companyName) headers["x-paperclip-cloud-paperclip-company-name"] = companyName;
+    if (companyId) headers["x-paperclip-cloud-paperclip-company-id"] = companyId;
     return { header: (name: string) => headers[name.toLowerCase()] };
   }
 
@@ -217,6 +307,32 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     const grants = await db.select().from(principalPermissionGrants)
       .where(and(eq(principalPermissionGrants.principalType, "user"), eq(principalPermissionGrants.principalId, userId)));
     return { memberships, grants };
+  }
+
+  async function cloudResolverState(userIds: string[], targetCompanyId: string) {
+    const [userRows, targetCompany, companyIds, memberships, grants, roles] = await Promise.all([
+      Promise.all(userIds.map((userId) => db.select().from(authUsers).where(eq(authUsers.id, userId)))),
+      db.select().from(companies).where(eq(companies.id, targetCompanyId)),
+      db.select({ id: companies.id }).from(companies),
+      db.select().from(companyMemberships).where(and(
+        eq(companyMemberships.principalType, "user"), inArray(companyMemberships.principalId, userIds),
+      )),
+      db.select().from(principalPermissionGrants).where(and(
+        eq(principalPermissionGrants.principalType, "user"), inArray(principalPermissionGrants.principalId, userIds),
+      )),
+      db.select().from(instanceUserRoles).where(inArray(instanceUserRoles.userId, userIds)),
+    ]);
+    const stableRows = (rows: Array<Record<string, unknown>>) => [...rows].sort((a, b) =>
+      String(a.id ?? `${a.companyId}:${a.principalId}:${a.permissionKey ?? a.role ?? ""}`)
+        .localeCompare(String(b.id ?? `${b.companyId}:${b.principalId}:${b.permissionKey ?? b.role ?? ""}`)));
+    return {
+      users: userRows.map((rows) => rows[0] ?? null),
+      targetCompany: targetCompany[0] ?? null,
+      companyIds: companyIds.map((row) => row.id).sort(),
+      memberships: stableRows(memberships as Array<Record<string, unknown>>),
+      grants: stableRows(grants as Array<Record<string, unknown>>),
+      roles: stableRows(roles as Array<Record<string, unknown>>),
+    };
   }
 
   async function waitForCloudSyncLock(controlDb: ReturnType<typeof createDb>, blockerPid: number) {
@@ -438,8 +554,77 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     }
   });
 
-  it("rechecks operator state in the exported resolver after a real user-row lock wait", async () => {
-    const ordinary = await unrelatedOrdinarySession();
+  it.each([
+    { label: "absent target company", companyExists: false },
+    { label: "existing legacy target company", companyExists: true },
+  ])("keeps exact auth, company, membership, grant, and role state for $label after the resolver lock", async ({ companyExists }) => {
+    const userId = `firebase-guard-r2-resolver-${randomUUID()}`;
+    const unrelated = await unrelatedOrdinarySession();
+    const stackId = `firebase-guard-r2-stack-${randomUUID()}`;
+    const targetCompanyId = cloudTenantPrimaryCompanyId(stackId);
+    const now = new Date(Date.now() - 120_000);
+    await db.insert(authUsers).values({
+      id: userId,
+      name: "Existing viewer metadata sentinel",
+      email: `sentinel-${userId}@example.test`,
+      emailVerified: false,
+      image: "https://example.test/existing-viewer.png",
+      createdAt: now,
+      updatedAt: now,
+    });
+    if (companyExists) {
+      await db.insert(companies).values({
+        id: targetCompanyId,
+        name: `paperclip-stack-${stackId}`,
+        description: null,
+        status: "active",
+        issuePrefix: `R${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+      });
+    }
+    const [controlCompany] = await db.insert(companies).values({
+      name: `Resolver unrelated control ${randomUUID()}`,
+      issuePrefix: `C${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+    }).returning({ id: companies.id });
+    await db.insert(companyMemberships).values([
+      ...(companyExists ? [{
+        companyId: targetCompanyId,
+        principalType: "user" as const,
+        principalId: userId,
+        status: "active",
+        membershipRole: "viewer",
+      }] : []),
+      {
+        companyId: controlCompany!.id,
+        principalType: "user",
+        principalId: unrelated.id,
+        status: "active",
+        membershipRole: "operator",
+      },
+    ]);
+    await db.insert(principalPermissionGrants).values([
+      ...(companyExists ? [{
+        companyId: targetCompanyId,
+        principalType: "user",
+        principalId: userId,
+        permissionKey: "tasks:assign",
+        scope: { sentinel: "target-viewer-grant" },
+        grantedByUserId: userId,
+      }] : []),
+      {
+        companyId: controlCompany!.id,
+        principalType: "user",
+        principalId: unrelated.id,
+        permissionKey: "tasks:assign",
+        scope: { sentinel: "unrelated-control-grant" },
+        grantedByUserId: unrelated.id,
+      },
+    ]);
+    await db.insert(instanceUserRoles).values([
+      { userId, role: "instance_admin" },
+      { userId: unrelated.id, role: "instance_admin" },
+    ]);
+    const watchedUserIds = [userId, unrelated.id];
+    const before = await cloudResolverState(watchedUserIds, targetCompanyId);
     const blockerDb = createDb(database.connectionString);
     const controlDb = createDb(database.connectionString);
     const blockerReleased = deferred();
@@ -448,27 +633,33 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     const blockerTransaction = blockerDb.transaction(async (tx) => {
       const [{ pid }] = await tx.execute(sql`select pg_backend_pid()::int as pid`) as unknown as Array<{ pid: number }>;
       await tx.select({ id: authUsers.id }).from(authUsers)
-        .where(eq(authUsers.id, ordinary.id)).for("update");
+        .where(eq(authUsers.id, userId)).for("update");
       signalBlocker(pid);
       await blockerReleased.promise;
       await tx.insert(firebaseOperatorBindings).values({
-        firebaseUid: `uid-${ordinary.id}`,
-        userId: ordinary.id,
-        createdByUserId: ordinary.id,
-        updatedByUserId: ordinary.id,
+        firebaseUid: `uid-${userId}`,
+        userId,
+        createdByUserId: userId,
+        updatedByUserId: userId,
       });
     });
 
     let resolverPromise: Promise<Awaited<ReturnType<typeof resolveCloudTenantActor>>> | undefined;
     try {
       const pid = await blockerReady;
-      resolverPromise = resolveCloudTenantActor(db, cloudHeaderSource(ordinary.id, `stack-firebase-direct-race-${randomUUID()}`));
+      resolverPromise = resolveCloudTenantActor(db, cloudHeaderSource(
+        userId,
+        stackId,
+        "Replacement human company name sentinel",
+        "legacy-paperclip-company-id",
+      ));
       await waitForCloudSyncLock(controlDb, pid);
       blockerReleased.release();
       await blockerTransaction;
       await expect(resolverPromise).resolves.toBeNull();
-      await expect(cloudSideEffects(ordinary.id)).resolves.toEqual({ memberships: [], grants: [] });
-      await expect(db.select().from(authUsers).where(eq(authUsers.id, ordinary.id))).resolves.toHaveLength(1);
+      await expect(cloudResolverState(watchedUserIds, targetCompanyId)).resolves.toEqual(before);
+      await expect(db.select().from(firebaseOperatorBindings).where(eq(firebaseOperatorBindings.userId, userId)))
+        .resolves.toMatchObject([expect.objectContaining({ userId, firebaseUid: `uid-${userId}`, enabled: true })]);
     } finally {
       blockerReleased.release();
       await blockerTransaction.catch(() => undefined);
@@ -808,14 +999,70 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
   });
 
   it.each([
-    { label: "provider evidence", advance: 60_000, expectedStatus: 503, cleanup: false },
-    { label: "interactive idle authority", advance: 30 * 60_000, expectedStatus: 401, cleanup: true },
-    { label: "absolute session authority", advance: 8 * 60 * 60_000, expectedStatus: 401, cleanup: true },
-  ])("finalizes $label at dispatch after the real guard check returns", async ({ advance, expectedStatus, cleanup }) => {
+    { label: "auth-session expiration", target: "session" as const, advance: 2_000, status: 401, reason: "session_expired", cleanup: true },
+    { label: "assurance absolute expiration", target: "absolute" as const, advance: 2_000, status: 401, reason: "session_expired", cleanup: true },
+    { label: "original session-created-at eight-hour cap", target: "created-cap" as const, advance: 2_000, status: 401, reason: "session_expired", cleanup: true },
+    { label: "interactive idle expiration", target: "idle" as const, advance: 2_000, status: 401, reason: "idle_expired", cleanup: true },
+    { label: "provider-only staleness with all local deadlines live", target: "provider" as const, advance: 60_000, status: 503, reason: "dependency_unavailable", cleanup: false },
+  ])("isolates $label at actual middleware dispatch", async ({ target, advance, status, reason, cleanup }) => {
     const fixture = await assuredUser();
+    const sameUserSession = await addSameUserAssuredSession(fixture);
     const unrelated = await assuredUser();
     let clock = Date.now();
-    const realGuard = await createGuard({ now: () => clock }) as Record<string, any>;
+    const sessionCreatedAt = target === "created-cap"
+      ? new Date(clock - 8 * 60 * 60_000 + 1_000)
+      : new Date(clock - 60 * 60_000);
+    const issuedAt = target === "created-cap"
+      ? new Date(clock - 7 * 60 * 60_000)
+      : target === "idle"
+        ? new Date(clock - 31 * 60_000)
+        : new Date(clock - 45 * 60_000);
+    const lastInteractiveAt = target === "idle"
+      ? new Date(clock - 30 * 60_000 + 1_000)
+      : new Date(clock - 30_000);
+    // For created-cap, session and assurance expiry are deliberately later
+    // than createdAt+8h so that only the persisted original-creation cap fires.
+    const sessionExpiresAt = target === "session"
+      ? new Date(clock + 1_000)
+      : target === "created-cap"
+        ? new Date(clock + 4 * 60 * 60_000)
+        : new Date(clock + 10 * 60 * 60_000);
+    const absoluteExpiresAt = target === "absolute"
+      ? new Date(clock + 1_000)
+      : target === "created-cap"
+        ? new Date(clock + 3 * 60 * 60_000)
+        : new Date(clock + 9 * 60 * 60_000);
+    await db.update(authSessions).set({
+      createdAt: sessionCreatedAt,
+      updatedAt: new Date(clock),
+      expiresAt: sessionExpiresAt,
+    }).where(eq(authSessions.id, fixture.session.id));
+    await db.update(firebaseOperatorSessionAssurance).set({
+      issuedAt,
+      lastAuthoritativeCheckAt: new Date(clock),
+      lastInteractiveAt,
+      absoluteExpiresAt,
+      authTimeSeconds: Math.floor(issuedAt.getTime() / 1000) - 301,
+    }).where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+    assertDeadlineIsolation({
+      target,
+      checkedAtMs: clock,
+      finalAtMs: clock + advance,
+      sessionExpiresAt,
+      sessionCreatedAt,
+      absoluteExpiresAt,
+      lastInteractiveAt,
+    });
+    const beforeMembershipsAndGrants = await cloudSideEffects(fixture.userId);
+    const [ownedSessionBefore] = await db.select().from(authSessions)
+      .where(eq(authSessions.id, fixture.session.id));
+    const [ownedAssuranceBefore] = await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+    const realGuard = await createGuard({
+      now: () => clock,
+      checkUser: async (proof) => ({ ...proof, checkedAtMs: proof.checkedAtMs }),
+    }) as Record<string, any>;
+    const finalizeSpy = vi.spyOn(realGuard, "finalizeForDispatch");
     const wrappedGuard = {
       ...realGuard,
       check: async (input: { sessionId: string; userId: string }) => {
@@ -825,18 +1072,23 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
       },
     };
     let routeCalls = 0;
+    const admittedActors: unknown[] = [];
     const app = express();
     app.use(actorMiddleware(db, {
       deploymentMode: "authenticated",
       resolveSession: async () => ({ session: fixture.session, user: fixture.user }),
       firebaseOperatorSessionGuard: wrappedGuard as never,
     } as never));
-    app.get("/dispatch", (_req, res) => { routeCalls += 1; res.sendStatus(200); });
+    app.get("/dispatch", (req, res) => { routeCalls += 1; admittedActors.push(req.actor); res.sendStatus(200); });
     app.use(errorHandler);
 
     const response = await request(app).get("/dispatch");
-    expect.soft(response.status).toBe(expectedStatus);
+    expect.soft(finalizeSpy).toHaveBeenCalledTimes(1);
+    expect.soft(finalizeSpy.mock.results[0]?.value).toMatchObject({ kind: "denied", status, reason });
+    expect.soft(response.status).toBe(status);
     expect.soft(routeCalls).toBe(0);
+    expect.soft(admittedActors).toEqual([]);
+    expect.soft(JSON.stringify(response.body ?? {})).not.toContain(reason);
     if (cleanup) {
       await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(0);
       await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
@@ -845,10 +1097,22 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
       await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(1);
       await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
         .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id))).resolves.toHaveLength(1);
+      const [ownedSessionAfter] = await db.select().from(authSessions)
+        .where(eq(authSessions.id, fixture.session.id));
+      const [ownedAssuranceAfter] = await db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+      expect.soft(ownedSessionAfter?.createdAt).toEqual(ownedSessionBefore!.createdAt);
+      expect.soft(ownedSessionAfter?.expiresAt).toEqual(ownedSessionBefore!.expiresAt);
+      expect.soft(ownedAssuranceAfter?.lastInteractiveAt).toEqual(ownedAssuranceBefore!.lastInteractiveAt);
+      expect.soft(ownedAssuranceAfter?.absoluteExpiresAt).toEqual(ownedAssuranceBefore!.absoluteExpiresAt);
     }
     await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, unrelated.session.id))).resolves.toHaveLength(1);
     await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
       .where(eq(firebaseOperatorSessionAssurance.sessionId, unrelated.session.id))).resolves.toHaveLength(1);
+    await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, sameUserSession.id))).resolves.toHaveLength(1);
+    await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, sameUserSession.id))).resolves.toHaveLength(1);
+    await expect.soft(cloudSideEffects(fixture.userId)).resolves.toEqual(beforeMembershipsAndGrants);
   });
 
   it.each([
@@ -1021,6 +1285,190 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
       await blocker.catch(() => undefined);
       await blockerDb.$client.end();
       await controlDb.$client.end();
+    }
+  });
+
+  it.each([
+    { label: "idle expires while provider evidence also goes stale", target: "idle" as const, status: 401, reason: "idle_expired", cleanup: true },
+    { label: "assurance absolute expiry crosses provider staleness", target: "absolute" as const, status: 401, reason: "session_expired", cleanup: true },
+    { label: "provider-only staleness with every local deadline live", target: "live" as const, status: 503, reason: "dependency_unavailable", cleanup: false },
+  ])("prioritizes known local expiry after a real membership lock wait: $label", async ({ target, status, reason, cleanup }) => {
+    const fixture = await assuredUser();
+    const sameUserSession = await addSameUserAssuredSession(fixture);
+    const unrelated = await assuredUser();
+    let clock = Date.now();
+    const deadlines = await setCoherentGuardDeadlines(fixture, clock, target);
+    assertDeadlineIsolation({
+      target: target === "live" ? "provider" : target,
+      providerStaleAlso: target !== "live",
+      checkedAtMs: clock,
+      finalAtMs: clock + 60_001,
+      sessionExpiresAt: deadlines.sessionExpiresAt,
+      sessionCreatedAt: deadlines.sessionCreatedAt,
+      absoluteExpiresAt: deadlines.absoluteExpiresAt,
+      lastInteractiveAt: deadlines.lastInteractiveAt,
+    });
+    const beforeMembershipsAndGrants = await cloudSideEffects(fixture.userId);
+    const [targetSessionBefore] = await db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id));
+    const targetAssuranceBefore = (await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id)))[0]!;
+
+    const blockerDb = createDb(database.connectionString);
+    const controlDb = createDb(database.connectionString);
+    const membershipLockAcquired = deferred();
+    const releaseMembershipLock = deferred();
+    let blockerPid = 0;
+    const blocker = blockerDb.transaction(async (tx) => {
+      const [pid] = await tx.execute(sql`select pg_backend_pid() as pid`) as unknown as Array<{ pid: number }>;
+      blockerPid = Number(pid?.pid);
+      await tx.select({ id: companyMemberships.id }).from(companyMemberships)
+        .where(and(
+          eq(companyMemberships.companyId, fixture.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, fixture.userId),
+          eq(companyMemberships.status, "active"),
+        )).for("update").limit(1);
+      membershipLockAcquired.release();
+      await releaseMembershipLock.promise;
+    }, { isolationLevel: "read committed" });
+    let pending: Promise<Record<string, unknown>> | undefined;
+    try {
+      await membershipLockAcquired.promise;
+      const guard = await createGuard({
+        now: () => clock,
+        checkUser: async (proof) => ({ ...proof, checkedAtMs: proof.checkedAtMs }),
+      }) as {
+        check: (input: { sessionId: string; userId: string; companyId?: string }) => Promise<Record<string, unknown>>;
+      };
+      pending = guard.check({ sessionId: fixture.session.id, userId: fixture.userId, companyId: fixture.companyId });
+      await waitForCloudSyncLock(controlDb, blockerPid);
+      clock += 60_001;
+      releaseMembershipLock.release();
+      const decision = await pending;
+      expect.soft(decision).toMatchObject({ kind: "denied", status, reason });
+
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id)))
+        .resolves.toHaveLength(cleanup ? 0 : 1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id)))
+        .resolves.toHaveLength(cleanup ? 0 : 1);
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, sameUserSession.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, sameUserSession.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, unrelated.session.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, unrelated.session.id))).resolves.toHaveLength(1);
+      await expect.soft(cloudSideEffects(fixture.userId)).resolves.toEqual(beforeMembershipsAndGrants);
+      if (!cleanup) {
+        const [targetSessionAfter] = await db.select().from(authSessions)
+          .where(eq(authSessions.id, fixture.session.id));
+        const [targetAssuranceAfter] = await db.select().from(firebaseOperatorSessionAssurance)
+          .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+        expect.soft(targetSessionAfter?.expiresAt).toEqual(targetSessionBefore!.expiresAt);
+        expect.soft(targetSessionAfter?.createdAt).toEqual(targetSessionBefore!.createdAt);
+        expect.soft(targetAssuranceAfter?.lastInteractiveAt).toEqual(targetAssuranceBefore.lastInteractiveAt);
+        expect.soft(targetAssuranceAfter?.absoluteExpiresAt).toEqual(targetAssuranceBefore.absoluteExpiresAt);
+      }
+    } finally {
+      releaseMembershipLock.release();
+      await blocker.catch(() => undefined);
+      if (pending) await pending.catch(() => undefined);
+      await blockerDb.$client.end();
+      await controlDb.$client.end();
+    }
+  });
+
+  it.each([
+    { label: "idle expires while successful verifier evidence is delayed", target: "idle" as const, status: 401, reason: "idle_expired", cleanup: true },
+    { label: "only successful verifier evidence becomes stale", target: "live" as const, status: 503, reason: "dependency_unavailable", cleanup: false },
+  ])("rechecks local authority after a delayed verifier result: $label", async ({ target, status, reason, cleanup }) => {
+    const fixture = await assuredUser();
+    const sameUserSession = await addSameUserAssuredSession(fixture);
+    const unrelated = await assuredUser();
+    let clock = Date.now();
+    const deadlines = await setCoherentGuardDeadlines(fixture, clock, target);
+    const [configuredAssurance] = await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+    const beforeMembershipsAndGrants = await cloudSideEffects(fixture.userId);
+    const [targetSessionBefore] = await db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id));
+    const [targetAssuranceBefore] = await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+    let lookupStartedAt = 0;
+    let providerReleased = false;
+    let signalProvider!: () => void;
+    let releaseProvider!: (proof: Record<string, unknown>) => void;
+    const providerStarted = new Promise<void>((resolve) => { signalProvider = resolve; });
+    const providerResult = new Promise<Record<string, unknown>>((resolve) => { releaseProvider = resolve; });
+    const guard = await createGuard({
+      now: () => clock,
+      checkUser: async (proof) => {
+        lookupStartedAt = proof.checkedAtMs;
+        signalProvider();
+        return providerResult;
+      },
+    }) as {
+      check: (input: { sessionId: string; userId: string; companyId?: string }) => Promise<Record<string, unknown>>;
+    };
+    let pending: Promise<Record<string, unknown>> | undefined;
+    try {
+      pending = guard.check({ sessionId: fixture.session.id, userId: fixture.userId, companyId: fixture.companyId });
+      await providerStarted;
+      assertDeadlineIsolation({
+        target: target === "live" ? "provider" : target,
+        providerStaleAlso: target !== "live",
+        checkedAtMs: lookupStartedAt,
+        finalAtMs: lookupStartedAt + 60_001,
+        sessionExpiresAt: deadlines.sessionExpiresAt,
+        sessionCreatedAt: deadlines.sessionCreatedAt,
+        absoluteExpiresAt: deadlines.absoluteExpiresAt,
+        lastInteractiveAt: deadlines.lastInteractiveAt,
+      });
+      clock = lookupStartedAt + 60_001;
+      releaseProvider({
+        projectId: "thl-pclipd-api",
+        uid: `uid-${fixture.userId}`,
+        authTimeSeconds: configuredAssurance!.authTimeSeconds,
+        totpFactors: [{ factorId: "totp", uid: `factor-${fixture.userId}` }],
+        checkedAtMs: lookupStartedAt,
+      });
+      providerReleased = true;
+      const decision = await pending;
+      expect.soft(decision).toMatchObject({ kind: "denied", status, reason });
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id)))
+        .resolves.toHaveLength(cleanup ? 0 : 1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id)))
+        .resolves.toHaveLength(cleanup ? 0 : 1);
+      if (!cleanup) {
+        const [targetSessionAfter] = await db.select().from(authSessions)
+          .where(eq(authSessions.id, fixture.session.id));
+        const [targetAssuranceAfter] = await db.select().from(firebaseOperatorSessionAssurance)
+          .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+        expect.soft(targetSessionAfter?.expiresAt).toEqual(targetSessionBefore!.expiresAt);
+        expect.soft(targetSessionAfter?.createdAt).toEqual(targetSessionBefore!.createdAt);
+        expect.soft(targetAssuranceAfter?.lastInteractiveAt).toEqual(targetAssuranceBefore!.lastInteractiveAt);
+        expect.soft(targetAssuranceAfter?.absoluteExpiresAt).toEqual(targetAssuranceBefore!.absoluteExpiresAt);
+      }
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, sameUserSession.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, sameUserSession.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, unrelated.session.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, unrelated.session.id))).resolves.toHaveLength(1);
+      await expect.soft(cloudSideEffects(fixture.userId)).resolves.toEqual(beforeMembershipsAndGrants);
+    } finally {
+      if (lookupStartedAt && !providerReleased) {
+        const [assurance] = await db.select().from(firebaseOperatorSessionAssurance)
+          .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+        releaseProvider({
+          projectId: assurance!.projectId,
+          uid: assurance!.firebaseUid,
+          authTimeSeconds: assurance!.authTimeSeconds,
+          totpFactors: assurance!.totpFactors,
+          checkedAtMs: lookupStartedAt,
+        });
+      }
+      if (pending) await pending.catch(() => undefined);
     }
   });
 
