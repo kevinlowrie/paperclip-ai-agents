@@ -39,9 +39,19 @@ function eligibleUser(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function expectSynchronousStatus(action: () => unknown, status: number) {
+  let caught: unknown;
+  try {
+    action();
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toMatchObject({ status });
+}
+
 afterEach(() => {
   vi.useRealTimers();
-  vi.setSystemTime();
+  vi.unstubAllEnvs();
   firebaseAdminMocks.getApps.mockReset().mockReturnValue([]);
   firebaseAdminMocks.initializeApp.mockReset().mockReturnValue({
     name: "synthetic-paperclip-app",
@@ -80,11 +90,56 @@ describe("production Firebase operator identity directory", () => {
     ["unverified email", { emailVerified: false }],
     ["tenant namespace", { tenantId: "tenant-a" }],
     ["missing Google provider", { providerData: [] }],
-    ["missing TOTP enrollment", { multiFactor: { enrolledFactors: [] } }],
   ])("rejects a non-current or ineligible directory record: %s", async (_label, overrides) => {
     firebaseAdminMocks.auth.getUser.mockResolvedValue(eligibleUser(overrides));
     const directory = createProductionFirebaseOperatorIdentityDirectory();
     await expect(directory.lookup("operator-uid")).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("does not make TOTP enrollment a directory lookup requirement", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    firebaseAdminMocks.auth.getUser.mockResolvedValue(eligibleUser({ multiFactor: { enrolledFactors: [] } }));
+    const directory = createProductionFirebaseOperatorIdentityDirectory();
+    await expect(directory.lookup("operator-uid")).resolves.toEqual({
+      projectId: "thl-pclipd-api", uid: "operator-uid", checkedAtMs: NOW,
+    });
+    // Login assurance still requires Google plus TOTP; this directory only proves current UID eligibility.
+    expect(firebaseAdminMocks.auth.getUser).toHaveBeenCalledExactlyOnceWith("operator-uid");
+  });
+
+  it("rejects malformed requested UIDs without asking Firebase", async () => {
+    const directory = createProductionFirebaseOperatorIdentityDirectory();
+    await expect(directory.lookup(" operator-uid ")).rejects.toMatchObject({ status: 401 });
+    expect(firebaseAdminMocks.auth.getUser).not.toHaveBeenCalled();
+  });
+
+  it("refuses Firebase Auth emulator configuration both before and after SDK calls", async () => {
+    vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "127.0.0.1:9099");
+    expectSynchronousStatus(() => createProductionFirebaseOperatorIdentityDirectory(), 503);
+    vi.unstubAllEnvs();
+    firebaseAdminMocks.auth.getUser.mockImplementation(async () => {
+      vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "127.0.0.1:9099");
+      return eligibleUser();
+    });
+    const directory = createProductionFirebaseOperatorIdentityDirectory();
+    await expect(directory.lookup("operator-uid")).rejects.toMatchObject({ status: 503 });
+  });
+
+  it("keeps the configured project fixed when the ambient project environment disagrees", async () => {
+    vi.stubEnv("GOOGLE_CLOUD_PROJECT", "different-project");
+    firebaseAdminMocks.auth.getUser.mockResolvedValue(eligibleUser());
+    const directory = createProductionFirebaseOperatorIdentityDirectory();
+    await directory.lookup("operator-uid");
+    expect(firebaseAdminMocks.initializeApp).toHaveBeenCalledWith(
+      expect.objectContaining({ projectId: "thl-pclipd-api" }), expect.any(String),
+    );
+  });
+
+  it("rejects a reused SDK app configured for another project", async () => {
+    firebaseAdminMocks.getApps.mockReturnValue([{ name: "paperclip-firebase-operator-verifier-v1", options: { projectId: "wrong-project" } }]);
+    expectSynchronousStatus(() => createProductionFirebaseOperatorIdentityDirectory(), 503);
+    expect(firebaseAdminMocks.getAuth).not.toHaveBeenCalled();
   });
 
   it("maps a provider outage to a safe unavailable error", async () => {
