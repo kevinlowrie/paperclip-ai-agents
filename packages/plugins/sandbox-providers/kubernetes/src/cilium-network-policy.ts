@@ -2,6 +2,7 @@ export interface BuildCiliumNetworkPolicyInput {
   namespace: string;
   paperclipServerNamespace: string;
   egressAllowFqdns: string[];
+  dnsQueryAllowFqdns?: string[];
   egressAllowCidrs: string[];
   name?: string;
   endpointSelector?: Record<string, string>;
@@ -26,7 +27,12 @@ export function buildCiliumNetworkPolicyManifest(input: BuildCiliumNetworkPolicy
           { port: "53", protocol: "UDP" },
           { port: "53", protocol: "TCP" },
         ],
-        rules: { dns: [{ matchPattern: "*" }] },
+        rules: {
+          dns:
+            input.dnsQueryAllowFqdns === undefined
+              ? [{ matchPattern: "*" }]
+              : input.dnsQueryAllowFqdns.map((matchName) => ({ matchName })),
+        },
       },
     ],
   });

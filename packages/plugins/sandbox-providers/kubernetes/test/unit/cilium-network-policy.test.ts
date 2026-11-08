@@ -33,6 +33,19 @@ describe("buildCiliumNetworkPolicyManifest", () => {
     ]);
   });
 
+  it("uses only exact DNS query names when an explicit DNS allow-list is supplied", () => {
+    const cnp = buildCiliumNetworkPolicyManifest({ ...baseInput, dnsQueryAllowFqdns: ["api.example.invalid"] });
+    const dnsRule = cnp.spec.egress.find((e: { toPorts?: { rules?: { dns?: unknown[] } }[] }) => e.toPorts?.some((p) => p.rules?.dns));
+    expect(dnsRule).toBeDefined();
+    expect(dnsRule.toPorts[0].rules.dns).toEqual([{ matchName: "api.example.invalid" }]);
+  });
+
+  it("preserves wildcard DNS behavior when the explicit allow-list is absent", () => {
+    const cnp = buildCiliumNetworkPolicyManifest(baseInput);
+    const dnsRule = cnp.spec.egress.find((e: { toPorts?: { rules?: { dns?: unknown[] } }[] }) => e.toPorts?.some((p) => p.rules?.dns));
+    expect(dnsRule.toPorts[0].rules.dns).toEqual([{ matchPattern: "*" }]);
+  });
+
   it("permits DNS to kube-dns explicitly so FQDN resolution can happen", () => {
     const cnp = buildCiliumNetworkPolicyManifest(baseInput);
     const dnsRule = cnp.spec.egress.find((e: { toPorts?: { ports: { port: string }[] }[] }) =>

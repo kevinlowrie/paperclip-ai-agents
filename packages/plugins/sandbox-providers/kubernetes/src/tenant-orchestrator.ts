@@ -9,6 +9,7 @@ export interface EnsureTenantInput {
   serviceAccountAnnotations: Record<string, string>;
   egressMode: "standard" | "cilium";
   egressAllowFqdns: string[];
+  dnsQueryAllowFqdns?: string[];
   egressAllowCidrs: string[];
   resourceQuota: {
     pods: string;
@@ -221,9 +222,13 @@ async function ensureNetworkPolicies(clients: KubeClients, input: EnsureTenantIn
       namespace: input.namespace,
       paperclipServerNamespace: input.paperclipServerNamespace,
       egressAllowFqdns: input.egressAllowFqdns,
+      dnsQueryAllowFqdns: input.dnsQueryAllowFqdns,
       egressAllowCidrs: input.egressAllowCidrs,
     });
     await ensureCiliumNetworkPolicy(clients, input.namespace, cnp);
+    if (input.dnsQueryAllowFqdns !== undefined) {
+      await assertCiliumDnsQueries(clients, input.namespace, input.dnsQueryAllowFqdns);
+    }
   } else {
     await ensureNetworkPolicy(clients, input.namespace, egressStd);
   }
@@ -244,6 +249,40 @@ async function ensureNetworkPolicy(
   await createIgnoringAlreadyExists(
     clients.networking.createNamespacedNetworkPolicy({ namespace, body: manifest as never }),
   );
+}
+
+async function assertCiliumDnsQueries(
+  clients: KubeClients,
+  namespace: string,
+  expectedNames: string[],
+): Promise<void> {
+  const result = await clients.custom.getNamespacedCustomObject({
+    group: "cilium.io",
+    version: "v2",
+    namespace,
+    plural: "ciliumnetworkpolicies",
+    name: "paperclip-egress-fqdn",
+  });
+  type Policy = {
+    spec?: {
+      egress?: Array<{
+        toPorts?: Array<{ rules?: { dns?: Array<{ matchName?: string; matchPattern?: string }> } }>
+      }>
+    }
+  };
+  const response = result as { body?: Policy };
+  const body = response.body ?? (result as Policy);
+  const dnsRules = (body.spec?.egress ?? []).flatMap((rule) => rule.toPorts ?? []).flatMap((port) => port.rules?.dns ?? []);
+  const actualNames = dnsRules.map((rule) => rule.matchName);
+  const sortedExpectedNames = [...expectedNames].sort();
+  if (
+    dnsRules.some((rule) => rule.matchPattern !== undefined) ||
+    actualNames.some((name) => name === undefined) ||
+    actualNames.length !== expectedNames.length ||
+    [...actualNames].sort().some((name, index) => name !== sortedExpectedNames[index])
+  ) {
+    throw new Error("CiliumNetworkPolicy DNS rules do not match dnsQueryAllowFqdns; operator migration is required");
+  }
 }
 
 async function ensureCiliumNetworkPolicy(

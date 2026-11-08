@@ -77,6 +77,21 @@ describe("ensureTenant", () => {
     expect((npCalls[0].body as { metadata: { name: string } }).metadata.name).toBe("paperclip-deny-all");
   });
 
+  it("fails closed on an existing wildcard Cilium DNS policy before lease provisioning", async () => {
+    const clients = makeMockClients();
+    clients.custom.getNamespacedCustomObject.mockResolvedValue({ body: { spec: { egress: [{ toPorts: [{ rules: { dns: [{ matchPattern: "*" }] } }] }] } } });
+    await expect(ensureTenant(clients as never, { ...baseInput, egressMode: "cilium", dnsQueryAllowFqdns: ["api.example.invalid"] })).rejects.toThrow(/DNS/i);
+    expect(clients.custom.createNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it("accepts an existing exact DNS query policy", async () => {
+    const clients = makeMockClients();
+    const exact = { body: { spec: { egress: [{ toPorts: [{ rules: { dns: [{ matchName: "api.example.invalid" }] } }] }] } } };
+    clients.custom.getNamespacedCustomObject.mockResolvedValue(exact);
+    await expect(ensureTenant(clients as never, { ...baseInput, egressMode: "cilium", dnsQueryAllowFqdns: ["api.example.invalid"] })).resolves.toBeUndefined();
+    expect(clients.custom.createNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
   it("applies serviceAccountAnnotations to the ServiceAccount", async () => {
     const clients = makeMockClients();
     await ensureTenant(clients as never, {

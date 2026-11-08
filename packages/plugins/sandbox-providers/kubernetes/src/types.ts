@@ -2,6 +2,18 @@ import { z } from "zod";
 import { adapterRegistrySchema } from "./adapter-registry.js";
 import { KNOWN_ADAPTER_TYPES } from "./adapter-defaults.js";
 
+const canonicalDnsName =
+  /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const dnsQueryAllowFqdnsSchema = z
+  .array(z.string().regex(canonicalDnsName, "DNS query names must be canonical lowercase hostnames"))
+  .min(1, "dnsQueryAllowFqdns must contain at least one DNS name")
+  .max(16, "dnsQueryAllowFqdns may contain at most 16 DNS names")
+  .refine(
+    (names) => names.every((name) => !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(name)),
+    "DNS query names cannot be IP addresses",
+  )
+  .refine((names) => new Set(names).size === names.length, "dnsQueryAllowFqdns entries must be unique");
+
 const cidrRegex = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
 
 export const kubernetesProviderConfigSchema = z
@@ -17,6 +29,8 @@ export const kubernetesProviderConfigSchema = z
     imagePullSecrets: z.array(z.string()).default([]),
 
     egressAllowFqdns: z.array(z.string()).default([]),
+    /** Exact DNS queries permitted by Cilium. Absent preserves legacy wildcard behavior. */
+    dnsQueryAllowFqdns: dnsQueryAllowFqdnsSchema.optional(),
     egressAllowCidrs: z.array(z.string().regex(cidrRegex, "Invalid CIDR")).default([]),
     egressMode: z.enum(["cilium", "standard"]).default("standard"),
 
@@ -73,7 +87,11 @@ export const kubernetesProviderConfigSchema = z
       message:
         "kubernetes provider requires one of `inCluster` or `kubeconfig`",
     },
-  );
+  )
+  .refine((cfg) => cfg.dnsQueryAllowFqdns === undefined || cfg.egressMode === "cilium", {
+    message: "dnsQueryAllowFqdns requires egressMode=cilium",
+    path: ["dnsQueryAllowFqdns"],
+  });
 
 export type KubernetesProviderConfig = z.infer<typeof kubernetesProviderConfigSchema>;
 

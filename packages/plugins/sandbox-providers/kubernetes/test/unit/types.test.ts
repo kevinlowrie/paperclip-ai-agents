@@ -31,6 +31,38 @@ describe("kubernetesProviderConfigSchema", () => {
     ).toThrow();
   });
 
+  it("accepts a bounded canonical DNS query allow-list and preserves absence", () => {
+    const absent = parseKubernetesProviderConfig({ inCluster: true });
+    expect(absent).not.toHaveProperty("dnsQueryAllowFqdns");
+    const strict = parseKubernetesProviderConfig({
+      inCluster: true,
+      egressMode: "cilium",
+      dnsQueryAllowFqdns: ["api.example.invalid", "svc.namespace.svc"],
+    });
+    expect(strict.dnsQueryAllowFqdns).toEqual(["api.example.invalid", "svc.namespace.svc"]);
+  });
+
+  it("requires Cilium mode for DNS query restrictions", () => {
+    expect(() =>
+      parseKubernetesProviderConfig({ inCluster: true, dnsQueryAllowFqdns: ["api.example.invalid"] }),
+    ).toThrow(/egressMode=cilium/);
+  });
+
+  it.each([
+    [[]],
+    [["*.example.invalid"]],
+    [["https://example.invalid"]],
+    [["192.0.2.1"]],
+    [["api.example.invalid."]],
+    [["Api.example.invalid"]],
+    [["a.example.invalid:443"]],
+    [["localhost"]],
+    [["api.example.invalid", "api.example.invalid"]],
+    [Array(17).fill("a.example.invalid")],
+  ])("rejects invalid strict DNS list %j", (dnsQueryAllowFqdns) => {
+    expect(() => parseKubernetesProviderConfig({ inCluster: true, dnsQueryAllowFqdns })).toThrow();
+  });
+
   it("rejects egressAllowCidrs entries that are not valid CIDR", () => {
     expect(() =>
       parseKubernetesProviderConfig({ inCluster: true, egressAllowCidrs: ["not-a-cidr"] }),

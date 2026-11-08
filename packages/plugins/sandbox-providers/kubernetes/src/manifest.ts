@@ -66,6 +66,19 @@ const manifest: PaperclipPluginManifestV1 = {
             description:
               "Additional FQDNs to allow egress to from agent pods. Adapter-default FQDNs (e.g. api.anthropic.com) are added automatically.",
           },
+          dnsQueryAllowFqdns: {
+            type: "array",
+            minItems: 1,
+            maxItems: 16,
+            uniqueItems: true,
+            items: {
+              type: "string",
+              pattern:
+                "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+            },
+            description:
+              "Exact canonical lowercase DNS names Cilium permits agent pods to query. Requires egressMode=cilium; omitted preserves the legacy wildcard DNS rule.",
+          },
           egressAllowCidrs: {
             type: "array",
             items: { type: "string" },
@@ -112,6 +125,12 @@ const manifest: PaperclipPluginManifestV1 = {
         anyOf: [
           { required: ["inCluster"] },
           { required: ["kubeconfig"] },
+        ],
+        allOf: [
+          {
+            if: { required: ["dnsQueryAllowFqdns"] },
+            then: { properties: { egressMode: { const: "cilium" } }, required: ["egressMode"] },
+          },
         ],
       },
     },

@@ -343,6 +343,7 @@ const plugin = definePlugin({
       serviceAccountAnnotations: config.serviceAccountAnnotations,
       egressMode: config.egressMode,
       egressAllowFqdns: [...adapterDefaults.allowFqdns, ...config.egressAllowFqdns],
+      dnsQueryAllowFqdns: config.dnsQueryAllowFqdns,
       egressAllowCidrs: config.egressAllowCidrs,
       resourceQuota: DEFAULT_RESOURCE_QUOTA,
     });
