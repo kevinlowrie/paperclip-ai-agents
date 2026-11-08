@@ -1,8 +1,12 @@
 import http from "node:http";
 import net from "node:net";
+import { Writable } from "node:stream";
 import express from "express";
 import request from "supertest";
+import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
+import { createHttpLogger } from "../middleware/logger.js";
+import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { firebaseOperatorPreAuthRequestHandler } from "../auth/firebase-operator-session-preflight.js";
 
 const PUBLIC = "https://paperclip.example.test";
@@ -11,18 +15,28 @@ const PATH = "/api/auth/firebase-session/begin";
 const EXCHANGE = "/api/auth/firebase-session/exchange";
 const JSON_TYPE = "application/json";
 
-function appFor(options: { maxBodyBytes?: number; origins?: string[] } = {}) {
+function appFor(options: { maxBodyBytes?: number; origins?: string[]; logs?: string[]; sdkError?: string } = {}) {
   const app = express();
+  if (options.logs) {
+    const stream = new Writable({ write(chunk, _encoding, callback) { options.logs!.push(chunk.toString()); callback(); } });
+    app.use(createHttpLogger(pino({ level: "trace", redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+  }
   app.use(firebaseOperatorPreAuthRequestHandler({
     trustedOrigins: new Set(options.origins ?? [PUBLIC, LAB]),
     ...(options.maxBodyBytes ? { maxBodyBytes: options.maxBodyBytes } : {}),
   }));
-  app.post([PATH, EXCHANGE], (req, res) => {
+  app.post([PATH, EXCHANGE], (req, res, next) => {
+    if (options.sdkError) {
+      const error = new Error(options.sdkError);
+      (res as express.Response & { err?: Error }).err = error;
+      next(error);
+      return;
+    }
     res.status(200).json({ method: req.method, path: req.path, body: req.body ?? null });
   });
   app.all("/api/auth/*splat", (_req, res) => res.status(418).json({ ordinaryAuth: true }));
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    res.status(413).json({ error: "body rejected" });
+    res.status(options.sdkError ? 500 : 413).json({ error: options.sdkError ? "internal error" : "body rejected" });
   });
   return app;
 }
@@ -105,16 +119,19 @@ describe("Firebase operator pre-auth HTTP boundary", () => {
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as import("node:net").AddressInfo).port;
-    const chunked = await new Promise<{ status: number; headers: http.IncomingHttpHeaders }>((resolve, reject) => {
+    const sendChunked = (body: string) => new Promise<number>((resolve, reject) => {
       const req = http.request({ host: "127.0.0.1", port, method: "POST", path: PATH, headers: { Host: new URL(PUBLIC).host, Origin: PUBLIC, "Content-Type": JSON_TYPE, "Transfer-Encoding": "chunked" } }, (res) => {
-        res.resume(); res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers }));
+        res.resume(); res.on("end", () => resolve(res.statusCode ?? 0));
       });
       req.on("error", reject);
-      req.write(oversizedBody.slice(0, 2000));
-      req.write(oversizedBody.slice(2000, 4000));
-      req.end(oversizedBody.slice(4000));
+      req.write(body.slice(0, 2000));
+      req.write(body.slice(2000, 4000));
+      req.end(body.slice(4000));
     });
-    expect(chunked.status).toBe(413);
+    const exactChunked = await sendChunked(exactBody);
+    expect(exactChunked).toBe(200);
+    const chunked = await sendChunked(oversizedBody);
+    expect(chunked).toBe(413);
   });
 
   it("rejects raw duplicate Origin, Host, Authorization, Content-Type, and ambiguous CL+TE framing", async () => {
@@ -161,5 +178,64 @@ describe("Firebase operator pre-auth HTTP boundary", () => {
         .set("Origin", PUBLIC).set("Content-Type", JSON_TYPE).send({ transactionId: "unused", state: "unused" })).status;
     }
     expect(last).toBe(429);
+  });
+
+  it("logs reserved auth namespace failures as a fixed route without inputs, parser data, or SDK error prose", async () => {
+    const logLines: string[] = [];
+    const app = appFor({ logs: logLines, sdkError: "RAW-SDK-ERROR-SENTINEL" });
+    const inputSentinels = [
+      "STATE-BODY-SENTINEL",
+      "UNKNOWN-CREDENTIAL-ALIAS-SENTINEL",
+      "TRANSACTION-ID-SENTINEL",
+      "COOKIE-INPUT-SENTINEL",
+      "AUTH-HEADER-SENTINEL",
+      "QUERY-CREDENTIAL-SENTINEL",
+      "PARSER-BUFFER-SENTINEL",
+      "RAW-SDK-ERROR-SENTINEL",
+    ];
+    const host = new URL(PUBLIC).host;
+    const malformed = await request(app).post(EXCHANGE).set("Host", host).set("Origin", PUBLIC)
+      .set("Content-Type", JSON_TYPE).send('{"value":"PARSER-BUFFER-SENTINEL');
+    expect(malformed.status).toBeGreaterThanOrEqual(400);
+    await request(app).get(`${EXCHANGE}?token=QUERY-CREDENTIAL-SENTINEL`)
+      .set("Host", host).set("Origin", PUBLIC).expect((response) => { expect(response.status).toBeGreaterThanOrEqual(400); });
+    await request(app).post(`${EXCHANGE}/`).set("Host", host).set("Origin", PUBLIC)
+      .set("Content-Type", JSON_TYPE).send({ state: inputSentinels[0] });
+    await request(app).post("/api/auth/firebase-session/unknown-suffix?credential=QUERY-CREDENTIAL-SENTINEL")
+      .set("Host", host).set("Origin", PUBLIC).set("Content-Type", JSON_TYPE)
+      .send({ transactionId: inputSentinels[2], credentialAlias: inputSentinels[1] });
+    await request(app).post("/api/auth/FIREBASE-SESSION/exchange").set("Host", host).set("Origin", PUBLIC)
+      .set("Content-Type", JSON_TYPE).set("Authorization", `Bearer ${inputSentinels[4]}`)
+      .set("Cookie", `probe=${inputSentinels[3]}`).send({ state: inputSentinels[0] });
+    await request(app).post(EXCHANGE).set("Host", host).set("Origin", PUBLIC).set("Content-Type", JSON_TYPE)
+      .send({ state: inputSentinels[0], credentialAlias: inputSentinels[1] });
+
+    const combinedLogs = logLines.join("\n");
+    const records = logLines.map((line) => JSON.parse(line) as {
+      req?: { method?: string; url?: string; headers?: unknown; query?: unknown; body?: unknown; params?: unknown };
+      res?: { statusCode?: number; headers?: unknown };
+      msg?: string;
+      err?: unknown;
+    });
+    expect(records.length).toBeGreaterThanOrEqual(6);
+    for (const record of records) {
+      expect(record.req?.url).toBe("/api/auth/firebase-session/:reserved");
+      expect(["GET", "POST"]).toContain(record.req?.method);
+      expect(record.res?.statusCode).toBeGreaterThanOrEqual(400);
+      expect(record.req?.headers).toBeUndefined();
+      expect(record.req?.query).toBeUndefined();
+      expect(record.req?.body).toBeUndefined();
+      expect(record.req?.params).toBeUndefined();
+      expect(record.res?.headers).toBeUndefined();
+      expect(record.err).toBeUndefined();
+    }
+    expect(records.some((record) => record.msg?.includes("/api/auth/firebase-session/:reserved"))).toBe(true);
+    for (const sentinel of inputSentinels) expect(combinedLogs).not.toContain(sentinel);
+    expect(combinedLogs).toContain("/api/auth/firebase-session/:reserved");
+    expect(combinedLogs).toMatch(/"statusCode":(?:400|405|418|500)/);
+    expect(combinedLogs).toMatch(/"method":"(?:GET|POST)"/);
+    expect(combinedLogs).not.toContain("/exchange/");
+    expect(combinedLogs).not.toContain("unknown-suffix");
+    expect(combinedLogs).not.toContain("FIREBASE-SESSION");
   });
 });

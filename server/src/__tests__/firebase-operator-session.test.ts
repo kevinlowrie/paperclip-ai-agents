@@ -23,10 +23,11 @@ import { firebaseOperatorSessionPlugin } from "../auth/firebase-operator-session
 import { firebaseOperatorPreAuthRequestHandler } from "../auth/firebase-operator-session-preflight.js";
 import { FirebaseOperatorVerificationError, type FirebaseOperatorProof } from "../auth/firebase-operator-verifier.js";
 import { createHttpLogger } from "../middleware/logger.js";
+import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 
 const PUBLIC = "https://paperclip.example.test";
 const LAB = "https://paperclip.lab.example.test";
-const NOW = Date.UTC(2026, 10, 8, 18, 0, 0);
+const NOW = Date.now();
 const TOKEN_SENTINEL = "id-token-do-not-log-7cb289";
 const SESSION_SENTINEL = "session-token-do-not-log-6b5c44";
 const COMPANY_ID = "b0e62d4d-b4f9-4e27-9f62-2b95d1320717";
@@ -109,7 +110,7 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     const app = express();
     if (options.httpLogs) {
       const stream = new Writable({ write(chunk, _encoding, callback) { options.httpLogs!.push(chunk.toString()); callback(); } });
-      app.use(createHttpLogger(pino({ level: "trace" }, stream)));
+      app.use(createHttpLogger(pino({ level: "trace", redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
     }
     app.use(firebaseOperatorPreAuthRequestHandler({ trustedOrigins: new Set([PUBLIC, LAB]) }));
     app.use(express.json());
@@ -229,13 +230,30 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
   });
 
+  it("requires private preflight provenance even when the same Better Auth plugin is mounted directly", async () => {
+    const f = await fixture(); const { app, auth } = appFor(f);
+    const started = await begin(app);
+    const directMount = express();
+    directMount.use(express.json());
+    directMount.all("/api/auth/*splat", (req, res, next) => {
+      void Promise.resolve(toNodeHandler(auth)(req, res)).catch(next);
+    });
+    const denied = await exchange(directMount, started, started.body.state);
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(denied.headers["set-cookie"]?.join("\n") ?? "").not.toMatch(/session_token=[^;\s]+/);
+    expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
+    const transactions = await db.select().from(firebaseOperatorLoginTransactions)
+      .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+    expect(transactions[0]?.consumedAt).toBeNull();
+  });
+
   it.each([
     ["wrong project", { projectId: "attacker-project" }],
     ["stale authentication", { authTimeSeconds: Math.floor(NOW / 1000) - 301 }],
     ["future authentication", { authTimeSeconds: Math.floor(NOW / 1000) + 1 }],
     ["no TOTP", { totpFactors: [] }],
   ])("denies %s proof with a generic response and no session", async (_label, proofOverrides) => {
-    const f = await fixture(); const { app } = appFor(f, { verify: async () => proof(proofOverrides) });
+    const f = await fixture(); const { app } = appFor(f, { verify: async () => proof({ ...proofOverrides, uid: f.uid } as Partial<FirebaseOperatorProof>) });
     const started = await begin(app);
     const response = await exchange(app, started, started.body.state);
     expect(response.status).toBeGreaterThanOrEqual(400);
@@ -245,17 +263,33 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
   });
 
   it("rechecks auth_time freshness at final issuance after a PostgreSQL lock wait", async () => {
-    const f = await fixture(); let clock = NOW; const { app } = appFor(f, { now: () => clock });
+    const f = await fixture(); let clock = NOW;
+    const authTimeSeconds = Math.floor(NOW / 1000) - 299;
+    const verifier = vi.fn(async () => proof({ uid: f.uid, authTimeSeconds }));
+    expect(NOW - authTimeSeconds * 1000).toBeLessThanOrEqual(300_000);
+    const { app } = appFor(f, { now: () => clock, verify: verifier });
     const started = await begin(app);
     const blockerDb = createDb(temporary.connectionString);
     let unlock!: () => void;
     const blocked = new Promise<void>((resolve) => { unlock = resolve; });
+    let signalLock!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => { signalLock = resolve; });
     let pending: Promise<request.Response> | undefined;
     const holding = blockerDb.transaction(async (tx) => {
       await tx.execute(sql`select id from firebase_operator_bindings where id = ${f.bindingId} for update`);
+      signalLock();
       await blocked;
     });
     try {
+      let lockTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          lockAcquired,
+          new Promise<never>((_, reject) => { lockTimer = setTimeout(() => reject(new Error("binding row lock was not acquired")), 10_000); }),
+        ]);
+      } finally {
+        if (lockTimer) clearTimeout(lockTimer);
+      }
       pending = exchange(app, started, started.body.state);
       const deadline = Date.now() + 10_000;
       let observedWait = false;
@@ -268,12 +302,19 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       expect(observedWait).toBe(true);
-      clock = NOW + 301_000;
+      expect(verifier).toHaveBeenCalledOnce();
+      clock = NOW + 2_000;
+      expect(clock - authTimeSeconds * 1000).toBeGreaterThan(300_000);
+      expect(clock - NOW).toBeLessThanOrEqual(60_000);
+      expect(clock).toBeLessThan(new Date(started.body.expiresAt).getTime());
       unlock();
       const response = await pending;
       expect(response.status).toBeGreaterThanOrEqual(400);
       expect(response.headers["set-cookie"]?.join("\n") ?? "").not.toContain("session_token");
       expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
+      const transaction = await db.select().from(firebaseOperatorLoginTransactions)
+        .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+      expect(transaction[0]?.consumedAt).toBeInstanceOf(Date);
     } finally {
       unlock();
       await pending?.catch(() => undefined);
@@ -365,12 +406,24 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
 
   it("cleans only its preallocated SDK session after assurance or cookie failure, and never replays", async () => {
     const f = await fixture();
-    const { app } = appFor(f, { hooks: { session: { create: { after: () => { throw new Error(SESSION_SENTINEL); } } } } });
+    let observedSessionToken: string | undefined;
+    const loggerEntries: unknown[] = []; const httpLogs: string[] = [];
+    const { app } = appFor(f, {
+      httpLogs,
+      onLogger: (entry) => loggerEntries.push(entry),
+      hooks: { session: { create: { after: (session: unknown) => {
+        if (typeof session === "object" && session !== null && "token" in session && typeof session.token === "string") observedSessionToken = session.token;
+        throw new Error(`${SESSION_SENTINEL} ${TOKEN_SENTINEL} TOTP-SENTINEL SQL-DETAIL-SENTINEL`);
+      } } } },
+    });
     const started = await begin(app);
     const failed = await exchange(app, started, started.body.state);
     expect(failed.status).toBeGreaterThanOrEqual(400);
     expect(failed.headers["set-cookie"]?.join("\n") ?? "").not.toContain("session_token");
     expect(failed.headers["set-cookie"]?.join("\n") ?? "").not.toContain(SESSION_SENTINEL);
+    expect(observedSessionToken).toEqual(expect.any(String));
+    expect(JSON.stringify({ body: failed.body, headers: failed.headers, loggerEntries, httpLogs })).not.toContain(observedSessionToken!);
+    expect(JSON.stringify({ loggerEntries, httpLogs })).not.toContain(started.body.state);
     expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
     expect((await exchange(app, started, started.body.state)).status).toBeGreaterThanOrEqual(400);
   });
