@@ -2,18 +2,25 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { and, eq, gt, isNull } from "drizzle-orm";
 import { createAuthEndpoint } from "better-auth/api";
 import { deleteSessionCookie, setSessionCookie } from "better-auth/cookies";
-import type { BetterAuthOptions } from "better-auth";
-import { ROOT_CONTEXT, trace } from "@opentelemetry/api";
 import type { Db } from "@paperclipai/db";
 import {
   authSessions, authUsers, companyMemberships, companies, firebaseOperatorBindings,
   firebaseOperatorLoginTransactions, firebaseOperatorSessionAssurance,
   instanceUserRoles,
 } from "@paperclipai/db";
-import { logger } from "../middleware/logger.js";
 import { createProductionFirebaseOperatorVerifier, FirebaseOperatorVerificationError } from "./firebase-operator-verifier.js";
 import { getFirebaseOperatorPreAuthContext } from "./firebase-operator-session-preflight.js";
 import type { FirebaseOperatorProof } from "./firebase-operator-verifier.js";
+import {
+  emitFirebaseOperatorAudit,
+  finishFirebaseOperatorSessionSpan,
+  isFirebaseOperatorSafeAuthLogger,
+  startFirebaseOperatorSessionSpan,
+  type FirebaseOperatorAuditEvent,
+  type FirebaseOperatorAuditSink,
+} from "./firebase-operator-session-observability.js";
+export { firebaseOperatorSafeAuthOptions } from "./firebase-operator-session-observability.js";
+export type { FirebaseOperatorAuditEvent, FirebaseOperatorAuditSink } from "./firebase-operator-session-observability.js";
 
 const BEGIN_PATH = "/api/auth/firebase-session/begin" as const;
 const EXCHANGE_PATH = "/api/auth/firebase-session/exchange" as const;
@@ -26,53 +33,6 @@ const PROOF_MAX_AGE_MS = 300_000;
 const CHECK_MAX_AGE_MS = 60_000;
 const SESSION_TTL_MS = 8 * 60 * 60_000;
 type Proof = FirebaseOperatorProof;
-export type FirebaseOperatorAuditEvent = {
-  event: "begin" | "exchange" | "better_auth_log_suppressed";
-  outcome: "created" | "issued" | "cancelled" | "denied" | "suppressed";
-  reason: "accepted" | "cancelled" | "bad_request" | "origin_denied" | "rate_limited" | "transaction_invalid" | "proof_denied" | "binding_denied" | "company_denied" | "session_failed" | "assurance_failed" | "deadline_expired" | "dependency_unavailable" | "internal_failure" | "sdk_message_suppressed";
-  correlationId: string;
-  sdkLevel?: "debug" | "info" | "warn" | "error";
-};
-export type FirebaseOperatorAuditSink = (event: FirebaseOperatorAuditEvent) => void;
-const safeAuthLogCallbacks = new WeakSet<Function>();
-
-function defaultAudit(event: FirebaseOperatorAuditEvent): void {
-  const fields = { event: event.event, outcome: event.outcome, reason: event.reason, correlationId: event.correlationId, ...(event.sdkLevel ? { sdkLevel: event.sdkLevel } : {}) };
-  if (event.outcome === "denied") logger.warn(fields, "Firebase operator session request denied");
-  else if (event.outcome === "cancelled") logger.info(fields, "Firebase operator session request cancelled");
-  else if (event.event === "better_auth_log_suppressed") logger.debug(fields, "Better Auth log suppressed");
-  else logger.info(fields, "Firebase operator session request completed");
-}
-
-function emitAudit(sink: FirebaseOperatorAuditSink, event: FirebaseOperatorAuditEvent): void {
-  try { sink(event); } catch { /* audit sinks cannot change authentication outcomes */ }
-}
-
-function startSafeSpan(route: "begin" | "exchange") {
-  try { return trace.getTracer("paperclip.firebase-operator-session").startSpan(`firebase.operator_session.${route}`, { attributes: { "firebase_operator.route": route } }, ROOT_CONTEXT); }
-  catch { return undefined; }
-}
-
-function finishSafeSpan(span: ReturnType<typeof startSafeSpan>, outcome: FirebaseOperatorAuditEvent["outcome"], reason: FirebaseOperatorAuditEvent["reason"]): void {
-  try {
-    span?.setAttribute("firebase_operator.outcome", outcome);
-    span?.setAttribute("firebase_operator.reason", reason);
-    span?.end();
-  } catch { /* observability cannot change authentication outcomes */ }
-}
-
-export function firebaseOperatorSafeAuthOptions(options: BetterAuthOptions, audit: FirebaseOperatorAuditSink = defaultAudit): BetterAuthOptions {
-  const callback = (level: "debug" | "info" | "warn" | "error") => {
-    emitAudit(audit, { event: "better_auth_log_suppressed", outcome: "suppressed", reason: "sdk_message_suppressed", correlationId: randomUUID(), sdkLevel: level });
-  };
-  safeAuthLogCallbacks.add(callback);
-  return {
-    ...options,
-    experimental: { ...options.experimental, instrumentation: { ...options.experimental?.instrumentation, enabled: false } },
-    logger: { ...options.logger, disabled: false, log: callback },
-  };
-}
-
 type Deps = { db: Db; verifier: { verify(token: string): Promise<Proof> }; trustedOrigins: ReadonlySet<string>; allowedCompanyIds: ReadonlySet<string>; now?: () => number; audit?: FirebaseOperatorAuditSink };
 type EndpointContext = {
   body?: unknown;
@@ -196,7 +156,7 @@ export function firebaseOperatorSessionPlugin(dependencies: Deps) {
   return {
     id: "paperclip-firebase-operator-session",
     init(ctx: { options?: { experimental?: { instrumentation?: { enabled?: boolean } }; logger?: { log?: Function } } }) {
-      if (ctx.options?.experimental?.instrumentation?.enabled !== false || typeof ctx.options.logger?.log !== "function" || !safeAuthLogCallbacks.has(ctx.options.logger.log)) {
+      if (ctx.options?.experimental?.instrumentation?.enabled !== false || !isFirebaseOperatorSafeAuthLogger(ctx.options.logger?.log)) {
         throw new Error("Firebase operator sessions require firebaseOperatorSafeAuthOptions");
       }
     },
@@ -204,7 +164,7 @@ export function firebaseOperatorSessionPlugin(dependencies: Deps) {
       beginFirebaseOperatorSession: createAuthEndpoint(BEGIN_ENDPOINT, { method: "POST", requireHeaders: true }, async (endpointContext) => {
         const ctx = endpointContext as unknown as EndpointContext;
         const correlationId = randomUUID();
-        const span = startSafeSpan("begin");
+        const span = startFirebaseOperatorSessionSpan("begin");
         let auditReason: FirebaseOperatorAuditEvent["reason"] = "internal_failure";
         try {
         ctx.setHeader("Cache-Control", "no-store");
@@ -232,20 +192,20 @@ export function firebaseOperatorSessionPlugin(dependencies: Deps) {
         const cookie = cookieFor(ctx);
         ctx.setCookie(cookie.name, binding, { ...cookie.attributes, maxAge: Math.min(300, remainingSeconds) });
         auditReason = "accepted";
-        emitAudit(dependencies.audit ?? defaultAudit, { event: "begin", outcome: "created", reason: auditReason, correlationId });
-        finishSafeSpan(span, "created", auditReason);
+        emitFirebaseOperatorAudit(dependencies.audit, { event: "begin", outcome: "created", reason: auditReason, correlationId });
+        finishFirebaseOperatorSessionSpan(span, "created", auditReason);
         return { transactionId, state, expiresAt: expiresAt.toISOString() };
         } catch (error) {
           const reason = error instanceof FirebaseSessionResponseError ? auditReason : reasonForStatus(error);
-          emitAudit(dependencies.audit ?? defaultAudit, { event: "begin", outcome: "denied", reason, correlationId });
-          finishSafeSpan(span, "denied", reason);
+          emitFirebaseOperatorAudit(dependencies.audit, { event: "begin", outcome: "denied", reason, correlationId });
+          finishFirebaseOperatorSessionSpan(span, "denied", reason);
           return reportEndpointFailure(ctx, error);
         }
       }),
       exchangeFirebaseOperatorSession: createAuthEndpoint(EXCHANGE_ENDPOINT, { method: "POST", requireHeaders: true }, async (endpointContext) => {
         const ctx = endpointContext as unknown as EndpointContext;
         const correlationId = randomUUID();
-        const span = startSafeSpan("exchange");
+        const span = startFirebaseOperatorSessionSpan("exchange");
         let auditReason: FirebaseOperatorAuditEvent["reason"] = "internal_failure";
         let auditOutcome: FirebaseOperatorAuditEvent["outcome"] = "denied";
         try {
@@ -358,8 +318,8 @@ export function firebaseOperatorSessionPlugin(dependencies: Deps) {
           expireTransactionCookie(ctx);
           auditOutcome = "issued";
           auditReason = "accepted";
-          emitAudit(dependencies.audit ?? defaultAudit, { event: "exchange", outcome: auditOutcome, reason: auditReason, correlationId });
-          finishSafeSpan(span, auditOutcome, auditReason);
+          emitFirebaseOperatorAudit(dependencies.audit, { event: "exchange", outcome: auditOutcome, reason: auditReason, correlationId });
+          finishFirebaseOperatorSessionSpan(span, auditOutcome, auditReason);
           return { redirectTo: transaction.returnPath };
         } catch (error) {
           if (error instanceof Error && error.message === "issuance deadline expired") auditReason = "deadline_expired";
@@ -374,8 +334,8 @@ export function firebaseOperatorSessionPlugin(dependencies: Deps) {
         }
         } catch (error) {
           const reason = error instanceof FirebaseSessionResponseError ? auditReason : auditReason === "session_failed" ? "session_failed" : "dependency_unavailable";
-          emitAudit(dependencies.audit ?? defaultAudit, { event: "exchange", outcome: auditOutcome, reason, correlationId });
-          finishSafeSpan(span, auditOutcome, reason);
+          emitFirebaseOperatorAudit(dependencies.audit, { event: "exchange", outcome: auditOutcome, reason, correlationId });
+          finishFirebaseOperatorSessionSpan(span, auditOutcome, reason);
           return reportEndpointFailure(ctx, error);
         }
       }),

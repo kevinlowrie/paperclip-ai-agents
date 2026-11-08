@@ -487,7 +487,7 @@ describe("Firebase operator pre-auth HTTP boundary", () => {
     }));
     assertObservedDenial({
       events,
-      expectedReason: "bad_request",
+      expectedReason: "origin_denied",
       response: {
         status: missingHostResponse.status,
         body: JSON.parse(missingHostBody),
