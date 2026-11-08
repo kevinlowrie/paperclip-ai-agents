@@ -129,6 +129,11 @@ export async function testEnvironment(
   }
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+  const scrubMcpSecrets = (text: string): string =>
+    Object.values(preparedRuntimeConfig.mcpCredentialEnv ?? {}).reduce(
+      (safe, secret) => secret.length > 0 ? safe.split(secret).join("[redacted]") : safe,
+      text,
+    );
   if (targetIsRemote) {
     prepareOpenCodeRemoteHomes({
       env: preparedRuntimeConfig.env,
@@ -412,6 +417,7 @@ export async function testEnvironment(
             env: {
               ...runtimeEnv,
               ...(targetIsRemote ? preparedRuntimeConfig.credentialEnv : {}),
+              ...(targetIsRemote ? preparedRuntimeConfig.mcpCredentialEnv : {}),
             },
             timeoutSec: helloProbeTimeoutSec,
             graceSec: 5,
@@ -420,9 +426,11 @@ export async function testEnvironment(
           },
         );
 
-        const parsed = parseOpenCodeJsonl(probe.stdout);
-        const detail = summarizeProbeDetail(probe.stdout, probe.stderr, parsed.errorMessage);
-        const authEvidence = `${parsed.errorMessage ?? ""}\n${probe.stdout}\n${probe.stderr}`.trim();
+        const safeStdout = scrubMcpSecrets(probe.stdout);
+        const safeStderr = scrubMcpSecrets(probe.stderr);
+        const parsed = parseOpenCodeJsonl(safeStdout);
+        const detail = summarizeProbeDetail(safeStdout, safeStderr, parsed.errorMessage);
+        const authEvidence = `${parsed.errorMessage ?? ""}\n${safeStdout}\n${safeStderr}`.trim();
 
         if (probe.timedOut) {
           checks.push({
@@ -432,7 +440,7 @@ export async function testEnvironment(
             hint: "Retry the probe. If this persists, run OpenCode manually in this working directory.",
           });
         } else if ((probe.exitCode ?? 1) === 0 && !parsed.errorMessage) {
-          const summary = parsed.summary.trim();
+          const summary = scrubMcpSecrets(parsed.summary.trim());
           const hasHello = /\bhello\b/i.test(summary);
           checks.push({
             code: hasHello ? "opencode_hello_probe_passed" : "opencode_hello_probe_unexpected_output",
@@ -477,7 +485,7 @@ export async function testEnvironment(
           code: "opencode_hello_probe_failed",
           level: "error",
           message: "OpenCode hello probe failed.",
-          detail: err instanceof Error ? err.message : String(err),
+          detail: scrubMcpSecrets(err instanceof Error ? err.message : String(err)),
           hint: "Run `opencode run --format json` manually in this working directory to debug.",
         });
       }

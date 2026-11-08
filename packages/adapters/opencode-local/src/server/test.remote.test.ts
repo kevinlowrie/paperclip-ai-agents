@@ -136,6 +136,7 @@ describe("opencode remote environment diagnostics", () => {
         command: "opencode",
         model: "anthropic/claude-sonnet-4-5",
         dangerouslySkipPermissions: false,
+        remoteMcpServers: [{ name: "search", url: "https://search.internal/mcp", tokenEnvName: "CONTEXT_KEY" }],
         ...(managed ? {
           managedAiConnection: { provider: "openrouter", method: "api_key" },
         } : {}),
@@ -151,6 +152,7 @@ describe("opencode remote environment diagnostics", () => {
             },
           }),
           SCOPED_PROVIDER_KEY: "scoped-test-key",
+          CONTEXT_KEY: "fixture-context-bearer",
           ...(managed ? { OPENAI_API_KEY: "", OPENROUTER_API_KEY: "fixture", HOME: "/var/folders/qa-managed", XDG_DATA_HOME: "/var/folders/qa-managed/data" } : {}),
         },
       },
@@ -183,8 +185,11 @@ describe("opencode remote environment diagnostics", () => {
       | Record<string, string>
       | undefined;
     expect(directoryOptions?.env?.SCOPED_PROVIDER_KEY).toBeUndefined();
+    expect(directoryOptions?.env?.CONTEXT_KEY).toBeUndefined();
     expect(installOptions?.env?.SCOPED_PROVIDER_KEY).toBeUndefined();
+    expect(installOptions?.env?.CONTEXT_KEY).toBeUndefined();
     expect(resolutionEnv?.SCOPED_PROVIDER_KEY).toBeUndefined();
+    expect(resolutionEnv?.CONTEXT_KEY).toBeUndefined();
     expect(probeCall?.[4].cwd).toBe("/remote/workspace/.paperclip-runtime/runs/test/workspace");
     if (managed) {
       expect(probeCall?.[4].env.HOME).toContain("/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/home/");
@@ -199,6 +204,7 @@ describe("opencode remote environment diagnostics", () => {
     );
     expect(probeCall?.[4].env.OPENCODE_CONFIG_DIR).toBeUndefined();
     expect(probeCall?.[4].env.SCOPED_PROVIDER_KEY).toBe("scoped-test-key");
+    expect(probeCall?.[4].env.CONTEXT_KEY).toBe("fixture-context-bearer");
     expect(probeCall?.[4].env.OPENAI_API_KEY).toBe(managed ? "" : undefined);
     expect(probeCall?.[4].env.DATABASE_URL).toBeUndefined();
     expect(probeCall?.[4].env.ANTHROPIC_API_KEY).toBeUndefined();
@@ -207,6 +213,8 @@ describe("opencode remote environment diagnostics", () => {
     expect(probeCall?.[4].env.PATH).toBeDefined();
     expect(probeCall?.[4].env.XDG_DATA_HOME).toContain("/home/");
     expect(probeCall?.[4].env.XDG_RUNTIME_DIR).toBe(`${probeCall?.[4].env.HOME}/runtime`);
+    expect(JSON.stringify(runtimeInput)).not.toContain("fixture-context-bearer");
+    expect(JSON.stringify(result)).not.toContain("fixture-context-bearer");
   });
 
   it("rejects missing scoped key before any remote runner or process call", async () => {
@@ -237,6 +245,46 @@ describe("opencode remote environment diagnostics", () => {
     expect(ensureAdapterExecutionTargetDirectory).not.toHaveBeenCalled();
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
     expect(remoteExecute).not.toHaveBeenCalled();
+  });
+
+  it("redacts MCP credentials echoed by a failed remote hello probe", async () => {
+    const secret = "fixture-context-bearer-echoed";
+    runAdapterExecutionTargetProcess.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: `remote auth failure: ${secret}`,
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    });
+    const remoteTarget: AdapterExecutionTarget = {
+      kind: "remote", transport: "sandbox", providerKey: "cloudflare", remoteCwd: "/remote/workspace",
+      runner: { execute: vi.fn(async () => ({
+        exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null,
+        startedAt: new Date().toISOString(),
+      })) },
+    };
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "opencode_local",
+      config: {
+        command: "opencode",
+        model: "anthropic/claude-sonnet-4-5",
+        remoteMcpServers: [{ name: "search", url: "https://search.internal/mcp", tokenEnvName: "CONTEXT_KEY" }],
+        env: {
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+            anthropic: { options: { apiKey: "{env:SCOPED_PROVIDER_KEY}" }, models: { "claude-sonnet-4-5": {} } },
+          }),
+          SCOPED_PROVIDER_KEY: "fixture-model-key",
+          CONTEXT_KEY: secret,
+        },
+      },
+      executionTarget: remoteTarget,
+    });
+    expect(result.status).toBe("fail");
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(JSON.stringify(result)).toContain("[redacted]");
   });
 
   it.each(["NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS"])(
