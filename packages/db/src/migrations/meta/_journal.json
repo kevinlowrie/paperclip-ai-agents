@@ -2066,6 +2066,13 @@
       "when": 1794159700607,
       "tag": "0296_panoramic_reptil",
       "breakpoints": true
+    },
+    {
+      "idx": 297,
+      "version": "7",
+      "when": 1794164357787,
+      "tag": "0297_ancient_iron_fist",
+      "breakpoints": true
     }
   ]
 }

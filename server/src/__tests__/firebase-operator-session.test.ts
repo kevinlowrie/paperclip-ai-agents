@@ -11,6 +11,8 @@ import { and, eq, sql } from "drizzle-orm";
 import {
   authSessions,
   authUsers,
+  authAccounts,
+  authVerifications,
   companies,
   companyMemberships,
   createDb,
@@ -94,7 +96,10 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
       secret: "real-test-secret-for-better-auth-session-exchange",
       baseURL: PUBLIC,
       trustedOrigins: [PUBLIC, LAB],
-      database: drizzleAdapter(db, { provider: "pg" }),
+      database: drizzleAdapter(db, {
+        provider: "pg",
+        schema: { user: authUsers, session: authSessions, account: authAccounts, verification: authVerifications },
+      }),
       emailAndPassword: { enabled: true },
       advanced: { crossSubDomainCookies: { enabled: Boolean(options.cookieDomain), domain: options.cookieDomain }, useSecureCookies: true },
       logger: { log: (level: string, message: string, ...args: unknown[]) => options.onLogger?.({ level, message, args }) } as never,

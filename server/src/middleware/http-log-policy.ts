@@ -41,6 +41,29 @@ const SECRET_SENSITIVE_HTTP_PATHS = [
   /^\/api\/chat-endpoints\/[^/]+\/setup(?:-secret)?(?:\/|$)/,
 ];
 const SECRET_SENSITIVE_HTTP_METHODS = new Set(["POST", "PUT", "PATCH"]);
+const FIREBASE_SESSION_NAMESPACE = /^\/api\/auth\/firebase-session(?:\/|$)/i;
+
+/** True for every spelling of the reserved exchange namespace, including rejected variants. */
+export function isFirebaseSessionHttpRequest(
+  method: string | undefined,
+  url: string | undefined,
+): boolean {
+  if (!method || !url) return false;
+  const raw = normalizePath(url);
+  if (/^https?:\/\//i.test(raw)) {
+    const rawPath = raw.replace(/^https?:\/\/[^/]*/i, "") || "/";
+    if (FIREBASE_SESSION_NAMESPACE.test(rawPath)) return true;
+    try { return FIREBASE_SESSION_NAMESPACE.test(new URL(url).pathname); } catch { return false; }
+  }
+  return FIREBASE_SESSION_NAMESPACE.test(raw);
+}
+
+export function isReservedFirebaseSessionHttpRequest(
+  method: string | undefined,
+  url: string | undefined,
+): boolean {
+  return isFirebaseSessionHttpRequest(method, url);
+}
 
 /** Provider payloads are private even when a method/signature is rejected. */
 export function isPrivateWebhookHttpRequest(
@@ -77,6 +100,7 @@ export function isSecretSensitiveHttpRequest(
   url: string | undefined,
 ): boolean {
   if (isPrivateWebhookHttpRequest(method, url)) return true;
+  if (isFirebaseSessionHttpRequest(method, url)) return true;
   if (!method || !url) return false;
   if (!SECRET_SENSITIVE_HTTP_METHODS.has(method.toUpperCase())) return false;
   const pathname = normalizePath(url);

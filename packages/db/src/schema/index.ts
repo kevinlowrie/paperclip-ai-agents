@@ -17,6 +17,7 @@ export { principalPermissionGrants } from "./principal_permission_grants.js";
 export {
   firebaseOperatorBindings,
   firebaseOperatorSessionAssurance,
+  firebaseOperatorLoginTransactions,
   firebaseOperatorProvisionPackets,
   firebaseOperatorProvisionEvents,
 } from "./firebase_operator.js";

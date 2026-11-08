@@ -1,5 +1,5 @@
 {
-  "status": "prerequisite-only; browser session issuance and deployed activation are not implemented",
+  "status": "browser Firebase-to-Paperclip session issuance implemented as dormant source; production registration and deployed activation remain disabled",
   "source_model": "user-authorized gpt-6-luna fallback; not native ownerpair/provider-diversity acceptance",
   "contracts": [
     {
@@ -24,7 +24,7 @@
     "PFS002 five-minute authentication freshness primitive",
     "PFS012 current-user revocation/factor snapshot primitives; no persisted session lifecycle",
     "PFS003/004/010 provisioning storage, Firebase UID directory proof, and reviewed existing-user binding service",
-    "PFS008/009/011/012/013 persistence prerequisites: assurance storage, one-use provisioning packet state, append-only audit events, and atomic session revocation"
+    "PFS008/009 issuance slice: origin-bound one-use browser transaction, durable pre-session claim, existing-user session creation, and assurance commit before cookie; source plugin remains unmounted"
   ],
   "provisioning_snapshot": {
     "date": "2026-11-08",
@@ -37,8 +37,8 @@
     "activation_allowed": false
   },
   "not_implemented": [
-    "PFS003 through PFS011 and PFS013 through PFS014",
-    "identity binding, provisioner, transaction exchange, routes, cookies, local roles, session persistence, HTTP/stream enforcement, UI, live acceptance, deployment"
+    "PFS-010–014 protected-session guard and lifecycle enforcement across HTTP, websocket, SSE, NDJSON, terminal and dynamic routes",
+    "authenticated provisioning management surface, operator UI, reviewed production configuration, public/lab live acceptance and deployment"
   ],
   "activation_allowed": false
 }

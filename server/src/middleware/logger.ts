@@ -4,6 +4,7 @@ import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
   isPrivateWebhookHttpRequest,
+  isFirebaseSessionHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
@@ -68,12 +69,23 @@ function privateWebhookLogUrl(url: unknown) {
     : "/api/chat-webhooks/:publicId/:provider";
 }
 
+const FIREBASE_SESSION_LOG_ROUTE = "/api/auth/firebase-session/:reserved";
+
+function isFirebaseSession(req: { method?: string; originalUrl?: unknown; url?: unknown }) {
+  return isFirebaseSessionHttpRequest(
+    req.method,
+    typeof req.originalUrl === "string" ? req.originalUrl : typeof req.url === "string" ? req.url : undefined,
+  );
+}
+
 function requestLogUrl(req: {
   method?: string;
   originalUrl?: unknown;
   url?: unknown;
 }) {
-  return isPrivateWebhook(req)
+  return isFirebaseSession(req)
+    ? FIREBASE_SESSION_LOG_ROUTE
+    : isPrivateWebhook(req)
     ? privateWebhookLogUrl(requestClassificationUrl(req))
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
 }
@@ -83,6 +95,12 @@ export function createHttpLogger(baseLogger: Logger) {
     logger: baseLogger,
     serializers: {
       req(req: Record<string, unknown> & { url?: unknown }) {
+        if (isFirebaseSession({
+          method: typeof req.method === "string" ? req.method : undefined,
+          url: req.url,
+        })) {
+          return { id: req.id, method: req.method, url: FIREBASE_SESSION_LOG_ROUTE };
+        }
         if (
           isPrivateWebhook({
             method: typeof req.method === "string" ? req.method : undefined,
@@ -119,7 +137,7 @@ export function createHttpLogger(baseLogger: Logger) {
       ) {
         // A provider error may also be reflected in response headers. Keep the
         // same content-free contract on both sides of a webhook request.
-        return res.raw?.req && isPrivateWebhook(res.raw.req)
+        return res.raw?.req && (isPrivateWebhook(res.raw.req) || isFirebaseSession(res.raw.req))
           ? { statusCode: res.statusCode }
           : res;
       },
@@ -139,7 +157,7 @@ export function createHttpLogger(baseLogger: Logger) {
       if (
         isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))
       ) {
-        return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
+      return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
       }
       const ctx = (res as any).__errorContext;
       const errMsg =
@@ -152,7 +170,9 @@ export function createHttpLogger(baseLogger: Logger) {
     customErrorObject(req, _res, _err, value) {
       // pino-http serializes res.err independently of customProps/errorContext.
       // Do not rely on a particular error handler having sanitized an SDK Error.
-      return isPrivateWebhook(req)
+      return isFirebaseSession(req)
+        ? { ...value, err: undefined }
+        : isPrivateWebhook(req)
         ? {
             ...value,
             err: { type: "Error", message: "Chat webhook request failed" },
@@ -162,6 +182,9 @@ export function createHttpLogger(baseLogger: Logger) {
     customProps(req, res) {
       if (res.statusCode >= 400) {
         const ctx = (res as any).__errorContext;
+        if (isFirebaseSession(req)) {
+          return { errorContext: ctx || (res as any).err ? { name: "Error" } : undefined };
+        }
         if (isPrivateWebhook(req)) {
           // Omit, rather than recursively redact, the entire provider payload.
           // This applies equally before/after parsing and with/without context.

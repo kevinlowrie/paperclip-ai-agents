@@ -13,6 +13,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { authSessions, authUsers } from "./auth.js";
+import { companies } from "./companies.js";
 
 export const firebaseOperatorBindings = pgTable("firebase_operator_bindings", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -51,6 +52,22 @@ export const firebaseOperatorSessionAssurance = pgTable("firebase_operator_sessi
   bindingIdx: index("firebase_operator_session_assurance_binding_idx").on(table.bindingId, table.bindingRevision),
   revisionPositive: check("firebase_operator_session_assurance_revision_check", sql`${table.bindingRevision} > 0`),
   projectFixed: check("firebase_operator_session_assurance_project_check", sql`${table.projectId} = 'thl-pclipd-api'`),
+}));
+
+export const firebaseOperatorLoginTransactions = pgTable("firebase_operator_login_transactions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  origin: text("origin").notNull(),
+  companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "restrict" }),
+  returnPath: text("return_path").notNull(),
+  browserBindingHash: text("browser_binding_hash").notNull(),
+  csrfStateHash: text("csrf_state_hash").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+}, (table) => ({
+  expiryCheck: check("firebase_operator_login_transactions_expiry_check", sql`${table.expiresAt} > ${table.createdAt} and ${table.expiresAt} <= ${table.createdAt} + interval '300 seconds'`),
+  hashesCheck: check("firebase_operator_login_transactions_hashes_check", sql`${table.browserBindingHash} ~ '^[0-9a-f]{64}$' and ${table.csrfStateHash} ~ '^[0-9a-f]{64}$'`),
+  expiryIdx: index("firebase_operator_login_transactions_expiry_idx").on(table.expiresAt),
 }));
 
 export const firebaseOperatorProvisionPackets = pgTable("firebase_operator_provision_packets", {
