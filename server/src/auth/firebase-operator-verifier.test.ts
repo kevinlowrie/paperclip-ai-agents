@@ -341,6 +341,13 @@ describe("production Firebase verifier", () => {
     expect(firebaseAdminMocks.getAuth).not.toHaveBeenCalled();
   });
 
+  it("refuses whitespace emulator configuration at initialization", () => {
+    vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "   ");
+    expect(() => createProductionFirebaseOperatorVerifier()).toThrow(FirebaseOperatorVerificationError);
+    expect(firebaseAdminMocks.initializeApp).not.toHaveBeenCalled();
+    expect(firebaseAdminMocks.getAuth).not.toHaveBeenCalled();
+  });
+
   it("pins the production project and uses SDK revocation checking with synthetic ADC", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(nowMs);
@@ -365,6 +372,17 @@ describe("production Firebase verifier", () => {
     firebaseAdminMocks.auth.getUser.mockResolvedValue(user());
     const verifier = createProductionFirebaseOperatorVerifier();
     vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "localhost:9099");
+    await expectSafeFailure(verifier.verify(token), 503);
+    expect(firebaseAdminMocks.auth.verifyIdToken).not.toHaveBeenCalled();
+    expect(firebaseAdminMocks.auth.getUser).not.toHaveBeenCalled();
+  });
+
+  it("refuses whitespace emulator configuration after startup before SDK calls", async () => {
+    vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "");
+    firebaseAdminMocks.auth.verifyIdToken.mockResolvedValue(claims());
+    firebaseAdminMocks.auth.getUser.mockResolvedValue(user());
+    const verifier = createProductionFirebaseOperatorVerifier();
+    vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "   ");
     await expectSafeFailure(verifier.verify(token), 503);
     expect(firebaseAdminMocks.auth.verifyIdToken).not.toHaveBeenCalled();
     expect(firebaseAdminMocks.auth.getUser).not.toHaveBeenCalled();

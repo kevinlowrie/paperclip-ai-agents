@@ -59,7 +59,7 @@ function classifyProviderError(error: unknown): never {
 
 function assertEmulatorOff(): void {
   const host = process.env.FIREBASE_AUTH_EMULATOR_HOST;
-  if (typeof host === "string" && host.trim().length > 0) unavailable();
+  if (typeof host === "string" && host.length > 0) unavailable();
 }
 
 function validUid(value: unknown): value is string {
