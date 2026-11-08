@@ -23,23 +23,21 @@ export const authSessions = pgTable("session", {
 
 /**
  * Better Auth's `account` model. Every column here has to exist for the
- * Drizzle adapter to accept the table at all: the adapter validates the
- * model's fields against the schema on each write and throws
- * `The field "<name>" does not exist in the "account" Drizzle schema`
- * when one is missing, which surfaces as a 500 on sign-up.
+ * Drizzle adapter to accept the table; its schema validation is based on the
+ * configured model and write operations.
  *
- * `issuer` is the account namespace Better Auth 1.7 added. It is
- * `local:credential` for email/password accounts and
- * `local:oauth:<providerId>` for social accounts that do not declare an
- * issuer of their own, and it pairs with `account_id` as the stable
- * provider-side key — hence the unique index, which mirrors the
- * `(issuer, accountId)` unique index Better Auth declares on the model.
+ * `issuer` is retained as nullable legacy metadata for rows written by
+ * Better Auth 1.7.0–1.7.2. Better Auth 1.7.18 neither writes nor looks up this
+ * field, so it must not be required for inserts. Better Auth 1.7.18 looks up
+ * accounts by `(provider_id, account_id)`. The unique index on that pair is
+ * project-specific hardening for ambiguous legacy identities; it is not an
+ * index declared by the SDK.
  */
 export const authAccounts = pgTable(
   "account",
   {
     id: text("id").primaryKey(),
-    issuer: text("issuer").notNull(),
+    issuer: text("issuer"),
     accountId: text("account_id").notNull(),
     providerId: text("provider_id").notNull(),
     userId: text("user_id").notNull().references(() => authUsers.id, { onDelete: "cascade" }),
@@ -54,7 +52,7 @@ export const authAccounts = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
   },
   (table) => ({
-    issuerAccountIdUq: uniqueIndex("account_issuer_account_id_uq").on(table.issuer, table.accountId),
+    providerAccountIdUq: uniqueIndex("account_provider_id_account_id_uq").on(table.providerId, table.accountId),
   }),
 );
 

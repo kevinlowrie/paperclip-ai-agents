@@ -80,6 +80,7 @@ describeEmbeddedPostgres("account issuer migration", () => {
     // Rewind to the pre-upgrade shape: no issuer column, no unique index.
     await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash()}`;
     await sql`DROP INDEX IF EXISTS ${sql(UNIQUE_INDEX)}`;
+    await sql`DROP INDEX IF EXISTS account_provider_id_account_id_uq`;
     await sql`ALTER TABLE "account" DROP COLUMN IF EXISTS "issuer"`;
 
     const credentialUserId = `user-${randomUUID()}`;
