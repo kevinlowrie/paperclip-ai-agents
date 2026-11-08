@@ -28,7 +28,23 @@ async function migrationHash(file: string): Promise<string> {
 async function rewindMigration(sql: ReturnType<typeof postgres>, file: string): Promise<string> {
   const contentHash = await migrationHash(file);
   await sql`DELETE FROM drizzle.__drizzle_migrations WHERE hash = ${contentHash}`;
+  // The fresh test database has already run the full current migration set.
+  // Rewinding the journal alone does not recreate the pre-0296 schema.
+  await sql`DROP INDEX IF EXISTS account_provider_id_account_id_uq`;
+  await sql`ALTER TABLE account ALTER COLUMN issuer SET NOT NULL`;
+  await sql`CREATE UNIQUE INDEX account_issuer_account_id_uq ON account USING btree (issuer, account_id)`;
   return contentHash;
+}
+
+function errorProperties(error: unknown): Array<{ code?: unknown; message?: unknown }> {
+  const found: Array<{ code?: unknown; message?: unknown }> = [];
+  let current: unknown = error;
+  while (current && typeof current === "object" && !found.includes(current as never)) {
+    const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+    found.push(candidate);
+    current = candidate.cause;
+  }
+  return found;
 }
 
 describeEmbeddedPostgres("Better Auth account key migration", () => {
@@ -116,15 +132,29 @@ describeEmbeddedPostgres("Better Auth account key migration", () => {
       migrationError = error;
     }
     expect(migrationError).toBeInstanceOf(Error);
-    expect(String(migrationError)).not.toContain(accountIds[0]);
-    expect(String(migrationError)).not.toContain(accountIds[1]);
-    expect(String(migrationError)).not.toContain(userId);
+    const errorDetails = errorProperties(migrationError);
+    expect(errorDetails.map((detail) => detail.message).join(" ")).toContain(
+      "Cannot upgrade authentication with ambiguous provider account identities.",
+    );
+    expect(errorDetails.map((detail) => detail.code)).toContain("23505");
+    const errorText = errorDetails.map((detail) => detail.message).join(" ");
+    for (const sensitiveValue of [
+      ...accountIds,
+      userId,
+      "same-subject",
+      "legacy:issuer-a",
+      "legacy:issuer-b",
+    ]) {
+      expect(errorText).not.toContain(sensitiveValue);
+    }
 
     const rows = await sql<{ id: string; issuer: string; account_id: string }[]>`
       SELECT id, issuer, account_id FROM account WHERE id IN (${accountIds[0]}, ${accountIds[1]}) ORDER BY id
     `;
     expect(rows).toHaveLength(2);
-    expect(rows.map((row) => row.issuer)).toEqual(["legacy:issuer-a", "legacy:issuer-b"]);
+    const issuerById = new Map(rows.map((row) => [row.id, row.issuer]));
+    expect(issuerById.get(accountIds[0])).toBe("legacy:issuer-a");
+    expect(issuerById.get(accountIds[1])).toBe("legacy:issuer-b");
     const issuerColumn = await sql<{ is_nullable: string }[]>`
       SELECT is_nullable FROM information_schema.columns
       WHERE table_name = 'account' AND column_name = 'issuer'
