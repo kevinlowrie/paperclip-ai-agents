@@ -10,6 +10,7 @@ import {
 } from "@paperclipai/db";
 import { createProductionFirebaseOperatorVerifier, FirebaseOperatorVerificationError } from "./firebase-operator-verifier.js";
 import { getFirebaseOperatorPreAuthContext } from "./firebase-operator-session-preflight.js";
+import { withFirebaseOperatorSessionIssuance } from "./firebase-operator-session-issuance.js";
 import type { FirebaseOperatorProof } from "./firebase-operator-verifier.js";
 import {
   emitFirebaseOperatorAudit,
@@ -278,9 +279,14 @@ export function firebaseOperatorSessionPlugin(dependencies: Deps) {
           sdkToken = randomBytes(32).toString("base64url");
           const issuedAt = new Date(nowValue(now));
           const expiresAt = new Date(issuedAt.getTime() + SESSION_TTL_MS);
-          const session = await ctx.context.internalAdapter.createSession(userId, false, {
+          const session = await withFirebaseOperatorSessionIssuance({
+            userId,
+            bindingId: bound.binding.id,
+            bindingRevision: bound.binding.revision,
+            sessionTokenHash: sha256(sdkToken),
+          }, () => ctx.context.internalAdapter.createSession(userId, false, {
             token: sdkToken, createdAt: issuedAt, updatedAt: issuedAt, expiresAt,
-          }, true);
+          }, true));
           if (!session || typeof session.id !== "string" || session.token !== sdkToken) throw new Error("session creation failed");
           sessionId = session.id;
           let persistedSession: typeof authSessions.$inferSelect | undefined;

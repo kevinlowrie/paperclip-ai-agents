@@ -596,6 +596,71 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
       .resolves.toMatchObject({ kind: "denied", status: 401, reason });
   });
 
+  it("rechecks the idle deadline after a real PostgreSQL authorization lock wait", async () => {
+    const fixture = await assuredUser();
+    const unrelated = await assuredUser();
+    let clock = Date.now();
+    const issuedAt = new Date(clock - (30 * 60_000 - 1_000));
+    const absoluteExpiresAt = new Date(issuedAt.getTime() + 8 * 60 * 60_000);
+    await db.update(authSessions).set({
+      createdAt: issuedAt,
+      updatedAt: issuedAt,
+      expiresAt: absoluteExpiresAt,
+    }).where(eq(authSessions.id, fixture.session.id));
+    await db.update(firebaseOperatorSessionAssurance).set({
+      issuedAt,
+      lastInteractiveAt: issuedAt,
+      absoluteExpiresAt,
+      authTimeSeconds: Math.floor(issuedAt.getTime() / 1000) - 1,
+    }).where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+
+    const blockerDb = createDb(database.connectionString);
+    const controlDb = createDb(database.connectionString);
+    const membershipLockAcquired = deferred();
+    const releaseMembershipLock = deferred();
+    let blockerPid = 0;
+    const blocker = blockerDb.transaction(async (tx) => {
+      const [pid] = await tx.execute(sql`select pg_backend_pid() as pid`) as unknown as Array<{ pid: number }>;
+      blockerPid = Number(pid?.pid);
+      await tx.select({ id: companyMemberships.id }).from(companyMemberships)
+        .where(and(
+          eq(companyMemberships.companyId, fixture.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, fixture.userId),
+          eq(companyMemberships.status, "active"),
+        )).for("update").limit(1);
+      membershipLockAcquired.release();
+      await releaseMembershipLock.promise;
+    }, { isolationLevel: "read committed" });
+
+    try {
+      await membershipLockAcquired.promise;
+      const guard = await createGuard({
+        now: () => clock,
+        checkUser: async (proof) => ({ ...proof, checkedAtMs: clock }),
+      }) as {
+        check: (input: { sessionId: string; userId: string }) => Promise<Record<string, unknown>>;
+      };
+      const pending = guard.check({ sessionId: fixture.session.id, userId: fixture.userId });
+      await waitForCloudSyncLock(controlDb, blockerPid);
+      clock += 2_000;
+      releaseMembershipLock.release();
+
+      await expect(pending).resolves.toMatchObject({ kind: "denied", status: 401, reason: "idle_expired" });
+      await expect(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(0);
+      await expect(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id))).resolves.toHaveLength(0);
+      await expect(db.select().from(authSessions).where(eq(authSessions.id, unrelated.session.id))).resolves.toHaveLength(1);
+      await expect(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, unrelated.session.id))).resolves.toHaveLength(1);
+    } finally {
+      releaseMembershipLock.release();
+      await blocker.catch(() => undefined);
+      await blockerDb.$client.end();
+      await controlDb.$client.end();
+    }
+  });
+
   it("rechecks current PostgreSQL authorization on a positive-cache hit", async () => {
     const fixture = await assuredUser();
     let providerCalls = 0;

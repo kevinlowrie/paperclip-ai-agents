@@ -9,6 +9,8 @@ import {
   authUsers,
   companies,
   companyMemberships,
+  firebaseOperatorBindings,
+  firebaseOperatorSessionAssurance,
   heartbeatRuns,
   instanceUserRoles,
 } from "@paperclipai/db";
@@ -24,6 +26,8 @@ import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
+import { createFirebaseOperatorSessionGuard, emitFirebaseOperatorGuardDenial } from "../auth/firebase-operator-session-guard.js";
+import { createProductionFirebaseOperatorVerifier } from "../auth/firebase-operator-verifier.js";
 import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
 import { boardAuthService } from "../services/board-auth.js";
@@ -62,7 +66,7 @@ function pruneCloudTenantWriteDebounce(
 }
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
-import { forbidden, unauthorized, unprocessable } from "../errors.js";
+import { forbidden, HttpError, unauthorized, unprocessable } from "../errors.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { cloudTenantPrimaryCompanyId } from "../services/cloud-instance.js";
@@ -218,14 +222,76 @@ async function auditAgentKeyMissingResponsibleUser(
 interface ActorMiddlewareOptions {
   deploymentMode: DeploymentMode;
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
+  firebaseOperatorSessionGuard?: ReturnType<typeof createFirebaseOperatorSessionGuard>;
 }
 
 const publicRoutineWebhookPath = /^\/api\/routine-triggers\/public\/[a-f0-9]{24}\/fire\/?$/i;
 
 const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
+function verifiedCloudPrincipalUserId(req: CloudActorHeaderSource): string | null {
+  const expected = process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN?.trim();
+  const token = req.header("x-paperclip-cloud-tenant-token")?.trim();
+  if (!expected || !token || !constantTimeStringEqual(token, expected)) return null;
+  return req.header("x-paperclip-cloud-user-id")?.trim() || null;
+}
+
+function guardHttpError(status: number): HttpError {
+  return new HttpError(status, status === 503 ? "Authentication is temporarily unavailable" : status === 403 ? "Forbidden" : "Unauthorized");
+}
+
+async function guardedSessionActor(
+  db: Db,
+  guard: ReturnType<typeof createFirebaseOperatorSessionGuard>,
+  session: BetterAuthSessionResult,
+  runId: string | undefined,
+): Promise<Express.Request["actor"] | null> {
+  const userId = session.user?.id;
+  const sessionId = session.session?.id;
+  if (!userId || !sessionId) return null;
+  if (session.session?.userId !== userId) {
+    emitFirebaseOperatorGuardDenial("binding_invalid", 401);
+    throw unauthorized();
+  }
+  const state = await guard.readUserState(userId);
+  if (state.kind === "unavailable") {
+    emitFirebaseOperatorGuardDenial("dependency_unavailable", 503);
+    throw guardHttpError(503);
+  }
+  if (state.kind === "ordinary") return null;
+  const decision = await guard.check({ sessionId, userId });
+  if (decision.kind !== "allowed") throw guardHttpError(decision.kind === "denied" ? decision.status : 401);
+  let roleRow: { id: string } | null;
+  let memberships: Awaited<ReturnType<typeof loadActiveUserCompanyMemberships>>;
+  try {
+    [roleRow, memberships] = await Promise.all([
+      db.select({ id: instanceUserRoles.id }).from(instanceUserRoles)
+        .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin"))).then((rows) => rows[0] ?? null),
+      loadActiveUserCompanyMemberships(db, userId),
+    ]);
+  } catch {
+    emitFirebaseOperatorGuardDenial("dependency_unavailable", 503);
+    throw guardHttpError(503);
+  }
+  return {
+    type: "board", userId, sessionId,
+    userName: session.user?.name ?? null,
+    userEmail: session.user?.email ?? null,
+    companyIds: memberships.map((row) => row.companyId), memberships,
+    isInstanceAdmin: Boolean(roleRow), runId, source: "session",
+  };
+}
+
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
+  let productionVerifier: ReturnType<typeof createProductionFirebaseOperatorVerifier> | undefined;
+  const firebaseGuard = opts.firebaseOperatorSessionGuard ?? createFirebaseOperatorSessionGuard({
+    db,
+    verifier: { checkUser: (proof) => {
+      productionVerifier ??= createProductionFirebaseOperatorVerifier();
+      return productionVerifier.checkUser(proof);
+    } },
+  });
   return async (req, _res, next) => {
     req.actor =
       opts.deploymentMode === "local_trusted"
@@ -265,48 +331,67 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     }
 
     if (!hasBearerCredentials) {
-      if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
-        const cloudTenantActor = await resolveCloudTenantActor(db, req);
-        if (cloudTenantActor) {
-          req.actor = {
-            ...cloudTenantActor,
-            runId: runIdHeader ?? undefined,
-          };
+      if (opts.deploymentMode === "authenticated") {
+        let session: BetterAuthSessionResult | null = null;
+        if (opts.resolveSession) {
+          try { session = await opts.resolveSession(req); }
+          catch {
+            emitFirebaseOperatorGuardDenial("dependency_unavailable", 503);
+            next(guardHttpError(503));
+            return;
+          }
+        }
+        const cloudUserId = verifiedCloudPrincipalUserId(req);
+        const cloudState = cloudUserId ? await firebaseGuard.readUserState(cloudUserId) : null;
+        if (cloudState?.kind === "unavailable") { emitFirebaseOperatorGuardDenial("dependency_unavailable", 503); next(guardHttpError(503)); return; }
+        let guardedActor: Express.Request["actor"] | null = null;
+        if (session?.user?.id && session.session?.id) {
+          guardedActor = await guardedSessionActor(db, firebaseGuard, session, runIdHeader ?? undefined);
+        }
+        if (cloudState?.kind === "operator_state") {
+          if (!session?.user?.id || session.user.id !== cloudUserId || !guardedActor) {
+            emitFirebaseOperatorGuardDenial("binding_invalid", 401);
+            next(unauthorized()); return;
+          }
+          req.actor = guardedActor;
           next();
           return;
         }
-
-        let session: BetterAuthSessionResult | null = null;
-        try {
-          session = await opts.resolveSession(req);
-        } catch (err) {
-          logger.warn(
-            { err, method: req.method, url: req.originalUrl },
-            "Failed to resolve auth session from request headers",
-          );
+        if (guardedActor) {
+          req.actor = guardedActor;
+          next();
+          return;
+        }
+        let cloudTenantActor: Express.Request["actor"] | null;
+        try { cloudTenantActor = await resolveCloudTenantActor(db, req); }
+        catch {
+          emitFirebaseOperatorGuardDenial("dependency_unavailable", 503);
+          next(guardHttpError(503));
+          return;
+        }
+        if (cloudTenantActor) {
+          req.actor = { ...cloudTenantActor, runId: runIdHeader ?? undefined };
+          next();
+          return;
+        }
+        if (cloudUserId) {
+          const postSyncState = await firebaseGuard.readUserState(cloudUserId);
+          if (postSyncState.kind === "unavailable") { emitFirebaseOperatorGuardDenial("dependency_unavailable", 503); next(guardHttpError(503)); return; }
+          if (postSyncState.kind === "operator_state") { emitFirebaseOperatorGuardDenial("binding_invalid", 401); next(unauthorized()); return; }
         }
         if (session?.user?.id && session.session?.id) {
           const userId = session.user.id;
+          const state = await firebaseGuard.readUserState(userId);
+          if (state.kind === "unavailable") { emitFirebaseOperatorGuardDenial("dependency_unavailable", 503); next(guardHttpError(503)); return; }
+          if (state.kind === "operator_state") { emitFirebaseOperatorGuardDenial("binding_invalid", 401); next(unauthorized()); return; }
           const [roleRow, memberships] = await Promise.all([
-            db
-              .select({ id: instanceUserRoles.id })
-              .from(instanceUserRoles)
-              .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-              .then((rows) => rows[0] ?? null),
+            db.select({ id: instanceUserRoles.id }).from(instanceUserRoles)
+              .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin"))).then((rows) => rows[0] ?? null),
             loadActiveUserCompanyMemberships(db, userId),
           ]);
-          req.actor = {
-            type: "board",
-            userId,
-            sessionId: session.session.id,
-            userName: session.user.name ?? null,
-            userEmail: session.user.email ?? null,
-            companyIds: memberships.map((row) => row.companyId),
-            memberships,
-            isInstanceAdmin: Boolean(roleRow),
-            runId: runIdHeader ?? undefined,
-            source: "session",
-          };
+          req.actor = { type: "board", userId, sessionId: session.session.id, userName: session.user.name ?? null,
+            userEmail: session.user.email ?? null, companyIds: memberships.map((row) => row.companyId), memberships,
+            isInstanceAdmin: Boolean(roleRow), runId: runIdHeader ?? undefined, source: "session" };
           next();
           return;
         }
@@ -324,6 +409,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     const boardKey = await boardAuth.findBoardApiKeyByToken(token);
     if (boardKey) {
+      const state = await firebaseGuard.readUserState(boardKey.userId);
+      if (state.kind === "unavailable") { emitFirebaseOperatorGuardDenial("dependency_unavailable", 503); next(guardHttpError(503)); return; }
+      if (state.kind === "operator_state") { emitFirebaseOperatorGuardDenial("binding_invalid", 401); next(unauthorized()); return; }
       const access = await boardAuth.resolveBoardAccess(boardKey.userId);
       if (access.user) {
         await boardAuth.touchBoardApiKey(boardKey.id);
@@ -594,124 +682,49 @@ async function resolveCloudTenantActorOnce(
   const previousSync = cloudTenantWriteDebounce.get(userId);
   const shouldSync = previousSync?.fingerprint !== syncFingerprint
     || previousSync.syncedAt <= now.getTime() - CLOUD_TENANT_WRITE_DEBOUNCE_MS;
-  let effectiveMembership: { companyId: string; membershipRole: string | null; status: string } = {
-    companyId,
-    membershipRole,
-    status: "active",
-  };
+  const synchronized = await db.transaction(async (tx) => {
+    const syncDb = tx as unknown as Db;
+    let user = await tx.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, userId)).for("update").limit(1).then((rows) => rows[0]);
+    if (!user) {
+      await tx.insert(authUsers).values({ id: userId, name: userName, email: userEmail, emailVerified: true, image: null, createdAt: now, updatedAt: now }).onConflictDoNothing({ target: authUsers.id });
+      user = await tx.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, userId)).for("update").limit(1).then((rows) => rows[0]);
+    }
+    if (!user) throw new Error("Cloud tenant identity could not be locked");
+    // READ COMMITTED gives this statement a fresh snapshot after any wait on
+    // the same user row lock used by Firebase binding provisioning.
+    const [bindings, assurances] = await Promise.all([
+      tx.select({ id: firebaseOperatorBindings.id }).from(firebaseOperatorBindings).where(eq(firebaseOperatorBindings.userId, userId)).limit(1),
+      tx.select({ id: firebaseOperatorSessionAssurance.id }).from(firebaseOperatorSessionAssurance).where(eq(firebaseOperatorSessionAssurance.userId, userId)).limit(1),
+    ]);
+    if (bindings.length || assurances.length) return { blocked: true as const };
 
-  if (shouldSync) await db
-    .insert(authUsers)
-    .values({
-      id: userId,
-      name: userName,
-      email: userEmail,
-      emailVerified: true,
-      image: null,
-      createdAt: now,
-      updatedAt: now,
-    })
-    .onConflictDoUpdate({
-      target: authUsers.id,
-      set: {
-        name: userName,
-        email: userEmail,
-        emailVerified: true,
-        updatedAt: now,
-      },
+    if (shouldSync) await tx.update(authUsers).set({ name: userName, email: userEmail, emailVerified: true, updatedAt: now }).where(eq(authUsers.id, userId));
+    await tx.delete(instanceUserRoles).where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")));
+    if (shouldSync) await insertCloudTenantCompany(syncDb, { companyId, companyName, now });
+    if (shouldSync && paperclipCompanyName) await repairCloudTenantCompanyName(syncDb, { companyId, paperclipCompanyId, paperclipCompanyName, now });
+    if (shouldSync) await repairCloudTenantCompanyProvisionDefaults(syncDb, { companyId, stackId, now });
+    const effectiveMembership = shouldSync ? await tx.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: userId, status: "active", membershipRole, updatedAt: now,
+    }).onConflictDoUpdate({
+      target: [companyMemberships.companyId, companyMemberships.principalType, companyMemberships.principalId],
+      set: { status: "active", membershipRole, updatedAt: now },
+    }).returning().then((rows) => rows[0] ?? { companyId, membershipRole, status: "active" })
+      : { companyId, membershipRole, status: "active" };
+    if (shouldSync) await ensureHumanRoleDefaultGrants(syncDb, {
+      companyId, principalId: userId, membershipRole: effectiveMembership.membershipRole ?? membershipRole, grantedByUserId: null,
     });
-
-  // Earlier cloud_tenant builds granted every tenant user `instance_admin`.
-  // Stale rows from those deployments would still elevate this user through
-  // the BetterAuth session path, board API keys, and the authorization
-  // service's own instanceUserRoles lookup — so actively purge them on every
-  // trusted-header authentication instead of merely no longer inserting them.
-  await db
-    .delete(instanceUserRoles)
-    .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")));
-
-  if (shouldSync) await insertCloudTenantCompany(db, { companyId, companyName, now });
-
-  if (shouldSync && paperclipCompanyName) {
-    await repairCloudTenantCompanyName(db, {
-      companyId,
-      paperclipCompanyId,
-      paperclipCompanyName,
-      now,
-    });
-  }
-
-  // Runs after the name repair so the prefix derives from the repaired name.
-  // The helper self-gates on the legacy markers, so it is a no-op once the
-  // company has been repaired or was claimed by a current build.
+    const additionalMemberships = (await tx.select({ companyId: companyMemberships.companyId, membershipRole: companyMemberships.membershipRole, status: companyMemberships.status })
+      .from(companyMemberships).where(and(eq(companyMemberships.principalType, "user"), eq(companyMemberships.principalId, userId), eq(companyMemberships.status, "active"))))
+      .filter((row) => row.companyId !== companyId);
+    return { blocked: false as const, effectiveMembership, additionalMemberships };
+  }, { isolationLevel: "read committed" });
+  if (synchronized.blocked) return null;
+  const { effectiveMembership, additionalMemberships } = synchronized;
   if (shouldSync) {
-    await repairCloudTenantCompanyProvisionDefaults(db, { companyId, stackId, now });
-  }
-
-  effectiveMembership = shouldSync ? await db
-    .insert(companyMemberships)
-    .values({
-      companyId,
-      principalType: "user",
-      principalId: userId,
-      status: "active",
-      membershipRole,
-      updatedAt: now,
-    })
-    .onConflictDoUpdate({
-      target: [
-        companyMemberships.companyId,
-        companyMemberships.principalType,
-        companyMemberships.principalId,
-      ],
-      set: {
-        status: "active",
-        membershipRole,
-        updatedAt: now,
-      },
-    })
-    .returning()
-    .then((rows) => rows[0] ?? {
-      companyId,
-      membershipRole,
-      status: "active",
-    }) : { companyId, membershipRole, status: "active" as const };
-
-  // Without instance-admin elevation, cloud tenant users are authorized purely
-  // through company-scoped permission grants — seed the same role defaults the
-  // regular membership flows create.
-  if (shouldSync) await ensureHumanRoleDefaultGrants(db, {
-    companyId,
-    principalId: userId,
-    membershipRole: effectiveMembership.membershipRole ?? membershipRole,
-    grantedByUserId: null,
-  });
-  if (shouldSync) {
+    const committedAt = Date.now();
     cloudTenantWriteDebounce.delete(userId);
-    cloudTenantWriteDebounce.set(userId, { fingerprint: syncFingerprint, syncedAt: Date.now() });
-    pruneCloudTenantWriteDebounce(cloudTenantWriteDebounce, Date.now());
-  }
-
-  // The stack's seeded company is only where Cloud provisioned this user.
-  // Companies created afterwards on the instance (imports, in-app company
-  // creation) attach real membership rows for the user, so union those with
-  // the pinned primary — the same active-membership scope a locally
-  // authenticated session actor carries. Strictly this user's own rows; the
-  // membership-creating flows seed their own permission grants, so nothing
-  // needs seeding per request here. A read failure degrades to the pinned
-  // primary instead of blocking authentication, mirroring the fail-closed
-  // owner-elevation resolution below.
-  let additionalMemberships: { companyId: string; membershipRole: string | null; status: string }[] =
-    [];
-  try {
-    additionalMemberships = (await loadActiveUserCompanyMemberships(db, userId)).filter(
-      (row) => row.companyId !== companyId,
-    );
-  } catch (err) {
-    logger.warn(
-      { err, userId, stackId },
-      "Failed to load cloud tenant user's company memberships; scoping actor to the stack's primary company",
-    );
+    cloudTenantWriteDebounce.set(userId, { fingerprint: syncFingerprint, syncedAt: committedAt });
+    pruneCloudTenantWriteDebounce(cloudTenantWriteDebounce, committedAt);
   }
 
   return {
@@ -847,9 +860,10 @@ async function repairCloudTenantCompanyName(
     });
   } catch (err) {
     logger.warn(
-      { err, companyId: input.companyId },
+      { event: "cloud_tenant_sync", outcome: "dependency_unavailable" },
       "Failed to repair legacy Cloud tenant company name",
     );
+    throw err;
   }
 }
 
@@ -870,8 +884,7 @@ async function insertCloudTenantCompany(
   const base = deriveIssuePrefixBase(input.companyName);
   for (let attempt = 1; attempt <= MAX_ISSUE_PREFIX_ATTEMPTS; attempt += 1) {
     try {
-      await db
-        .insert(companies)
+      await db.transaction(async (attemptTx) => attemptTx.insert(companies)
         .values({
           id: input.companyId,
           name: input.companyName,
@@ -880,9 +893,7 @@ async function insertCloudTenantCompany(
           issuePrefix: `${base}${issuePrefixSuffixForAttempt(attempt)}`,
           updatedAt: input.now,
         })
-        .onConflictDoNothing({
-          target: companies.id,
-        });
+        .onConflictDoNothing({ target: companies.id }));
       return;
     } catch (error) {
       if (!isIssuePrefixConflict(error)) throw error;
@@ -994,9 +1005,10 @@ async function repairCloudTenantCompanyProvisionDefaults(
     });
   } catch (err) {
     logger.warn(
-      { err, companyId: input.companyId },
+      { event: "cloud_tenant_sync", outcome: "dependency_unavailable" },
       "Failed to repair legacy tenant company provisioning defaults",
     );
+    throw err;
   }
 }
 

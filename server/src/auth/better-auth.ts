@@ -1,6 +1,7 @@
 import type { Request, RequestHandler } from "express";
+import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
-import { betterAuth, type Auth } from "better-auth";
+import { APIError, betterAuth, type Auth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
 import type { Db } from "@paperclipai/db";
@@ -12,6 +13,9 @@ import {
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
+import { createFirebaseOperatorSessionGuard, emitFirebaseOperatorGuardDenial } from "./firebase-operator-session-guard.js";
+import { consumeFirebaseOperatorSessionIssuance } from "./firebase-operator-session-issuance.js";
+import { createProductionFirebaseOperatorVerifier } from "./firebase-operator-verifier.js";
 import {
   workspaceLoginHandoffPlugin,
   type WorkspaceHandoffExpectedIdentity,
@@ -281,6 +285,32 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       override: process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED,
     }),
     advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies }),
+    databaseHooks: {
+      session: {
+        create: {
+          before: async (data: { userId: string; token?: string }) => {
+            const state = await guard.readUserState(data.userId);
+            if (state.kind === "unavailable") {
+              emitFirebaseOperatorGuardDenial("dependency_unavailable", 503, "better_auth");
+              throw new APIError("SERVICE_UNAVAILABLE");
+            }
+            if (state.kind === "ordinary") return;
+            const capability = typeof data.token === "string"
+              ? consumeFirebaseOperatorSessionIssuance({
+                  userId: data.userId,
+                  actualSessionTokenHash: createHash("sha256").update(data.token).digest("hex"),
+                })
+              : null;
+            if (!capability || !state.enabledBinding
+              || capability.bindingId !== state.enabledBinding.id
+              || capability.bindingRevision !== state.enabledBinding.revision) {
+              emitFirebaseOperatorGuardDenial("binding_invalid", 401, "better_auth");
+              throw new APIError("UNAUTHORIZED");
+            }
+          },
+        },
+      },
+    },
     // Registered only for a managed workspace instance: the plugin is what makes
     // `Open workspace` password-independent, and a control-plane instance that
     // was never handed a workspace key must not expose the exchange at all.
@@ -304,6 +334,17 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
         }
       : {}),
   };
+
+  let productionVerifier: ReturnType<typeof createProductionFirebaseOperatorVerifier> | undefined;
+  const guard = createFirebaseOperatorSessionGuard({
+    db,
+    verifier: {
+      checkUser: (proof) => {
+        productionVerifier ??= createProductionFirebaseOperatorVerifier();
+        return productionVerifier.checkUser(proof);
+      },
+    },
+  });
 
   if (!baseUrl) {
     delete (authConfig as { baseURL?: string }).baseURL;
