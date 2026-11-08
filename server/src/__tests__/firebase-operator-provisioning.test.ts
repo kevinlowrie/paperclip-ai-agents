@@ -266,15 +266,16 @@ describe("Firebase operator provisioning", () => {
 
   it("rolls back only rows owned by its applied packet and disables the expected binding revision", async () => {
     const f = await fixture();
+    const unrelatedSessionId = `unassured-unrelated-${randomUUID()}`;
     await addSession(f.targetSessionId, f.targetId);
     const p = makeProvisioner(f);
     const packet = await p.dryRun(actor(f), intent(f));
     const applied = await p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash });
-    await addSession("unassured-unrelated-session", f.targetId);
+    await addSession(unrelatedSessionId, f.targetId);
     const rolledBack = await p.rollback(actor(f), { packetId: packet.packetId, expectedBindingRevision: applied.bindingRevision });
     expect(rolledBack).toMatchObject({ status: "rolled_back", bindingDisabled: true, removedMembershipIds: applied.createdMembershipIds, removedGrantIds: applied.createdGrantIds });
     expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, f.targetId))).toHaveLength(0);
-    expect(await db.select().from(authSessions).where(eq(authSessions.id, "unassured-unrelated-session"))).toHaveLength(1);
+    expect(await db.select().from(authSessions).where(eq(authSessions.id, unrelatedSessionId))).toHaveLength(1);
   });
 
   it("rejects stale rollback revision and preserves concurrent target grants as a partial result", async () => {
@@ -310,9 +311,10 @@ describe("Firebase operator provisioning", () => {
     const firstPacket = await p.dryRun(actor(f), intent(f));
     const first = await p.apply(actor(f), { packetId: firstPacket.packetId, packetHash: firstPacket.packetHash });
     const secondTarget = `firebase-new-target-${randomUUID()}`;
+    const secondSession = `second-target-prebinding-${randomUUID()}`;
     const timestamp = new Date(NOW);
     await db.insert(authUsers).values({ id: secondTarget, name: "Replacement", email: `${secondTarget}@example.test`, emailVerified: true, createdAt: timestamp, updatedAt: timestamp });
-    await addSession("second-target-prebinding", secondTarget);
+    await addSession(secondSession, secondTarget);
     const nextIntent = intent(f, { targetUserId: secondTarget, binding: { mode: "reassign", expectedRevision: first.bindingRevision, expectedUserId: f.targetId } });
     const packet = await p.dryRun(actor(f), nextIntent);
     const result = await p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash });
