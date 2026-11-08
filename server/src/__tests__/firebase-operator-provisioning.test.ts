@@ -7,6 +7,9 @@ import {
   companies,
   companyMemberships,
   createDb,
+  firebaseOperatorBindings,
+  firebaseOperatorProvisionEvents,
+  firebaseOperatorProvisionPackets,
   instanceUserRoles,
   principalPermissionGrants,
 } from "@paperclipai/db";
@@ -24,6 +27,27 @@ if (!postgresSupport.supported) {
 const NOW = Date.UTC(2026, 10, 8, 12, 0, 0);
 const PROJECT = "thl-pclipd-api" as const;
 let testCounter = 0;
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((accept) => { resolve = accept; });
+  return { promise, resolve };
+}
+
+async function waitForLockWait(controlDb: ReturnType<typeof createDb>, waitingPid: number, blockerPid: number) {
+  const deadline = Date.now() + 10_000;
+  let last: unknown;
+  while (Date.now() < deadline) {
+    const rows = await controlDb.execute(sql`
+      select pid, state, wait_event_type, wait_event, query, pg_blocking_pids(pid) as blocking_pids
+      from pg_stat_activity where pid = ${waitingPid}
+    `) as unknown as Array<{ pid: number; state: string; wait_event_type: string | null; wait_event: string | null; query: string; blocking_pids: number[] }>;
+    last = rows[0];
+    if (rows[0]?.state === "active" && rows[0].wait_event_type === "Lock" && rows[0].blocking_pids.map(Number).includes(blockerPid)) return rows[0];
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`PostgreSQL lock wait not observed for backend ${waitingPid}; last activity: ${JSON.stringify(last)}`);
+}
 
 async function expectPostgresSqlState(operation: Promise<unknown>, expected: string) {
   let error: unknown;
@@ -107,8 +131,8 @@ describe("Firebase operator provisioning", () => {
   function makeProvisioner(f: Awaited<ReturnType<typeof fixture>>, options: {
     lookup?: (uid: string) => Promise<unknown>;
     allowedCompanyIds?: Set<string>;
-  } = {}) {
-    return createFirebaseOperatorProvisioner(db, {
+  } = {}, provisionerDb: ReturnType<typeof createDb> = db) {
+    return createFirebaseOperatorProvisioner(provisionerDb, {
       identityDirectory: {
         lookup: options.lookup ?? (async (uid: string) => ({ projectId: PROJECT, uid, checkedAtMs: f.now })),
       },
@@ -269,6 +293,231 @@ describe("Firebase operator provisioning", () => {
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, permissionKey: "custom:concurrent", scope: null, grantedByUserId: f.actorId });
     await expect(p.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash })).rejects.toMatchObject({ status: 409 });
     expect(await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.targetId), eq(principalPermissionGrants.permissionKey, "custom:concurrent")))).toHaveLength(1);
+  });
+
+  it("orders a generic grant insert that holds the company FK key-share lock before apply", async () => {
+    const f = await fixture();
+    const p = makeProvisioner(f);
+    const packet = await p.dryRun(actor(f), intent(f));
+    const writerDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-grant-writer-${randomUUID()}` });
+    const applyDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-provision-apply-${randomUUID()}` });
+    const writerPidReady = deferred<number>();
+    const allowWriterInsert = deferred<void>();
+    const permissionKey = `custom:generic-${randomUUID()}`;
+    let applyPromise: Promise<unknown> | undefined;
+    const writerPromise = writerDb.$client.begin(async (tx) => {
+      await tx`select id from companies where id = ${f.companyId}::uuid for key share`;
+      const [pidRow] = await tx`select pg_backend_pid()::int as pid`;
+      writerPidReady.resolve(Number(pidRow.pid));
+      await allowWriterInsert.promise;
+      await tx`insert into principal_permission_grants (company_id, principal_type, principal_id, permission_key, scope, granted_by_user_id)
+        values (${f.companyId}::uuid, 'user', ${f.targetId}, ${permissionKey}, null, ${f.actorId})`;
+    });
+
+    try {
+      const writerPid = await writerPidReady.promise;
+      const [applyBackend] = await applyDb.execute(sql`select pg_backend_pid()::int as pid`) as unknown as Array<{ pid: number }>;
+      const applyProvisioner = makeProvisioner(f, {}, applyDb);
+      applyPromise = applyProvisioner.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash });
+      const wait = await waitForLockWait(db, Number(applyBackend.pid), writerPid);
+      expect(wait.query.toLowerCase()).toContain("companies");
+      expect(wait.query.toLowerCase()).toContain("for update");
+
+      allowWriterInsert.resolve(undefined);
+      await writerPromise;
+      const [outcome] = await Promise.allSettled([applyPromise]);
+      const [foreignGrant] = await db.select().from(principalPermissionGrants)
+        .where(and(eq(principalPermissionGrants.principalId, f.targetId), eq(principalPermissionGrants.permissionKey, permissionKey)));
+      expect(foreignGrant).toBeDefined();
+      if (outcome.status === "fulfilled") {
+        const applied = outcome.value as { bindingRevision: number };
+        await expect(p.rollback(actor(f), { packetId: packet.packetId, expectedBindingRevision: applied.bindingRevision }))
+          .resolves.toMatchObject({ status: "partial", bindingDisabled: true });
+      } else {
+        expect(outcome.reason).toMatchObject({ status: 409 });
+        expect(await db.select().from(firebaseOperatorBindings).where(eq(firebaseOperatorBindings.firebaseUid, f.firebaseUid))).toHaveLength(0);
+        expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, f.targetId))).toHaveLength(0);
+        const [storedPacket] = await db.select().from(firebaseOperatorProvisionPackets).where(eq(firebaseOperatorProvisionPackets.id, packet.packetId));
+        expect(storedPacket.status).toBe("pending");
+        const events = await db.select().from(firebaseOperatorProvisionEvents).where(eq(firebaseOperatorProvisionEvents.packetId, packet.packetId));
+        expect(events.map((row) => row.action)).toEqual(["dry_run"]);
+      }
+      expect(await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.targetId), eq(principalPermissionGrants.permissionKey, permissionKey)))).toHaveLength(1);
+    } finally {
+      allowWriterInsert.resolve(undefined);
+      await writerPromise;
+      if (applyPromise) await Promise.allSettled([applyPromise]);
+      await applyDb.$client.end();
+      await writerDb.$client.end();
+    }
+  });
+
+  it("orders a generic grant insert after apply holds the company FK lock and forces rollback partial", async () => {
+    const f = await fixture();
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, status: "active", membershipRole: "operator" });
+    const [defaultGrant] = await db.insert(principalPermissionGrants).values({
+      companyId: f.companyId, principalType: "user", principalId: f.targetId,
+      permissionKey: "tasks:assign", scope: null, grantedByUserId: f.actorId,
+    }).returning({ id: principalPermissionGrants.id });
+    const p = makeProvisioner(f);
+    const packet = await p.dryRun(actor(f), intent(f));
+    const blockerDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-grant-row-holder-${randomUUID()}` });
+    const writerDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-grant-writer-${randomUUID()}` });
+    const applyDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-provision-apply-${randomUUID()}` });
+    const holderPidReady = deferred<number>();
+    const releaseGrantRow = deferred<void>();
+    const writerPidReady = deferred<number>();
+    const permissionKey = `custom:after-apply-${randomUUID()}`;
+    let applyPromise: Promise<unknown> | undefined;
+    const holderPromise = blockerDb.$client.begin(async (tx) => {
+      await tx`select id from principal_permission_grants where id = ${defaultGrant.id}::uuid for update`;
+      const [pidRow] = await tx`select pg_backend_pid()::int as pid`;
+      holderPidReady.resolve(Number(pidRow.pid));
+      await releaseGrantRow.promise;
+    });
+    let writerPromise: Promise<unknown> | undefined;
+
+    try {
+      const holderPid = await holderPidReady.promise;
+      const [applyBackend] = await applyDb.execute(sql`select pg_backend_pid()::int as pid`) as unknown as Array<{ pid: number }>;
+      const applyPid = Number(applyBackend.pid);
+      const applyProvisioner = makeProvisioner(f, {}, applyDb);
+      applyPromise = applyProvisioner.apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash });
+      const applyWait = await waitForLockWait(db, applyPid, holderPid);
+      expect(applyWait.query.toLowerCase()).toContain("principal_permission_grants");
+
+      writerPromise = writerDb.$client.begin(async (tx) => {
+        const [pidRow] = await tx`select pg_backend_pid()::int as pid`;
+        writerPidReady.resolve(Number(pidRow.pid));
+        await tx`insert into principal_permission_grants (company_id, principal_type, principal_id, permission_key, scope, granted_by_user_id)
+          values (${f.companyId}::uuid, 'user', ${f.targetId}, ${permissionKey}, null, ${f.actorId})`;
+      });
+      const writerPid = await writerPidReady.promise;
+      const writerWait = await waitForLockWait(db, writerPid, applyPid);
+      expect(writerWait.query.toLowerCase()).toContain("insert into principal_permission_grants");
+
+      releaseGrantRow.resolve(undefined);
+      const outcome = await applyPromise;
+      await writerPromise;
+      expect(outcome).toMatchObject({ status: "applied" });
+      expect(await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.targetId), eq(principalPermissionGrants.permissionKey, permissionKey)))).toHaveLength(1);
+      await expect(p.rollback(actor(f), { packetId: packet.packetId, expectedBindingRevision: (outcome as { bindingRevision: number }).bindingRevision }))
+        .resolves.toMatchObject({ status: "partial", bindingDisabled: true });
+      expect(await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.targetId), eq(principalPermissionGrants.permissionKey, permissionKey)))).toHaveLength(1);
+    } finally {
+      releaseGrantRow.resolve(undefined);
+      await holderPromise;
+      if (writerPromise) await writerPromise;
+      if (applyPromise) await Promise.allSettled([applyPromise]);
+      await applyDb.$client.end();
+      await writerDb.$client.end();
+      await blockerDb.$client.end();
+    }
+  });
+
+  it("rejects a dry run whose Firebase lookup ages while the reviewed grant rows are locked", async () => {
+    const f = await fixture();
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, status: "active", membershipRole: "operator" });
+    const [targetGrant] = await db.insert(principalPermissionGrants).values({
+      companyId: f.companyId, principalType: "user", principalId: f.targetId,
+      permissionKey: "tasks:assign", scope: null, grantedByUserId: f.actorId,
+    }).returning({ id: principalPermissionGrants.id });
+    await addSession(f.targetSessionId, f.targetId);
+    const beforeMemberships = await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, f.targetId));
+    const beforeGrants = await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.targetId));
+    const blockerDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-dryrun-grant-holder-${randomUUID()}` });
+    const operationDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-dryrun-${randomUUID()}` });
+    const holderPidReady = deferred<number>();
+    const releaseGrantRow = deferred<void>();
+    let operationPromise: Promise<unknown> | undefined;
+    const holderPromise = blockerDb.$client.begin(async (tx) => {
+      await tx`select id from principal_permission_grants where id = ${targetGrant.id}::uuid for update`;
+      const [pidRow] = await tx`select pg_backend_pid()::int as pid`;
+      holderPidReady.resolve(Number(pidRow.pid));
+      await releaseGrantRow.promise;
+    });
+
+    try {
+      const holderPid = await holderPidReady.promise;
+      const [operationBackend] = await operationDb.execute(sql`select pg_backend_pid()::int as pid`) as unknown as Array<{ pid: number }>;
+      operationPromise = makeProvisioner(f, {}, operationDb).dryRun(actor(f), intent(f));
+      const wait = await waitForLockWait(db, Number(operationBackend.pid), holderPid);
+      expect(wait.query.toLowerCase()).toContain("principal_permission_grants");
+
+      f.now = NOW + 61_001;
+      releaseGrantRow.resolve(undefined);
+      await holderPromise;
+      await expect(operationPromise).rejects.toMatchObject({ status: 401 });
+      const [{ count: packetCount }] = await db.execute(sql`select count(*)::int as count from firebase_operator_provision_packets where intent ->> 'firebaseUid' = ${f.firebaseUid}`) as unknown as Array<{ count: number }>;
+      const [{ count: eventCount }] = await db.execute(sql`select count(*)::int as count from firebase_operator_provision_events e join firebase_operator_provision_packets p on p.id = e.packet_id where p.intent ->> 'firebaseUid' = ${f.firebaseUid}`) as unknown as Array<{ count: number }>;
+      expect(packetCount).toBe(0);
+      expect(eventCount).toBe(0);
+      expect(await db.select().from(firebaseOperatorBindings).where(eq(firebaseOperatorBindings.firebaseUid, f.firebaseUid))).toHaveLength(0);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, f.targetId))).toEqual(beforeMemberships);
+      expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.targetId))).toEqual(beforeGrants);
+      expect(await db.select().from(authSessions).where(eq(authSessions.id, f.targetSessionId))).toHaveLength(1);
+    } finally {
+      releaseGrantRow.resolve(undefined);
+      await holderPromise;
+      if (operationPromise) await Promise.allSettled([operationPromise]);
+      await operationDb.$client.end();
+      await blockerDb.$client.end();
+    }
+  });
+
+  it.each([
+    { name: "Firebase proof age", offsetMs: 61_001, expectedStatus: 401 },
+    { name: "review packet expiry", offsetMs: 300_001, expectedStatus: 409 },
+  ])("rolls back every apply write if $name expires while grant-state locks are held", async ({ offsetMs, expectedStatus }) => {
+    const f = await fixture();
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: f.targetId, status: "active", membershipRole: "operator" });
+    const [targetGrant] = await db.insert(principalPermissionGrants).values({
+      companyId: f.companyId, principalType: "user", principalId: f.targetId,
+      permissionKey: "tasks:assign", scope: null, grantedByUserId: f.actorId,
+    }).returning({ id: principalPermissionGrants.id });
+    await addSession(f.targetSessionId, f.targetId);
+    const p = makeProvisioner(f);
+    const packet = await p.dryRun(actor(f), intent(f));
+    const beforeMemberships = await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, f.targetId));
+    const beforeGrants = await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.targetId));
+    const blockerDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-apply-grant-holder-${randomUUID()}` });
+    const operationDb = createDb(database.connectionString, { maxConnections: 1, applicationName: `pclip-apply-expiry-${randomUUID()}` });
+    const holderPidReady = deferred<number>();
+    const releaseGrantRow = deferred<void>();
+    let operationPromise: Promise<unknown> | undefined;
+    const holderPromise = blockerDb.$client.begin(async (tx) => {
+      await tx`select id from principal_permission_grants where id = ${targetGrant.id}::uuid for update`;
+      const [pidRow] = await tx`select pg_backend_pid()::int as pid`;
+      holderPidReady.resolve(Number(pidRow.pid));
+      await releaseGrantRow.promise;
+    });
+
+    try {
+      const holderPid = await holderPidReady.promise;
+      const [operationBackend] = await operationDb.execute(sql`select pg_backend_pid()::int as pid`) as unknown as Array<{ pid: number }>;
+      operationPromise = makeProvisioner(f, {}, operationDb).apply(actor(f), { packetId: packet.packetId, packetHash: packet.packetHash });
+      const wait = await waitForLockWait(db, Number(operationBackend.pid), holderPid);
+      expect(wait.query.toLowerCase()).toContain("principal_permission_grants");
+
+      f.now = NOW + offsetMs;
+      releaseGrantRow.resolve(undefined);
+      await holderPromise;
+      await expect(operationPromise).rejects.toMatchObject({ status: expectedStatus });
+      const [storedPacket] = await db.select().from(firebaseOperatorProvisionPackets).where(eq(firebaseOperatorProvisionPackets.id, packet.packetId));
+      expect(storedPacket).toMatchObject({ status: "pending", appliedBindingId: null, appliedBindingRevision: null });
+      const eventRows = await db.select().from(firebaseOperatorProvisionEvents).where(eq(firebaseOperatorProvisionEvents.packetId, packet.packetId));
+      expect(eventRows.map((row) => row.action)).toEqual(["dry_run"]);
+      expect(await db.select().from(firebaseOperatorBindings).where(eq(firebaseOperatorBindings.firebaseUid, f.firebaseUid))).toHaveLength(0);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, f.targetId))).toEqual(beforeMemberships);
+      expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.targetId))).toEqual(beforeGrants);
+      expect(await db.select().from(authSessions).where(eq(authSessions.id, f.targetSessionId))).toHaveLength(1);
+    } finally {
+      releaseGrantRow.resolve(undefined);
+      await holderPromise;
+      if (operationPromise) await Promise.allSettled([operationPromise]);
+      await operationDb.$client.end();
+      await blockerDb.$client.end();
+    }
   });
 
   it("rechecks actor and company permission after dry run and leaves sessions untouched on denial", async () => {

@@ -190,6 +190,9 @@ export function createFirebaseOperatorProvisioner(db: Db, options: Options) {
         const packetHash = reviewHash(actor.userId, intent, expectedBindingState, state.hash, expiresAt);
         await tx.insert(firebaseOperatorProvisionPackets).values({ id: packetId, actorUserId: actor.userId, intentHash: packetHash, intent, expectedBindingState, expectedGrantStateHash: state.hash, expiresAt, status: "pending" });
         await tx.insert(firebaseOperatorProvisionEvents).values({ packetId, actorUserId: actor.userId, action: "dry_run", outcome: "review_ready", details: { packetHash, bindingRevision: binding?.revision ?? null, addMembershipCount: plan.membershipIds.length, addGrantCount: plan.grantValues.length, identityCheckedAtMs: proof.checkedAtMs } });
+        const commitCheckAtMs = now();
+        if (commitCheckAtMs - proof.checkedAtMs > MAX_IDENTITY_AGE_MS) fail(401, "Firebase identity lookup expired before review packet commit");
+        if (expiresAt.getTime() <= commitCheckAtMs) fail(409, "Review packet expired before commit");
         return { packetId, packetHash, expiresAt, bindingBefore: binding ? { userId: binding.userId, revision: binding.revision, enabled: binding.enabled } : null, plan: { companies: intent.companies, addMembershipCompanyIds: plan.membershipIds, addGrants: plan.grantValues.map(({ companyId, permissionKey }) => ({ companyId, permissionKey })) } };
       });
     },
@@ -243,6 +246,9 @@ export function createFirebaseOperatorProvisioner(db: Db, options: Options) {
         const postState = await grantState(tx, intent);
         await tx.update(firebaseOperatorProvisionPackets).set({ status: "applied", appliedBindingId: bindingId, appliedBindingRevision: revision, createdMembershipIds, createdGrantIds, postGrantStateHash: postState.hash, updatedAt: new Date(now()) }).where(eq(firebaseOperatorProvisionPackets.id, packet.id));
         await tx.insert(firebaseOperatorProvisionEvents).values({ packetId: packet.id, actorUserId: actor.userId, action: "apply", outcome: "applied", details: { bindingId, bindingRevision: revision, createdMembershipIds, createdGrantIds, revokedSessionCount: revoked.length, identityCheckedAtMs: proof.checkedAtMs } });
+        const commitCheckAtMs = now();
+        if (packet.expiresAt.getTime() <= commitCheckAtMs) fail(409, "Review packet expired before apply commit");
+        if (commitCheckAtMs - proof.checkedAtMs > MAX_IDENTITY_AGE_MS) fail(401, "Firebase identity lookup expired before apply commit");
         return { packetId: packet.id, bindingId, bindingRevision: revision, status: "applied" as const, createdMembershipIds, createdGrantIds, revokedSessionCount: revoked.length };
       });
     },
