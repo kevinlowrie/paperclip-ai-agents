@@ -2,7 +2,7 @@ import express from "express";
 import { and, eq, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import request from "supertest";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   authSessions,
   authUsers,
@@ -17,7 +17,9 @@ import {
 } from "@paperclipai/db";
 import { actorMiddleware, resolveCloudTenantActor } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { logger } from "../middleware/logger.js";
 import { hashBearerToken } from "../services/board-auth.js";
+import { FirebaseOperatorVerificationError } from "../auth/firebase-operator-verifier.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -51,6 +53,10 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     await database?.cleanup();
     if (previousCloudToken === undefined) delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
     else process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = previousCloudToken;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   async function boundUser() {
@@ -461,6 +467,91 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     const decision = await guard.check({ sessionId: fixture.session.id, userId: fixture.userId });
     expect(fixture.authTimeSeconds * 1000).toBeLessThan(Date.now() - 300_000);
     expect(decision).toMatchObject({ kind: "allowed", bindingId: fixture.bindingId });
+  });
+
+  it("denies the selected company when another active membership remains", async () => {
+    const fixture = await assuredUser();
+    const [otherCompany] = await db.insert(companies).values({
+      name: `Guard second company ${randomUUID()}`,
+      issuePrefix: `H${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+    }).returning({ id: companies.id });
+    await db.insert(companyMemberships).values({
+      companyId: otherCompany!.id,
+      principalType: "user",
+      principalId: fixture.userId,
+      status: "active",
+      membershipRole: "member",
+    });
+    const guard = await createGuard() as {
+      check: (input: { sessionId: string; userId: string; companyId?: string }) => Promise<Record<string, unknown>>;
+    };
+
+    await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId, companyId: otherCompany!.id }))
+      .resolves.toMatchObject({ kind: "allowed" });
+    await db.update(companyMemberships).set({ status: "inactive" })
+      .where(and(eq(companyMemberships.principalId, fixture.userId), eq(companyMemberships.companyId, fixture.companyId)));
+    await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId, companyId: fixture.companyId }))
+      .resolves.toMatchObject({ kind: "denied", status: 403, reason: "company_forbidden" });
+  });
+
+  it("does not slide a positive cache hit past its original 60-second deadline", async () => {
+    const fixture = await assuredUser();
+    const start = Date.now();
+    let clock = start;
+    let providerCalls = 0;
+    const guard = await createGuard({
+      now: () => clock,
+      checkUser: async (proof) => {
+        providerCalls += 1;
+        if (providerCalls > 1) throw new FirebaseOperatorVerificationError(503);
+        return { ...proof, checkedAtMs: clock };
+      },
+    }) as {
+      check: (input: { sessionId: string; userId: string }) => Promise<Record<string, unknown>>;
+    };
+
+    await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId }))
+      .resolves.toMatchObject({ kind: "allowed" });
+    clock = start + 59_000;
+    await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId }))
+      .resolves.toMatchObject({ kind: "allowed" });
+    expect(providerCalls).toBe(1);
+
+    clock = start + 60_000;
+    await expect(guard.check({ sessionId: fixture.session.id, userId: fixture.userId }))
+      .resolves.toMatchObject({ kind: "denied", status: 503, reason: "dependency_unavailable" });
+    expect(providerCalls).toBe(2);
+  });
+
+  it.each([
+    { label: "provider rejection", error: new FirebaseOperatorVerificationError(401), status: 401, reason: "firebase_denied", deleteOwnedSession: true },
+    { label: "provider unavailability", error: new FirebaseOperatorVerificationError(503), status: 503, reason: "dependency_unavailable", deleteOwnedSession: false },
+    { label: "an unexpected provider error", error: new Error("GUARD-PROVIDER-RAW-ERROR-SENTINEL"), status: 503, reason: "dependency_unavailable", deleteOwnedSession: false },
+  ])("maps $label to a closed denial and only cleans up the owned session", async ({ error, status, reason, deleteOwnedSession }) => {
+    const fixture = await assuredUser();
+    const unrelated = await assuredUser();
+    const spies = ["debug", "info", "warn", "error"].map((level) =>
+      vi.spyOn(logger, level as "warn").mockImplementation(() => undefined as never));
+    const guard = await createGuard({ checkUser: async () => { throw error; } }) as {
+      check: (input: { sessionId: string; userId: string }) => Promise<Record<string, unknown>>;
+    };
+
+    const decision = await guard.check({ sessionId: fixture.session.id, userId: fixture.userId });
+    expect(decision).toMatchObject({ kind: "denied", status, reason });
+    const logCalls = spies.flatMap((spy) => spy.mock.calls);
+    expect(JSON.stringify({ decision, logCalls })).not.toContain("GUARD-PROVIDER-RAW-ERROR-SENTINEL");
+    if (deleteOwnedSession) {
+      await expect(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(0);
+      await expect(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id))).resolves.toHaveLength(0);
+    } else {
+      await expect(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id))).resolves.toHaveLength(1);
+      await expect(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id))).resolves.toHaveLength(1);
+    }
+    await expect(db.select().from(authSessions).where(eq(authSessions.id, unrelated.session.id))).resolves.toHaveLength(1);
+    await expect(db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, unrelated.session.id))).resolves.toHaveLength(1);
   });
 
   it("does not allow a verifier result that returns after its lookup-start cache deadline", async () => {

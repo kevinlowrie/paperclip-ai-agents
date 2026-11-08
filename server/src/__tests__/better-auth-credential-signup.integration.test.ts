@@ -170,6 +170,7 @@ describeEmbeddedPostgres("Better Auth credential sign-up against the real schema
 
     // The browser must not receive a normal session for an operator identity;
     // checking both the HTTP cookie and persisted rows proves the real SDK hook.
+    expect.soft(signIn.status).toBe(401);
     expect.soft(sessionCookies(signIn)).toHaveLength(0);
     expect.soft(await db.select().from(authSessions)).toHaveLength(sessionsBefore.length);
   });
