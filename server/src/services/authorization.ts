@@ -39,6 +39,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
+import { isEligibleInstanceAdmin } from "./instance-admin-policy.js";
 
 export type AuthorizationActor =
   {
@@ -562,16 +563,7 @@ type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 export function authorizationService(db: Db | DbTransaction) {
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
-    if (
-      await db
-        .select({ id: instanceUserRoles.id })
-        .from(instanceUserRoles)
-        .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-        .then((rows) => rows[0] ?? null)
-    ) {
-      return true;
-    }
-    return false;
+    return isEligibleInstanceAdmin(db, userId);
   }
 
   async function getActiveMembership(

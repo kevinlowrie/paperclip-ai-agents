@@ -241,7 +241,6 @@ function guardHttpError(status: number): HttpError {
 }
 
 async function guardedSessionActor(
-  db: Db,
   guard: ReturnType<typeof createFirebaseOperatorSessionGuard>,
   session: BetterAuthSessionResult,
   runId: string | undefined,
@@ -259,26 +258,27 @@ async function guardedSessionActor(
     throw guardHttpError(503);
   }
   if (state.kind === "ordinary") return null;
-  const decision = await guard.check({ sessionId, userId });
+  let decision = await guard.check({ sessionId, userId });
   if (decision.kind !== "allowed") throw guardHttpError(decision.kind === "denied" ? decision.status : 401);
-  let roleRow: { id: string } | null;
-  let memberships: Awaited<ReturnType<typeof loadActiveUserCompanyMemberships>>;
-  try {
-    [roleRow, memberships] = await Promise.all([
-      db.select({ id: instanceUserRoles.id }).from(instanceUserRoles)
-        .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin"))).then((rows) => rows[0] ?? null),
-      loadActiveUserCompanyMemberships(db, userId),
-    ]);
-  } catch {
-    emitFirebaseOperatorGuardDenial("dependency_unavailable", 503);
-    throw guardHttpError(503);
+  decision = guard.finalizeForDispatch(decision);
+  if (decision.kind !== "allowed") {
+    if (decision.kind === "denied") {
+      emitFirebaseOperatorGuardDenial(decision.reason, decision.status);
+      if (decision.status === 401) {
+        try { await guard.cleanupOwnedSession({ sessionId, userId }); }
+        catch { /* cleanup failure cannot change the original closed denial */ }
+      }
+      throw guardHttpError(decision.status);
+    }
+    throw unauthorized();
   }
+  const memberships = decision.memberships;
   return {
     type: "board", userId, sessionId,
     userName: session.user?.name ?? null,
     userEmail: session.user?.email ?? null,
     companyIds: memberships.map((row) => row.companyId), memberships,
-    isInstanceAdmin: Boolean(roleRow), runId, source: "session",
+    isInstanceAdmin: false, ignoreInstanceAdmin: true, runId, source: "session",
   };
 }
 
@@ -346,7 +346,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         if (cloudState?.kind === "unavailable") { emitFirebaseOperatorGuardDenial("dependency_unavailable", 503); next(guardHttpError(503)); return; }
         let guardedActor: Express.Request["actor"] | null = null;
         if (session?.user?.id && session.session?.id) {
-          guardedActor = await guardedSessionActor(db, firebaseGuard, session, runIdHeader ?? undefined);
+          guardedActor = await guardedSessionActor(firebaseGuard, session, runIdHeader ?? undefined);
         }
         if (cloudState?.kind === "operator_state") {
           if (!session?.user?.id || session.user.id !== cloudUserId || !guardedActor) {

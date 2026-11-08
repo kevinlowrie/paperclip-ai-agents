@@ -20,7 +20,18 @@ export type FirebaseOperatorGuardReason =
   | "instance_admin_forbidden" | "firebase_denied" | "dependency_unavailable";
 export type FirebaseOperatorGuardDecision =
   | { kind: "unbound" }
-  | { kind: "allowed"; checkedAtMs: number; bindingId: string; bindingRevision: number; absoluteExpiresAt: Date }
+  | {
+      kind: "allowed";
+      checkedAtMs: number;
+      bindingId: string;
+      bindingRevision: number;
+      absoluteExpiresAt: Date;
+      authorityDeadlineMs: number;
+      sessionExpiresAtMs: number;
+      sessionCreatedAtMs: number;
+      lastInteractiveAtMs: number;
+      memberships: Array<{ companyId: string; membershipRole: string | null; status: string }>;
+    }
   | { kind: "denied"; status: 401 | 403 | 503; reason: Exclude<FirebaseOperatorGuardReason, "unbound" | "allowed"> };
 export type FirebaseOperatorUserState =
   | { kind: "ordinary" }
@@ -139,24 +150,47 @@ export function createFirebaseOperatorSessionGuard(deps: {
           tx.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, input.userId)).limit(1),
           tx.select({ id: instanceUserRoles.id }).from(instanceUserRoles)
             .where(and(eq(instanceUserRoles.userId, input.userId), eq(instanceUserRoles.role, "instance_admin"))).for("update").limit(1),
-          tx.select({ id: companyMemberships.id, companyId: companyMemberships.companyId }).from(companyMemberships)
+          tx.select({
+            id: companyMemberships.id,
+            companyId: companyMemberships.companyId,
+            membershipRole: companyMemberships.membershipRole,
+            status: companyMemberships.status,
+          }).from(companyMemberships)
             .innerJoin(companies, eq(companies.id, companyMemberships.companyId))
             .where(and(eq(companyMemberships.principalType, "user"), eq(companyMemberships.principalId, input.userId), eq(companyMemberships.status, "active"), eq(companies.status, "active"))).for("update"),
         ]);
         if (!user.length) return denied(401, "binding_invalid");
         if (admins.length) return denied(403, "instance_admin_forbidden");
         if (!memberships.length || (input.companyId && !memberships.some((row) => row.companyId === input.companyId))) return denied(403, "company_forbidden");
-        if (currentNow > checkedAtMs + 60_000) return unavailable();
+        if (currentNow >= checkedAtMs + 60_000) return unavailable();
         if (persistCheck) {
           await tx.update(firebaseOperatorSessionAssurance).set({ lastAuthoritativeCheckAt: new Date(checkedAtMs) })
             .where(eq(firebaseOperatorSessionAssurance.sessionId, input.sessionId));
         }
         const afterAwaitNow = now();
-        if (afterAwaitNow > checkedAtMs + 60_000) return unavailable();
+        if (afterAwaitNow >= checkedAtMs + 60_000) return unavailable();
         if (session.expiresAt.getTime() <= afterAwaitNow || assurance.absoluteExpiresAt.getTime() <= afterAwaitNow
           || session.createdAt.getTime() + 8 * 60 * 60_000 <= afterAwaitNow) return denied(401, "session_expired");
         if (assurance.lastInteractiveAt.getTime() + 30 * 60_000 <= afterAwaitNow) return denied(401, "idle_expired");
-        return { kind: "allowed", checkedAtMs, bindingId: binding.id, bindingRevision: binding.revision, absoluteExpiresAt: assurance.absoluteExpiresAt };
+        return {
+          kind: "allowed", checkedAtMs, bindingId: binding.id, bindingRevision: binding.revision,
+          absoluteExpiresAt: assurance.absoluteExpiresAt,
+          authorityDeadlineMs: Math.min(
+            checkedAtMs + 60_000,
+            session.expiresAt.getTime(),
+            assurance.absoluteExpiresAt.getTime(),
+            session.createdAt.getTime() + 8 * 60 * 60_000,
+            assurance.lastInteractiveAt.getTime() + 30 * 60_000,
+          ),
+          sessionExpiresAtMs: session.expiresAt.getTime(),
+          sessionCreatedAtMs: session.createdAt.getTime(),
+          lastInteractiveAtMs: assurance.lastInteractiveAt.getTime(),
+          memberships: memberships.map((row) => ({
+            companyId: row.companyId,
+            membershipRole: row.membershipRole,
+            status: row.status,
+          })),
+        };
       }, { isolationLevel: "repeatable read" });
     } catch {
       return unavailable();
@@ -214,7 +248,7 @@ export function createFirebaseOperatorSessionGuard(deps: {
         return unavailable();
       }
       checkedAtMs = result.checkedAtMs;
-      if (!Number.isSafeInteger(checkedAtMs) || checkedAtMs > now() || atStart > checkedAtMs + 60_000 || now() > atStart + 60_000
+      if (!Number.isSafeInteger(checkedAtMs) || checkedAtMs > now() || atStart >= checkedAtMs + 60_000 || now() >= atStart + 60_000
         || result.projectId !== assurance.projectId || result.uid !== assurance.firebaseUid
         || result.authTimeSeconds !== assurance.authTimeSeconds
         || factorsHash(result.totpFactors) !== factorsHash(assurance.totpFactors)) return unavailable();
@@ -255,20 +289,15 @@ export function createFirebaseOperatorSessionGuard(deps: {
         return decision;
       }
       const deadline = checkedAtMs + 60_000;
-      if (now() > deadline) return unavailable();
+      if (now() >= deadline) return unavailable();
       if (!cached || atStart >= cached.deadline) {
         cache.set(key, { checkedAtMs, deadline, bindingId: decision.bindingId, bindingRevision: decision.bindingRevision, absoluteExpiresAt: decision.absoluteExpiresAt });
         while (cache.size > maxEntries) cache.delete(cache.keys().next().value!);
       }
     } else if (decision.kind === "denied" && decision.status === 401) {
       await removeOwned(input.sessionId, input.userId);
-    } else if (decision.kind === "denied" && decision.reason === "company_forbidden" && !input.companyId) {
-      try {
-        const [active] = await deps.db.select({ id: companyMemberships.id }).from(companyMemberships)
-          .innerJoin(companies, eq(companies.id, companyMemberships.companyId))
-          .where(and(eq(companyMemberships.principalType, "user"), eq(companyMemberships.principalId, input.userId), eq(companyMemberships.status, "active"), eq(companies.status, "active"))).limit(1);
-        if (!active) await removeOwned(input.sessionId, input.userId);
-      } catch { /* a membership query failure does not widen access */ }
+    } else if (decision.kind === "denied" && decision.reason === "company_forbidden") {
+      await removeOwned(input.sessionId, input.userId);
     }
     return decision;
   }
@@ -279,5 +308,22 @@ export function createFirebaseOperatorSessionGuard(deps: {
     return decision;
   }
 
-  return { check, readUserState };
+  function finalizeForDispatch(decision: FirebaseOperatorGuardDecision): FirebaseOperatorGuardDecision {
+    if (decision.kind !== "allowed") return decision;
+    const current = now();
+    if (decision.sessionExpiresAtMs <= current
+      || decision.absoluteExpiresAt.getTime() <= current
+      || decision.sessionCreatedAtMs + 8 * 60 * 60_000 <= current) {
+      return denied(401, "session_expired");
+    }
+    if (decision.lastInteractiveAtMs + 30 * 60_000 <= current) return denied(401, "idle_expired");
+    if (current >= decision.authorityDeadlineMs) return unavailable();
+    return decision;
+  }
+
+  async function cleanupOwnedSession(input: { sessionId: string; userId: string }): Promise<void> {
+    await removeOwned(input.sessionId, input.userId);
+  }
+
+  return { check, readUserState, finalizeForDispatch, cleanupOwnedSession };
 }

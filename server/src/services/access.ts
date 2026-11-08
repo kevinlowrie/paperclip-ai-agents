@@ -19,6 +19,7 @@ import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
+import { isEligibleInstanceAdmin } from "./instance-admin-policy.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 type GrantInput = {
@@ -350,12 +351,7 @@ export function accessService(db: Db) {
 
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
-    const row = await db
-      .select({ id: instanceUserRoles.id })
-      .from(instanceUserRoles)
-      .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+    return isEligibleInstanceAdmin(db, userId);
   }
 
   async function getMembership(
