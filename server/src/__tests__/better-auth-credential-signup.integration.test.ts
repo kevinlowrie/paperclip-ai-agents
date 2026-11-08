@@ -14,6 +14,7 @@
  */
 
 import express from "express";
+import { eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { authAccounts, createDb } from "@paperclipai/db";
@@ -27,11 +28,6 @@ import type { Config } from "../config.js";
 const ORIGIN = "http://127.0.0.1:41999";
 const EMAIL = "founder@example.com";
 const PASSWORD = "correct-horse-battery-staple";
-
-// The issuer Better Auth stamps on an email/password account:
-// `createLocalAccountIssuer("credential")`. Sign-in matches on it, so a row
-// written with anything else is a row nobody can sign in as.
-const CREDENTIAL_ISSUER = "local:credential";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -107,8 +103,10 @@ describeEmbeddedPostgres("Better Auth credential sign-up against the real schema
     expect(accounts).toHaveLength(1);
     expect(accounts[0]).toMatchObject({
       providerId: "credential",
-      issuer: CREDENTIAL_ISSUER,
     });
+    // New Better Auth credential accounts are keyed by provider_id/account_id;
+    // issuer is retained only for legacy rows and is nullable in the current DB.
+    expect(accounts[0]?.issuer).toBeNull();
     expect(accounts[0]?.password).toBeTruthy();
 
     const signIn = await request(app)
@@ -118,6 +116,29 @@ describeEmbeddedPostgres("Better Auth credential sign-up against the real schema
 
     expect(signIn.status).toBe(200);
     expect(signIn.body?.user?.email).toBe(EMAIL);
+    expect(sessionCookies(signIn).length).toBeGreaterThan(0);
+  });
+
+  it("keeps a legacy issuer credential usable after upgrading the account key", async () => {
+    const signUp = await request(app)
+      .post("/api/auth/sign-up/email")
+      .set("origin", ORIGIN)
+      .send({ email: "legacy@example.com", password: PASSWORD, name: "Legacy" });
+    expect(signUp.status).toBe(200);
+
+    // Model a row written by Better Auth 1.7.2 before issuer became optional.
+    await db
+      .update(authAccounts)
+      .set({ issuer: "local:credential" })
+      .where(eq(authAccounts.userId, signUp.body.user.id));
+
+    const signIn = await request(app)
+      .post("/api/auth/sign-in/email")
+      .set("origin", ORIGIN)
+      .send({ email: "legacy@example.com", password: PASSWORD });
+
+    expect(signIn.status).toBe(200);
+    expect(signIn.body?.user?.email).toBe("legacy@example.com");
     expect(sessionCookies(signIn).length).toBeGreaterThan(0);
   });
 });

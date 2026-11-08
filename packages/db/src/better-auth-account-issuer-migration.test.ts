@@ -45,14 +45,16 @@ describe("account issuer schema", () => {
     const config = getTableConfig(authAccounts);
     const issuer = config.columns.find((column) => column.name === "issuer");
     expect(issuer).toBeDefined();
-    expect(issuer?.notNull).toBe(true);
+    expect(issuer?.notNull).toBe(false);
 
-    // Better Auth declares `(issuer, accountId)` unique on the account model
-    // and resolves accounts by that pair.
-    const unique = config.indexes.find((index) => index.config.name === UNIQUE_INDEX);
-    expect(unique?.config.unique).toBe(true);
-    expect(unique?.config.columns.map((column) => (column as { name: string }).name)).toEqual([
-      "issuer",
+    const oldUnique = config.indexes.find((index) => index.config.name === UNIQUE_INDEX);
+    expect(oldUnique).toBeUndefined();
+    const providerAccountUnique = config.indexes.find(
+      (index) => index.config.name === "account_provider_id_account_id_uq",
+    );
+    expect(providerAccountUnique?.config.unique).toBe(true);
+    expect(providerAccountUnique?.config.columns.map((column) => (column as { name: string }).name)).toEqual([
+      "provider_id",
       "account_id",
     ]);
   });
