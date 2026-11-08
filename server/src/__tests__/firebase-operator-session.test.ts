@@ -514,7 +514,7 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
   it("rechecks the independent 60-second verifier freshness boundary after assurance INSERT waits", async () => {
     const f = await fixture();
     let clock = NOW;
-    const verifier = vi.fn(async () => proof({ uid: f.uid, authTimeSeconds: Math.floor((NOW - 59_000) / 1000), checkedAtMs: NOW - 59_000 }));
+    const verifier = vi.fn(async () => proof({ uid: f.uid, authTimeSeconds: Math.floor((NOW - 100_000) / 1000), checkedAtMs: NOW - 59_000 }));
     const { app } = appFor(f, { now: () => clock, verify: verifier });
     const started = await begin(app);
     const assuranceBlock = await blockAssuranceInsert();
@@ -524,7 +524,7 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
       expect(await assuranceBlock.waitForInsert()).toBe(true);
       clock = NOW + 2_000;
       expect(clock - (NOW - 59_000)).toBeGreaterThan(60_000);
-      expect(clock - Math.floor((NOW - 59_000) / 1000) * 1000).toBeLessThanOrEqual(300_000);
+      expect(clock - Math.floor((NOW - 100_000) / 1000) * 1000).toBeLessThanOrEqual(300_000);
       expect(clock).toBeLessThan(new Date(started.body.expiresAt).getTime());
       await assuranceBlock.release();
       const response = await pending;
