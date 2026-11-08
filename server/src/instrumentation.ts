@@ -36,8 +36,16 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { checkExactPeerVersions } from "./peer-version-check.js";
+import { isFirebaseSessionHttpRequest } from "./middleware/http-log-policy.js";
 
 export { checkExactPeerVersions } from "./peer-version-check.js";
+
+/** Suppress automatic request and descendant spans for the reserved auth namespace. */
+export function firebaseOperatorHttpInstrumentationOptions(): {
+  ignoreIncomingRequestHook(req: { method?: string; url?: string }): boolean;
+} {
+  return { ignoreIncomingRequestHook: (req) => isFirebaseSessionHttpRequest(req.method, req.url) };
+}
 
 const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
 
@@ -510,6 +518,7 @@ async function bootstrapOtel(endpoint: string): Promise<void> {
         : new OTLPTraceExporter()) as never,
       instrumentations: [
         getNodeAutoInstrumentations({
+          "@opentelemetry/instrumentation-http": firebaseOperatorHttpInstrumentationOptions(),
           // Too chatty for this workload.
           "@opentelemetry/instrumentation-fs": { enabled: false },
           "@opentelemetry/instrumentation-dns": { enabled: false },

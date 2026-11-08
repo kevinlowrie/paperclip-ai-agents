@@ -509,7 +509,7 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     const correlations = parsed.map((event) => event.correlationId).filter((id) => typeof id === "string");
     expect(correlations.length).toBeGreaterThanOrEqual(5);
     expect(new Set(correlations).size).toBe(correlations.length);
-    const surfaces = JSON.stringify({ events, state: started.body.state, transactionId: started.body.transactionId, uid: f.uid, token: TOKEN_SENTINEL });
+    const surfaces = JSON.stringify({ events });
     expect(surfaces).not.toContain(started.body.state);
     expect(surfaces).not.toContain(started.body.transactionId);
     expect(surfaces).not.toContain(f.uid);
@@ -541,7 +541,6 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     const f = await fixture();
     let clock = NOW;
     const { app } = appFor(f, { now: () => clock });
-    const beforeIds = new Set((await db.select({ id: firebaseOperatorLoginTransactions.id }).from(firebaseOperatorLoginTransactions)).map((row) => row.id));
     const transactionBlock = await blockTransactionInsert();
     let pending: Promise<request.Response> | undefined;
     try {
@@ -568,6 +567,7 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     const f = await fixture();
     let clock = NOW;
     const { app } = appFor(f, { now: () => clock });
+    const beforeIds = new Set((await db.select({ id: firebaseOperatorLoginTransactions.id }).from(firebaseOperatorLoginTransactions)).map((row) => row.id));
     const transactionBlock = await blockTransactionInsert();
     let pending: Promise<request.Response> | undefined;
     try {

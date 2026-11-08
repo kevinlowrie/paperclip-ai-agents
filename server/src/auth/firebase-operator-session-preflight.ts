@@ -116,7 +116,9 @@ export function firebaseOperatorPreAuthRequestHandler(options: {
         reject(res, status === 413 ? 413 : 400);
         return;
       }
-      const bodyBytes = capturedLengths.get(req) ?? 0;
+      const capturedBytes = capturedLengths.get(req);
+      if (capturedBytes === undefined) { reject(res, 400); return; }
+      const bodyBytes = capturedBytes;
       if (bodyBytes > maxBodyBytes) { reject(res, 413); return; }
       const store: Provenance = { method: "POST", path: candidatePath as typeof BEGIN | typeof EXCHANGE, origin, bodyBytes, nonce: randomBytes(16).toString("hex"), request: req };
       provenance.run(store, next);
