@@ -269,6 +269,42 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     })).rejects.toThrow("SCOPED_KEY is missing or empty");
   });
 
+  it("declares remote MCP with an env placeholder and withholds its bearer from the public profile and model credential bundle", async () => {
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: {
+        PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({ gateway: { options: { apiKey: "{env:MODEL_KEY}" }, models: { model: {} } } }),
+        MODEL_KEY: "fixture-model-bearer",
+        CONTEXT_KEY: "fixture-context-bearer",
+      },
+      config: { model: "gateway/model", remoteMcpServers: [{ name: "search", url: "https://search.internal/mcp", tokenEnvName: "CONTEXT_KEY" }] },
+      targetIsRemote: true,
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const profile = await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8");
+    expect(profile).toContain('"search"');
+    expect(profile).toContain("{env:CONTEXT_KEY}");
+    expect(profile).toContain('"oauth": false');
+    expect(profile).not.toContain("fixture-context-bearer");
+    expect(prepared.credentialEnv).toEqual({ MODEL_KEY: "fixture-model-bearer" });
+    expect(prepared.mcpCredentialEnv).toEqual({ CONTEXT_KEY: "fixture-context-bearer" });
+    expect(prepared.env.CONTEXT_KEY).toBeUndefined();
+    await prepared.cleanup();
+    cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
+  });
+
+  it.each([
+    ["duplicate names", [{ name: "search", url: "https://a.internal", tokenEnvName: "KEY_A" }, { name: "search", url: "https://b.internal", tokenEnvName: "KEY_B" }]],
+    ["query strings", [{ name: "search", url: "https://a.internal/path?q=x", tokenEnvName: "KEY_A" }]],
+    ["arbitrary HTTP", [{ name: "search", url: "http://search.internal/mcp", tokenEnvName: "KEY_A" }]],
+    ["reserved env names", [{ name: "search", url: "https://a.internal", tokenEnvName: "PAPERCLIP_API_KEY" }]],
+  ])("rejects unsafe MCP declarations (%s)", async (_label, remoteMcpServers) => {
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({ gateway: { options: { apiKey: "{env:MODEL_KEY}" }, models: { model: {} } } }), MODEL_KEY: "model-token", KEY_A: "a", KEY_B: "b" },
+      config: { model: "gateway/model", remoteMcpServers },
+      targetIsRemote: true,
+    })).rejects.toThrow();
+  });
+
   it("rejects a literal selected credential instead of an env binding", async () => {
     await expect(prepareOpenCodeRuntimeConfig({
       env: {

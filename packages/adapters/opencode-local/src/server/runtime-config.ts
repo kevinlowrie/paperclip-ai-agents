@@ -2,11 +2,13 @@ import fs from "node:fs/promises";
 import { X509Certificate } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { isIP } from "node:net";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
   credentialEnv?: Record<string, string>;
+  mcpCredentialEnv?: Record<string, string>;
   trustedCaRelativePath?: string;
   notes: string[];
   cleanup: () => Promise<void>;
@@ -184,8 +186,16 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
   targetIsRemote?: boolean;
+  hostBearerToken?: string;
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
+  if (
+    !input.targetIsRemote &&
+    Object.prototype.hasOwnProperty.call(input.config, "remoteMcpServers") &&
+    (!Array.isArray(input.config.remoteMcpServers) || input.config.remoteMcpServers.length > 0)
+  ) {
+    throw new Error("Remote OpenCode MCP servers require an isolated remote execution target.");
+  }
   // Remote execution must only use the run's declared provider profile. Never
   // inherit the server's OpenCode profile or ambient provider settings.
   const providerConfig = input.env.PAPERCLIP_OPENCODE_PROVIDERS ??
@@ -311,7 +321,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
 }
 
 async function prepareRemoteOpenCodeRuntimeConfig(
-  input: { env: Record<string, string>; config: Record<string, unknown> },
+  input: { env: Record<string, string>; config: Record<string, unknown>; hostBearerToken?: string },
   providerConfig: string | undefined,
   skipPermissions: boolean,
 ): Promise<PreparedOpenCodeRuntimeConfig> {
@@ -338,6 +348,7 @@ async function prepareRemoteOpenCodeRuntimeConfig(
   const requestedModels = [configuredModel, smallModelRef];
   const minimalProviders: Record<string, Record<string, unknown>> = {};
   const credentialEnv: Record<string, string> = {};
+  const mcpCredentialEnv: Record<string, string> = {};
   for (const modelRef of requestedModels) {
     const declaredProvider = providers?.[modelRef.provider];
     if (!isPlainObject(declaredProvider)) {
@@ -377,6 +388,81 @@ async function prepareRemoteOpenCodeRuntimeConfig(
     provider: minimalProviders,
   };
   nextConfig.small_model = configuredSmallModel || `${configuredModel.provider}/${configuredModel.model}`;
+  const remoteMcpServers = input.config.remoteMcpServers;
+  if (remoteMcpServers !== undefined && !Array.isArray(remoteMcpServers)) {
+    throw new Error("Remote OpenCode MCP servers must be an array.");
+  }
+  if (Array.isArray(remoteMcpServers) && remoteMcpServers.length > 4) {
+    throw new Error("Remote OpenCode supports at most four MCP servers.");
+  }
+  if (Array.isArray(remoteMcpServers) && remoteMcpServers.length > 0) {
+    const servers: Record<string, unknown> = {};
+    const names = new Set<string>();
+    const tokenNames = new Set<string>();
+    const modelValues = new Set(Object.values(credentialEnv));
+    for (const raw of remoteMcpServers) {
+      if (!isPlainObject(raw) || Object.keys(raw).sort().join(",") !== "name,tokenEnvName,url") {
+        throw new Error("Remote OpenCode MCP server declaration has invalid fields.");
+      }
+      const { name, url, tokenEnvName } = raw;
+      if (typeof name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(name) || names.has(name)) {
+        throw new Error("Remote OpenCode MCP server name is invalid or duplicated.");
+      }
+      if (
+        typeof tokenEnvName !== "string" ||
+        !/^[A-Z][A-Z0-9_]{0,63}$/.test(tokenEnvName) ||
+        tokenNames.has(tokenEnvName)
+      ) {
+        throw new Error("Remote OpenCode MCP credential reference is invalid or duplicated.");
+      }
+      if (
+        tokenEnvName.startsWith("PAPERCLIP_") ||
+        /^(?:TLS|SSL|OPENSSL|NODE_|XDG_|HOME$|PATH$|OPENCODE)/.test(tokenEnvName) ||
+        REMOTE_RESERVED_CREDENTIAL_ENV.has(tokenEnvName)
+      ) {
+        throw new Error("Remote OpenCode MCP credential reference uses a reserved environment variable.");
+      }
+      if (Object.keys(credentialEnv).includes(tokenEnvName)) {
+        throw new Error("Remote OpenCode MCP credential reference collides with a model credential.");
+      }
+      if (typeof url !== "string" || url.length > 2048 || /[\u0000-\u001f\u007f]/.test(url)) {
+        throw new Error("Remote OpenCode MCP URL is invalid.");
+      }
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(url);
+      } catch {
+        throw new Error("Remote OpenCode MCP URL is invalid.");
+      }
+      const hostname = parsedUrl.hostname.toLowerCase();
+      const ipv4Loopback = /^127(?:\.\d{1,3}){3}$/.test(hostname);
+      const isLoopback = hostname === "localhost" || ipv4Loopback || hostname === "[::1]";
+      if (parsedUrl.username || parsedUrl.password || parsedUrl.search || parsedUrl.hash ||
+          (parsedUrl.protocol !== "https:" && !(parsedUrl.protocol === "http:" && isLoopback)) ||
+          !hostname || (isIP(hostname.replace(/^\[|\]$/g, "")) !== 0 && !isLoopback) ||
+          (parsedUrl.protocol === "https:" && !hostname.includes(".") && hostname !== "localhost") ||
+          parsedUrl.toString() !== url) {
+        throw new Error("Remote OpenCode MCP URL must use HTTPS (HTTP is limited to loopback).");
+      }
+      const token = input.env[tokenEnvName];
+      if (typeof token !== "string" || token.trim().length === 0) {
+        throw new Error(`Remote OpenCode MCP credential ${tokenEnvName} is missing or empty.`);
+      }
+      if (modelValues.has(token) || token === input.hostBearerToken || token === input.env.PAPERCLIP_API_KEY) {
+        throw new Error("Remote OpenCode MCP credential cannot reuse another authority value.");
+      }
+      names.add(name);
+      tokenNames.add(tokenEnvName);
+      mcpCredentialEnv[tokenEnvName] = token;
+      servers[name] = {
+        type: "remote",
+        url,
+        headers: { Authorization: `{env:${tokenEnvName}}` },
+        oauth: false,
+      };
+    }
+    nextConfig.mcp = servers;
+  }
   for (const [name, value] of Object.entries(credentialEnv)) {
     if (containsCredential(nextConfig, value)) {
       throw new Error(`Remote OpenCode profile embeds credential ${name} instead of keeping it in the runtime environment.`);
@@ -403,9 +489,11 @@ async function prepareRemoteOpenCodeRuntimeConfig(
     for (const name of REMOTE_TRUST_CONFLICTING_ENV) delete runtimeEnv[name];
   }
   for (const name of Object.keys(credentialEnv)) delete runtimeEnv[name];
+  for (const name of Object.keys(mcpCredentialEnv)) delete runtimeEnv[name];
   return {
     env: { ...runtimeEnv, XDG_CONFIG_HOME: runtimeConfigHome },
     credentialEnv,
+    mcpCredentialEnv,
     ...(trustedCaPem ? { trustedCaRelativePath: "trust/ca.pem" } : {}),
     notes: ["Created an isolated remote OpenCode config from the selected run provider/model."],
     cleanup: async () => fs.rm(runtimeConfigHome, { recursive: true, force: true }),
