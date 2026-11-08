@@ -5,12 +5,48 @@ import {
   FirebaseOperatorVerificationError,
 } from "./firebase-operator-verifier.js";
 
+const firebaseAdminMocks = vi.hoisted(() => {
+  const auth = {
+    verifyIdToken: vi.fn(),
+    getUser: vi.fn(),
+  };
+  return {
+    getApps: vi.fn(() => []),
+    initializeApp: vi.fn(() => ({ name: "synthetic-paperclip-app" })),
+    getAuth: vi.fn(() => auth),
+    applicationDefault: vi.fn(() => { throw new Error("ADC must not be accessed by this test"); }),
+    cert: vi.fn(() => { throw new Error("credentials must not be accessed by this test"); }),
+    auth,
+  };
+});
+
+vi.mock("firebase-admin/app", () => ({
+  getApps: firebaseAdminMocks.getApps,
+  initializeApp: firebaseAdminMocks.initializeApp,
+  applicationDefault: firebaseAdminMocks.applicationDefault,
+  cert: firebaseAdminMocks.cert,
+}));
+
+vi.mock("firebase-admin/auth", () => ({ getAuth: firebaseAdminMocks.getAuth }));
+
 const nowMs = Date.UTC(2026, 10, 8, 12, 0, 0);
 const nowSeconds = Math.floor(nowMs / 1000);
 const projectId = "thl-pclipd-api";
 const token = "synthetic.firebase.id-token";
 
 function claims(overrides: Record<string, unknown> = {}) {
+  const baseFirebase = {
+    sign_in_provider: "google.com",
+    sign_in_second_factor: "totp",
+    second_factor_identifier: "token-factor-id",
+  };
+  const firebaseOverride = Object.hasOwn(overrides, "firebase") ? overrides.firebase : undefined;
+  const firebase = !Object.hasOwn(overrides, "firebase")
+    ? baseFirebase
+    : firebaseOverride && typeof firebaseOverride === "object"
+      ? { ...baseFirebase, ...(firebaseOverride as Record<string, unknown>) }
+      : firebaseOverride;
+  const { firebase: _ignoredFirebase, ...topLevelOverrides } = overrides;
   return {
     aud: projectId,
     iss: `https://securetoken.google.com/${projectId}`,
@@ -21,12 +57,8 @@ function claims(overrides: Record<string, unknown> = {}) {
     auth_time: nowSeconds - 120,
     iat: nowSeconds - 60,
     exp: nowSeconds + 300,
-    firebase: {
-      sign_in_provider: "google.com",
-      second_factor_identifier: "token-factor-id",
-      ...((overrides.firebase as Record<string, unknown> | undefined) ?? {}),
-    },
-    ...overrides,
+    firebase,
+    ...topLevelOverrides,
   };
 }
 
@@ -37,7 +69,7 @@ function user(overrides: Record<string, unknown> = {}) {
     email: "operator@example.test",
     emailVerified: true,
     tenantId: undefined,
-    tokensValidAfterTime: new Date(nowMs - 10_000).toISOString(),
+    tokensValidAfterTime: new Date((nowSeconds - 121) * 1000).toUTCString(),
     providerData: [
       { providerId: "google.com", uid: "google-subject", email: "operator@example.test" },
     ],
@@ -65,22 +97,28 @@ function makeVerifier(options: { claims?: Record<string, unknown>; user?: Record
   };
 }
 
-function expectSafeFailure(promise: Promise<unknown>, status: 401 | 503) {
-  return promise.then(
-    () => {
-      throw new Error("expected a safe Firebase verification failure");
-    },
-    (error: unknown) => {
-      expect(error).toBeInstanceOf(FirebaseOperatorVerificationError);
-      expect(error).toMatchObject({ status });
-      expect(String(error)).not.toContain(token);
-      expect(String(error)).not.toContain("provider-secret");
-    },
-  });
+async function expectSafeFailure(promise: Promise<unknown>, status: 401 | 503) {
+  let error: unknown;
+  try {
+    await promise;
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(FirebaseOperatorVerificationError);
+  expect(error).toMatchObject({ status });
+  expect(String(error)).not.toContain(token);
+  expect(String(error)).not.toContain("provider-secret");
 }
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  firebaseAdminMocks.getApps.mockReset().mockReturnValue([]);
+  firebaseAdminMocks.initializeApp.mockReset().mockReturnValue({ name: "synthetic-paperclip-app" });
+  firebaseAdminMocks.getAuth.mockReset().mockReturnValue(firebaseAdminMocks.auth);
+  firebaseAdminMocks.applicationDefault.mockClear();
+  firebaseAdminMocks.cert.mockClear();
+  firebaseAdminMocks.auth.verifyIdToken.mockReset();
+  firebaseAdminMocks.auth.getUser.mockReset();
 });
 
 describe("Firebase operator verifier", () => {
@@ -111,24 +149,49 @@ describe("Firebase operator verifier", () => {
     });
   });
 
+  it("accepts the exact five-minute auth-time boundary", async () => {
+    const { verifier } = makeVerifier({
+      claims: { auth_time: nowSeconds - 300 },
+      user: { tokensValidAfterTime: new Date((nowSeconds - 301) * 1000).toISOString() },
+    });
+    await expect(verifier.verify(token)).resolves.toMatchObject({ authTimeSeconds: nowSeconds - 300 });
+  });
+
+  it("accepts a non-ASCII Firebase UID within the supported length", async () => {
+    const uid = "opérator-uid";
+    const { verifier } = makeVerifier({ claims: { sub: uid, uid }, user: { uid } });
+    await expect(verifier.verify(token)).resolves.toMatchObject({ uid });
+  });
+
   it.each([
     ["wrong audience", { aud: "other-project" }],
     ["wrong issuer", { iss: "https://securetoken.google.com/other-project" }],
     ["subject and uid mismatch", { uid: "another-uid" }],
     ["missing subject", { sub: "" }],
+    ["absent subject", { sub: undefined }],
     ["unverified email", { email_verified: false }],
     ["wrong provider", { firebase: { sign_in_provider: "password" } }],
+    ["missing second-factor method", { firebase: { sign_in_second_factor: undefined } }],
+    ["phone second-factor method", { firebase: { sign_in_second_factor: "phone" } }],
+    ["tenant firebase namespace", { firebase: { tenant: "" } }],
+    ["null firebase tenant namespace", { firebase: { tenant: null } }],
     ["missing firebase claims", { firebase: undefined }],
     ["missing auth time", { auth_time: undefined }],
     ["non-integer auth time", { auth_time: nowSeconds - 1.5 }],
+    ["boolean auth time", { auth_time: true }],
     ["auth time after token issue", { auth_time: nowSeconds - 20, iat: nowSeconds - 30 }],
     ["auth older than five minutes", { auth_time: nowSeconds - 301 }],
     ["auth time in the future", { auth_time: nowSeconds + 1 }],
     ["issue time in the future", { iat: nowSeconds + 1 }],
+    ["string issue time", { iat: String(nowSeconds - 60) }],
+    ["boolean issue time", { iat: true }],
     ["expired token", { exp: nowSeconds }],
     ["non-numeric expiry", { exp: "later" }],
+    ["missing factor identifier", { firebase: { second_factor_identifier: undefined } }],
     ["padded factor identifier", { firebase: { second_factor_identifier: " factor " } }],
+    ["non-printable factor identifier", { firebase: { second_factor_identifier: "factor\n" } }],
     ["oversized factor identifier", { firebase: { second_factor_identifier: "x".repeat(129) } }],
+    ["oversized subject", { sub: "u".repeat(129) }],
   ])("rejects malformed identity proof: %s", async (_label, override) => {
     const { verifier } = makeVerifier({ claims: override });
     await expectSafeFailure(verifier.verify(token), 401);
@@ -141,6 +204,8 @@ describe("Firebase operator verifier", () => {
     ["missing Google binding", { providerData: [] }],
     ["tenant namespace", { tenantId: "tenant-a" }],
     ["invalid revocation timestamp", { tokensValidAfterTime: "not-a-date" }],
+    ["malformed normalized calendar timestamp", { tokensValidAfterTime: "Mon, 32 Nov 2026 12:00:00 GMT" }],
+    ["missing revocation timestamp", { tokensValidAfterTime: undefined }],
     ["future revocation timestamp", { tokensValidAfterTime: new Date(nowMs + 1).toISOString() }],
     ["same-second revocation boundary", { tokensValidAfterTime: new Date((nowSeconds - 120) * 1000).toISOString() }],
     ["no TOTP factors", { multiFactor: { enrolledFactors: [] } }],
@@ -148,22 +213,32 @@ describe("Firebase operator verifier", () => {
       { factorId: "totp", uid: "same-factor" },
       { factorId: "totp", uid: "same-factor" },
     ] } }],
-    ["malformed TOTP factor", { multiFactor: { enrolledFactors: [{ factorId: "phone", uid: "factor" }] } }],
+    ["phone-only enrollment", { multiFactor: { enrolledFactors: [{ factorId: "phone", uid: "factor" }] } }],
     ["blank TOTP uid", { multiFactor: { enrolledFactors: [{ factorId: "totp", uid: "  " }] } }],
   ])("rejects an ineligible current account: %s", async (_label, override) => {
     const { verifier } = makeVerifier({ user: override });
     await expectSafeFailure(verifier.verify(token), 401);
   });
 
-  it("requires a Google provider binding to the verified email", async () => {
+  it("requires a Google provider binding without requiring its display email to match", async () => {
     const { verifier } = makeVerifier({ user: { providerData: [
       { providerId: "google.com", uid: "google-subject", email: "other@example.test" },
     ] } });
-    await expectSafeFailure(verifier.verify(token), 401);
+    await expect(verifier.verify(token)).resolves.toMatchObject({ uid: "operator-uid" });
   });
 
-  it("trims and accepts printable factor identifiers while returning no raw claims", async () => {
-    const { verifier } = makeVerifier({ claims: { firebase: { second_factor_identifier: " factor-1 " } } });
+  it("snapshots TOTP factors while ignoring additional phone factors", async () => {
+    const { verifier } = makeVerifier({ user: { multiFactor: { enrolledFactors: [
+      { factorId: "phone", uid: "phone-factor" },
+      { factorId: "totp", uid: "totp-factor" },
+    ] } } });
+    await expect(verifier.verify(token)).resolves.toMatchObject({
+      totpFactors: [{ factorId: "totp", uid: "totp-factor" }],
+    });
+  });
+
+  it("accepts an already-trimmed printable factor identifier while returning no raw claims", async () => {
+    const { verifier } = makeVerifier({ claims: { firebase: { second_factor_identifier: "factor-1" } } });
     const proof = await verifier.verify(token);
     expect(proof).not.toHaveProperty("secondFactorIdentifier");
     expect(proof).not.toHaveProperty("email");
@@ -222,12 +297,31 @@ describe("production Firebase verifier", () => {
   it.each(["true", "1", "localhost", "127.0.0.1"]) ("refuses emulator configuration %s at initialization", (emulator) => {
     vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", emulator);
     expect(() => createProductionFirebaseOperatorVerifier()).toThrow(FirebaseOperatorVerificationError);
+    expect(firebaseAdminMocks.initializeApp).not.toHaveBeenCalled();
+    expect(firebaseAdminMocks.getAuth).not.toHaveBeenCalled();
+  });
+
+  it("pins the production project and uses SDK revocation checking without ADC", async () => {
+    vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "");
+    vi.stubEnv("FIREBASE_PROJECT_ID", "attacker-selected-project");
+    firebaseAdminMocks.auth.verifyIdToken.mockResolvedValue(claims());
+    firebaseAdminMocks.auth.getUser.mockResolvedValue(user());
+    const verifier = createProductionFirebaseOperatorVerifier();
+    await verifier.verify(token);
+    expect(firebaseAdminMocks.initializeApp.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ projectId }));
+    expect(firebaseAdminMocks.auth.verifyIdToken).toHaveBeenCalledExactlyOnceWith(token, true);
+    expect(firebaseAdminMocks.applicationDefault).not.toHaveBeenCalled();
+    expect(firebaseAdminMocks.cert).not.toHaveBeenCalled();
   });
 
   it("checks for an emulator again before SDK calls", async () => {
     vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "");
+    firebaseAdminMocks.auth.verifyIdToken.mockResolvedValue(claims());
+    firebaseAdminMocks.auth.getUser.mockResolvedValue(user());
     const verifier = createProductionFirebaseOperatorVerifier();
     vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "localhost:9099");
     await expectSafeFailure(verifier.verify(token), 503);
+    expect(firebaseAdminMocks.auth.verifyIdToken).not.toHaveBeenCalled();
+    expect(firebaseAdminMocks.auth.getUser).not.toHaveBeenCalled();
   });
 });
