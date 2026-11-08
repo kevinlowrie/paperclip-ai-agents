@@ -282,7 +282,7 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
     const profile = await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8");
     expect(profile).toContain('"search"');
-    expect(profile).toContain("{env:CONTEXT_KEY}");
+    expect(profile).toContain("Bearer {env:CONTEXT_KEY}");
     expect(profile).toContain('"oauth": false');
     expect(profile).not.toContain("fixture-context-bearer");
     expect(prepared.credentialEnv).toEqual({ MODEL_KEY: "fixture-model-bearer" });
@@ -303,6 +303,23 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       config: { model: "gateway/model", remoteMcpServers },
       targetIsRemote: true,
     })).rejects.toThrow();
+  });
+
+  it("rejects unresolved MCP env placeholders before writing the runtime profile", async () => {
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({ gateway: { options: { apiKey: "{env:MODEL_KEY}" }, models: { model: {} } } }), MODEL_KEY: "model-token", CONTEXT_KEY: "{env:MISSING_CONTEXT_KEY}" },
+      config: { model: "gateway/model", remoteMcpServers: [{ name: "search", url: "https://search.internal/mcp", tokenEnvName: "CONTEXT_KEY" }] },
+      targetIsRemote: true,
+    })).rejects.toThrow(/missing|unresolved/i);
+  });
+
+  it("rejects an MCP credential embedded in the generated public profile", async () => {
+    const rawToken = "fixture-context-in-url";
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({ gateway: { options: { apiKey: "{env:MODEL_KEY}" }, models: { model: {} } } }), MODEL_KEY: "model-token", CONTEXT_KEY: rawToken },
+      config: { model: "gateway/model", remoteMcpServers: [{ name: "search", url: `https://search.internal/${rawToken}`, tokenEnvName: "CONTEXT_KEY" }] },
+      targetIsRemote: true,
+    })).rejects.toThrow(/credential/i);
   });
 
   it("rejects a literal selected credential instead of an env binding", async () => {

@@ -463,6 +463,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       for (const name of Object.keys(remoteCredentialEnv)) {
         delete preparedRuntimeConfig.env[name];
       }
+      for (const name of Object.keys(remoteMcpCredentialEnv)) {
+        delete preparedRuntimeConfig.env[name];
+      }
       delete preparedRuntimeConfig.env.PAPERCLIP_OPENCODE_PROVIDERS;
       delete preparedRuntimeConfig.env.PAPERCLIP_OPENCODE_SMALL_MODEL;
       remoteRuntimeRootDir = preparedExecutionTargetRuntime.runtimeRootDir;
