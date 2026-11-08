@@ -337,9 +337,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     env,
     config,
     targetIsRemote: executionTargetIsRemote,
+    hostBearerToken: authToken,
   });
   const remoteCredentialEnv = executionTargetIsRemote
     ? preparedRuntimeConfig.credentialEnv ?? {}
+    : {};
+  const remoteMcpCredentialEnv = executionTargetIsRemote
+    ? preparedRuntimeConfig.mcpCredentialEnv ?? {}
     : {};
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
@@ -703,7 +707,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         onProcessStopped: providerStop.beginInvocation(),
         cwd,
-        env: { ...preparedRuntimeConfig.env, ...remoteCredentialEnv },
+        env: { ...preparedRuntimeConfig.env, ...remoteCredentialEnv, ...remoteMcpCredentialEnv },
         stdin: prompt,
         timeoutSec,
         graceSec,
