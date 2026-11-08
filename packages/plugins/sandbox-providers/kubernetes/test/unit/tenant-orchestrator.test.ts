@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { ensureTenant } from "../../src/tenant-orchestrator.js";
+import { buildCiliumNetworkPolicyManifest } from "../../src/cilium-network-policy.js";
 
 function makeMockClients() {
   const calls: { kind: string; name: string; namespace?: string; body?: unknown }[] = [];
@@ -84,11 +85,44 @@ describe("ensureTenant", () => {
     expect(clients.custom.createNamespacedCustomObject).not.toHaveBeenCalled();
   });
 
-  it("accepts an existing exact DNS query policy", async () => {
+  it("accepts an existing exact provider DNS query policy", async () => {
     const clients = makeMockClients();
-    const exact = { body: { spec: { egress: [{ toPorts: [{ rules: { dns: [{ matchName: "api.example.invalid" }] } }] }] } } };
-    clients.custom.getNamespacedCustomObject.mockResolvedValue(exact);
+    const exact = buildCiliumNetworkPolicyManifest({
+      namespace: baseInput.namespace,
+      paperclipServerNamespace: baseInput.paperclipServerNamespace,
+      egressAllowFqdns: baseInput.egressAllowFqdns,
+      egressAllowCidrs: [],
+      dnsQueryAllowFqdns: ["api.example.invalid"],
+    });
+    clients.custom.getNamespacedCustomObject.mockResolvedValue({ body: exact });
     await expect(ensureTenant(clients as never, { ...baseInput, egressMode: "cilium", dnsQueryAllowFqdns: ["api.example.invalid"] })).resolves.toBeUndefined();
+    expect(clients.custom.createNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["separate unrestricted kube-dns L4 rule", (policy: any) => policy.spec.egress.push({ toEndpoints: [{ matchLabels: { "k8s:io.kubernetes.pod.namespace": "kube-system", "k8s-app": "kube-dns" } }], toPorts: [{ ports: [{ port: "53", protocol: "UDP" }, { port: "53", protocol: "TCP" }] }] })],
+    ["DNS rule on a different endpoint", (policy: any) => { policy.spec.egress[0].toEndpoints[0].matchLabels["k8s:io.kubernetes.pod.namespace"] = "other"; }],
+    ["portless grant", (policy: any) => { policy.spec.egress.push({ toEndpoints: [{ matchLabels: { "k8s:io.kubernetes.pod.namespace": "kube-system", "k8s-app": "kube-dns" } }] }); }],
+    ["wildcard endpoint selector", (policy: any) => { policy.spec.egress[0].toEndpoints[0].matchLabels = {}; }],
+    ["extra wildcard DNS name", (policy: any) => { policy.spec.egress[0].toPorts[0].rules.dns.push({ matchPattern: "*" }); }],
+    ["empty port list", (policy: any) => { policy.spec.egress[0].toPorts[0].ports = []; }],
+    ["named port", (policy: any) => { policy.spec.egress[0].toPorts[0].ports = [{ port: "dns", protocol: "UDP" }]; }],
+    ["port range covering DNS", (policy: any) => { policy.spec.egress[0].toPorts[0].ports = [{ port: "1", endPort: 53, protocol: "UDP" }]; }],
+    ["unrestricted unknown selector grant", (policy: any) => { policy.spec.egress.push({ toEndpoints: [{}] }); }],
+    ["portless world entity grant", (policy: any) => { policy.spec.egress.push({ toEntities: ["world"] }); }],
+    ["endpoint selector expressions", (policy: any) => { policy.spec.egress[0].toEndpoints[0].matchExpressions = []; }],
+  ])("rejects %s in strict Cilium mode", async (_label, mutate) => {
+    const clients = makeMockClients();
+    const policy = buildCiliumNetworkPolicyManifest({
+      namespace: baseInput.namespace,
+      paperclipServerNamespace: baseInput.paperclipServerNamespace,
+      egressAllowFqdns: baseInput.egressAllowFqdns,
+      egressAllowCidrs: [],
+      dnsQueryAllowFqdns: ["api.example.invalid"],
+    });
+    mutate(policy);
+    clients.custom.getNamespacedCustomObject.mockResolvedValue({ body: policy });
+    await expect(ensureTenant(clients as never, { ...baseInput, egressMode: "cilium", dnsQueryAllowFqdns: ["api.example.invalid"] })).rejects.toThrow(/DNS/i);
     expect(clients.custom.createNamespacedCustomObject).not.toHaveBeenCalled();
   });
 

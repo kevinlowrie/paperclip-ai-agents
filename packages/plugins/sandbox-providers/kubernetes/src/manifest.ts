@@ -74,7 +74,7 @@ const manifest: PaperclipPluginManifestV1 = {
             items: {
               type: "string",
               pattern:
-                "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                "^(?!(?:0[xX][0-9a-fA-F]+|0[0-7]*|[0-9]+)(?:\\.(?:0[xX][0-9a-fA-F]+|0[0-7]*|[0-9]+)){0,3}$)(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
             },
             description:
               "Exact canonical lowercase DNS names Cilium permits agent pods to query. Requires egressMode=cilium; omitted preserves the legacy wildcard DNS rule.",

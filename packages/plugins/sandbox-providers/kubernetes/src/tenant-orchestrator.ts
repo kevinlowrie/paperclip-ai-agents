@@ -227,7 +227,9 @@ async function ensureNetworkPolicies(clients: KubeClients, input: EnsureTenantIn
     });
     await ensureCiliumNetworkPolicy(clients, input.namespace, cnp);
     if (input.dnsQueryAllowFqdns !== undefined) {
-      await assertCiliumDnsQueries(clients, input.namespace, input.dnsQueryAllowFqdns);
+      await assertCiliumDnsQueries(
+        clients, input.namespace, input.paperclipServerNamespace, input.dnsQueryAllowFqdns,
+      );
     }
   } else {
     await ensureNetworkPolicy(clients, input.namespace, egressStd);
@@ -254,6 +256,7 @@ async function ensureNetworkPolicy(
 async function assertCiliumDnsQueries(
   clients: KubeClients,
   namespace: string,
+  paperclipServerNamespace: string,
   expectedNames: string[],
 ): Promise<void> {
   const result = await clients.custom.getNamespacedCustomObject({
@@ -263,26 +266,123 @@ async function assertCiliumDnsQueries(
     plural: "ciliumnetworkpolicies",
     name: "paperclip-egress-fqdn",
   });
-  type Policy = {
-    spec?: {
-      egress?: Array<{
-        toPorts?: Array<{ rules?: { dns?: Array<{ matchName?: string; matchPattern?: string }> } }>
-      }>
+  type Policy = { body?: { spec?: { egress?: unknown } }; spec?: { egress?: unknown } };
+  const response = result as Policy;
+  const egress = (response.body ?? response).spec?.egress;
+  if (!Array.isArray(egress)) throw dnsPolicyMismatch();
+
+  let dnsRuleCount = 0;
+  for (const candidate of egress) {
+    const rule = asRecord(candidate);
+    if (!rule) throw dnsPolicyMismatch();
+    if (isExactKubeDnsRule(rule, expectedNames)) {
+      dnsRuleCount += 1;
+      continue;
     }
-  };
-  const response = result as { body?: Policy };
-  const body = response.body ?? (result as Policy);
-  const dnsRules = (body.spec?.egress ?? []).flatMap((rule) => rule.toPorts ?? []).flatMap((port) => port.rules?.dns ?? []);
-  const actualNames = dnsRules.map((rule) => rule.matchName);
-  const sortedExpectedNames = [...expectedNames].sort();
-  if (
-    dnsRules.some((rule) => rule.matchPattern !== undefined) ||
-    actualNames.some((name) => name === undefined) ||
-    actualNames.length !== expectedNames.length ||
-    [...actualNames].sort().some((name, index) => name !== sortedExpectedNames[index])
-  ) {
-    throw new Error("CiliumNetworkPolicy DNS rules do not match dnsQueryAllowFqdns; operator migration is required");
+    if (isExactPaperclipServerRule(rule, paperclipServerNamespace) || isExactFqdn443Rule(rule)) continue;
+    // Only the known generated rule forms are accepted. Any broader or
+    // unfamiliar selector/port shape could reach a DNS resolver without the
+    // exact L7 name restriction, so strict mode fails closed.
+    throw dnsPolicyMismatch();
   }
+  if (dnsRuleCount !== 1) throw dnsPolicyMismatch();
+}
+
+function isExactKubeDnsRule(rule: Record<string, unknown>, expectedNames: string[]): boolean {
+  if (!hasOnlyKeys(rule, ["toEndpoints", "toPorts"])) return false;
+  const endpoints = rule.toEndpoints;
+  if (!Array.isArray(endpoints) || endpoints.length !== 1) return false;
+  const endpoint = asRecord(endpoints[0]);
+  const labels = endpoint && hasOnlyKeys(endpoint, ["matchLabels"]) ? asRecord(endpoint.matchLabels) : undefined;
+  if (!labels || !hasExactEntries(labels, {
+    "k8s:io.kubernetes.pod.namespace": "kube-system",
+    "k8s-app": "kube-dns",
+  })) return false;
+
+  const ports = rule.toPorts;
+  if (!Array.isArray(ports) || ports.length !== 1) return false;
+  const port = asRecord(ports[0]);
+  if (!port || !hasOnlyKeys(port, ["ports", "rules"])) return false;
+  if (!isExactDnsRules(port.rules, expectedNames)) return false;
+  const allowedPorts = port.ports;
+  if (!Array.isArray(allowedPorts) || allowedPorts.length !== 2) return false;
+  const normalizedPorts = allowedPorts.map((item) => asRecord(item));
+  if (normalizedPorts.some((item) => !item || !hasOnlyKeys(item, ["port", "protocol"]))) return false;
+  const pairs = normalizedPorts.map((item) => `${item!.port}/${item!.protocol}`).sort();
+  return pairs[0] === "53/TCP" && pairs[1] === "53/UDP";
+}
+
+function isExactDnsRules(value: unknown, expectedNames: string[]): boolean {
+  const rules = asRecord(value);
+  if (!rules || !hasOnlyKeys(rules, ["dns"]) || !Array.isArray(rules.dns)) return false;
+  const names = rules.dns.map((item) => {
+    const entry = asRecord(item);
+    return entry && hasOnlyKeys(entry, ["matchName"]) && typeof entry.matchName === "string"
+      ? entry.matchName
+      : undefined;
+  });
+  if (names.some((name) => name === undefined) || names.length !== expectedNames.length) return false;
+  const expected = [...expectedNames].sort();
+  return [...names].sort().every((name, index) => name === expected[index]);
+}
+
+function isExactPaperclipServerRule(
+  rule: Record<string, unknown>,
+  paperclipServerNamespace: string,
+): boolean {
+  if (!hasOnlyKeys(rule, ["toEndpoints", "toPorts"])) return false;
+  const endpoints = rule.toEndpoints;
+  const ports = rule.toPorts;
+  if (!Array.isArray(endpoints) || endpoints.length !== 1 || !Array.isArray(ports) || ports.length !== 1) return false;
+  const endpoint = asRecord(endpoints[0]);
+  const labels = endpoint && hasOnlyKeys(endpoint, ["matchLabels"]) ? asRecord(endpoint.matchLabels) : undefined;
+  const port = asRecord(ports[0]);
+  if (!labels || !hasExactEntries(labels, {
+    "k8s:io.kubernetes.pod.namespace": paperclipServerNamespace,
+    app: "paperclip-server",
+  }) || !port || !hasOnlyKeys(port, ["ports"])) return false;
+  return hasExactPortList(port.ports, [{ port: "3100", protocol: "TCP" }]);
+}
+
+function isExactFqdn443Rule(rule: Record<string, unknown>): boolean {
+  if (!hasOnlyKeys(rule, ["toFQDNs", "toPorts"])) return false;
+  const names = rule.toFQDNs;
+  const ports = rule.toPorts;
+  if (!Array.isArray(names) || names.length === 0 || !Array.isArray(ports) || ports.length !== 1) return false;
+  if (names.some((item) => {
+    const name = asRecord(item);
+    return !name || !hasOnlyKeys(name, ["matchName"]) || typeof name.matchName !== "string";
+  })) return false;
+  const port = asRecord(ports[0]);
+  return !!port && hasOnlyKeys(port, ["ports"]) && hasExactPortList(port.ports, [{ port: "443", protocol: "TCP" }]);
+}
+
+function hasExactPortList(value: unknown, expected: Array<{ port: string; protocol: string }>): boolean {
+  if (!Array.isArray(value) || value.length !== expected.length) return false;
+  const ports = value.map(asRecord);
+  if (ports.some((port) => !port || !hasOnlyKeys(port, ["port", "protocol"]))) return false;
+  const actual = ports.map((port) => `${port!.port}/${port!.protocol}`).sort();
+  const wanted = expected.map((item) => `${item.port}/${item.protocol}`).sort();
+  return actual.every((pair, index) => pair === wanted[index]);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function hasExactEntries(value: Record<string, unknown>, expected: Record<string, unknown>): boolean {
+  return Object.keys(value).length === Object.keys(expected).length &&
+    Object.entries(expected).every(([key, expectedValue]) => JSON.stringify(value[key]) === JSON.stringify(expectedValue));
+}
+
+function dnsPolicyMismatch(): Error {
+  return new Error("CiliumNetworkPolicy DNS rules do not match dnsQueryAllowFqdns; operator migration is required");
 }
 
 async function ensureCiliumNetworkPolicy(

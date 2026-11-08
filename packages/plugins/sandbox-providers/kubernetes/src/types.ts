@@ -4,12 +4,13 @@ import { KNOWN_ADAPTER_TYPES } from "./adapter-defaults.js";
 
 const canonicalDnsName =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const ipAddressLike = /^(?:0[xX][0-9a-fA-F]+|0[0-7]*|[0-9]+)(?:\.(?:0[xX][0-9a-fA-F]+|0[0-7]*|[0-9]+)){0,3}$/;
 const dnsQueryAllowFqdnsSchema = z
   .array(z.string().regex(canonicalDnsName, "DNS query names must be canonical lowercase hostnames"))
   .min(1, "dnsQueryAllowFqdns must contain at least one DNS name")
   .max(16, "dnsQueryAllowFqdns may contain at most 16 DNS names")
   .refine(
-    (names) => names.every((name) => !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(name)),
+    (names) => names.every((name) => !ipAddressLike.test(name)),
     "DNS query names cannot be IP addresses",
   )
   .refine((names) => new Set(names).size === names.length, "dnsQueryAllowFqdns entries must be unique");
