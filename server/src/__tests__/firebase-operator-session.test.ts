@@ -143,6 +143,67 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     return (token === null ? call : call.set("Authorization", `Bearer ${token}`)).timeout({ response: 20_000 });
   }
 
+  async function blockAssuranceInsert() {
+    const lockKey = 7_351_921;
+    await db.execute(sql.raw(`
+      create or replace function pclip_block_test_assurance() returns trigger
+      language plpgsql as $$ begin perform pg_advisory_xact_lock(${lockKey}); return new; end $$
+    `));
+    await db.execute(sql.raw(`
+      create trigger pclip_block_test_assurance before insert on firebase_operator_session_assurance
+      for each row execute function pclip_block_test_assurance()
+    `));
+    const blockerDb = createDb(temporary.connectionString);
+    let releaseLock!: () => void;
+    let signalLock!: () => void;
+    const blocked = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockAcquired = new Promise<void>((resolve) => { signalLock = resolve; });
+    const holding = blockerDb.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${lockKey})`);
+      signalLock();
+      await blocked;
+    });
+    let lockTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        lockAcquired,
+        new Promise<never>((_, reject) => { lockTimer = setTimeout(() => reject(new Error("assurance advisory lock was not acquired")), 10_000); }),
+      ]);
+    } finally {
+      if (lockTimer) clearTimeout(lockTimer);
+    }
+    let released = false;
+    let cleaned = false;
+    return {
+      async waitForInsert() {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const waits = await db.execute(sql`
+            select pid from pg_stat_activity
+            where wait_event_type = 'Lock' and query ilike '%firebase_operator_session_assurance%'
+          `) as unknown as Array<{ pid: number }>;
+          if (waits.length > 0) return true;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        return false;
+      },
+      async release() {
+        if (released) return;
+        released = true;
+        releaseLock();
+        await holding;
+      },
+      async cleanup() {
+        if (cleaned) return;
+        cleaned = true;
+        await this.release();
+        await blockerDb.$client.end();
+        await db.execute(sql.raw("drop trigger if exists pclip_block_test_assurance on firebase_operator_session_assurance"));
+        await db.execute(sql.raw("drop function if exists pclip_block_test_assurance()"));
+      },
+    };
+  }
+
   it("issues only the normal Better Auth cookie after durable assurance and returns safe metadata", async () => {
     const f = await fixture();
     const { app } = appFor(f, { cookieDomain: ".example.test" });
@@ -217,6 +278,62 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
     const correct = await exchange(app, started, started.body.state, PUBLIC);
     expect(correct.status).toBe(200);
+
+    const labStarted = await begin(app, LAB);
+    expect(labStarted.status).toBe(200);
+    const labExchange = await exchange(app, labStarted, labStarted.body.state, LAB);
+    expect(labExchange.status).toBe(200);
+    expect(labExchange.body).toEqual({ redirectTo: "/companies/current" });
+  });
+
+  it("rejects a persisted SDK session whose before-create hook changes its user, cleaning only that session", async () => {
+    const f = await fixture();
+    await db.execute(sql`insert into instance_user_roles (user_id, role) values (${f.creatorId}, 'instance_admin')`);
+    const existing = {
+      id: `unrelated-session-${randomUUID()}`,
+      token: `unrelated-token-${randomUUID()}`,
+      userId: f.creatorId,
+      createdAt: new Date(NOW - 60_000),
+      updatedAt: new Date(NOW - 60_000),
+      expiresAt: new Date(NOW + 60 * 60_000),
+    };
+    await db.insert(authSessions).values(existing);
+    const { app } = appFor(f, {
+      hooks: { session: { create: { before: async () => ({ data: { userId: f.creatorId } }) } } },
+    });
+    const started = await begin(app);
+    const response = await exchange(app, started, started.body.state);
+
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(response.headers["set-cookie"]?.join("\n") ?? "").not.toMatch(/session_token=[^;\s]+/);
+    const transaction = await db.select().from(firebaseOperatorLoginTransactions)
+      .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+    expect(transaction[0]?.consumedAt).toBeInstanceOf(Date);
+    const creatorSessions = await db.select().from(authSessions).where(eq(authSessions.userId, f.creatorId));
+    expect(creatorSessions).toHaveLength(1);
+    expect(creatorSessions[0]).toMatchObject({ id: existing.id, token: existing.token });
+    expect(await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.userId, f.userId))).toHaveLength(0);
+  });
+
+  it("rejects persisted SDK session timestamps changed by a before-create hook", async () => {
+    const f = await fixture();
+    const { app } = appFor(f, {
+      hooks: { session: { create: { before: async () => ({ data: {
+        createdAt: new Date(NOW - 60_000), expiresAt: new Date(NOW + 24 * 60 * 60_000),
+      } }) } } },
+    });
+    const started = await begin(app);
+    const response = await exchange(app, started, started.body.state);
+
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(response.headers["set-cookie"]?.join("\n") ?? "").not.toMatch(/session_token=[^;\s]+/);
+    const transaction = await db.select().from(firebaseOperatorLoginTransactions)
+      .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+    expect(transaction[0]?.consumedAt).toBeInstanceOf(Date);
+    expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
+    expect(await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.userId, f.userId))).toHaveLength(0);
   });
 
   it("rejects extra exchange fields and any bearer token placed in the URL or body", async () => {
@@ -250,6 +367,38 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     const transactions = await db.select().from(firebaseOperatorLoginTransactions)
       .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
     expect(transactions[0]?.consumedAt).toBeNull();
+  });
+
+  it("denies a whitespace-padded exchange parsed by an earlier 10 MB JSON middleware", async () => {
+    const f = await fixture();
+    const verifier = vi.fn(async () => proof({ uid: f.uid }));
+    const { app, auth } = appFor(f, { verify: verifier });
+    const started = await begin(app);
+    const wrongOrder = express();
+    wrongOrder.use(express.json({ limit: "10mb" }));
+    wrongOrder.use(firebaseOperatorPreAuthRequestHandler({ trustedOrigins: new Set([PUBLIC, LAB]) }));
+    wrongOrder.all("/api/auth/*splat", (req, res, next) => {
+      void Promise.resolve(toNodeHandler(auth)(req, res)).catch(next);
+    });
+    wrongOrder.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      res.status(500).json({ error: String(error) });
+    });
+
+    const cookie = started.headers["set-cookie"]?.[0]?.split(";")[0] ?? "";
+    const valid = JSON.stringify({ transactionId: started.body.transactionId, state: started.body.state });
+    const padded = `${valid}${" ".repeat(5000)}`;
+    expect(Buffer.byteLength(padded)).toBeGreaterThan(4096);
+    const response = await request(wrongOrder).post("/api/auth/firebase-session/exchange")
+      .set("Origin", PUBLIC).set("Host", new URL(PUBLIC).host).set("Cookie", cookie)
+      .set("Authorization", `Bearer ${TOKEN_SENTINEL}`).set("Content-Type", "application/json")
+      .send(padded);
+
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(response.headers["set-cookie"]?.join("\n") ?? "").not.toMatch(/session_token=[^;\s]+/);
+    expect(verifier).not.toHaveBeenCalled();
+    const transaction = await db.select().from(firebaseOperatorLoginTransactions)
+      .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+    expect(transaction[0]?.consumedAt).toBeNull();
   });
 
   it.each([
@@ -325,6 +474,108 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
       await pending?.catch(() => undefined);
       await holding;
       await blockerDb.$client.end();
+    }
+  });
+
+  it("rechecks auth_time after an actual PostgreSQL assurance INSERT wait", async () => {
+    const f = await fixture();
+    let clock = NOW;
+    const authTimeSeconds = Math.floor(NOW / 1000) - 299;
+    const verifier = vi.fn(async () => proof({ uid: f.uid, authTimeSeconds, checkedAtMs: NOW }));
+    const { app } = appFor(f, { now: () => clock, verify: verifier });
+    const started = await begin(app);
+    const assuranceBlock = await blockAssuranceInsert();
+    let pending: Promise<request.Response> | undefined;
+    try {
+      pending = exchange(app, started, started.body.state);
+      expect(await assuranceBlock.waitForInsert()).toBe(true);
+      expect(verifier).toHaveBeenCalledOnce();
+      clock = NOW + 2_000;
+      expect(clock - authTimeSeconds * 1000).toBeGreaterThan(300_000);
+      expect(clock - NOW).toBeLessThanOrEqual(60_000);
+      expect(clock).toBeLessThan(new Date(started.body.expiresAt).getTime());
+      await assuranceBlock.release();
+      const response = await pending;
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(response.headers["set-cookie"]?.join("\n") ?? "").not.toMatch(/session_token=[^;\s]+/);
+      expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
+      expect(await db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.userId, f.userId))).toHaveLength(0);
+      const transaction = await db.select().from(firebaseOperatorLoginTransactions)
+        .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+      expect(transaction[0]?.consumedAt).toBeInstanceOf(Date);
+    } finally {
+      await assuranceBlock.release();
+      await pending?.catch(() => undefined);
+      await assuranceBlock.cleanup();
+    }
+  });
+
+  it("rechecks the independent 60-second verifier freshness boundary after assurance INSERT waits", async () => {
+    const f = await fixture();
+    let clock = NOW;
+    const verifier = vi.fn(async () => proof({ uid: f.uid, authTimeSeconds: Math.floor((NOW - 59_000) / 1000), checkedAtMs: NOW - 59_000 }));
+    const { app } = appFor(f, { now: () => clock, verify: verifier });
+    const started = await begin(app);
+    const assuranceBlock = await blockAssuranceInsert();
+    let pending: Promise<request.Response> | undefined;
+    try {
+      pending = exchange(app, started, started.body.state);
+      expect(await assuranceBlock.waitForInsert()).toBe(true);
+      clock = NOW + 2_000;
+      expect(clock - (NOW - 59_000)).toBeGreaterThan(60_000);
+      expect(clock - Math.floor((NOW - 59_000) / 1000) * 1000).toBeLessThanOrEqual(300_000);
+      expect(clock).toBeLessThan(new Date(started.body.expiresAt).getTime());
+      await assuranceBlock.release();
+      const response = await pending;
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(response.headers["set-cookie"]?.join("\n") ?? "").not.toMatch(/session_token=[^;\s]+/);
+      expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
+      expect(await db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.userId, f.userId))).toHaveLength(0);
+      const transaction = await db.select().from(firebaseOperatorLoginTransactions)
+        .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+      expect(transaction[0]?.consumedAt).toBeInstanceOf(Date);
+    } finally {
+      await assuranceBlock.release();
+      await pending?.catch(() => undefined);
+      await assuranceBlock.cleanup();
+    }
+  });
+
+  it("rechecks the independent 300-second transaction expiry after assurance INSERT waits", async () => {
+    const f = await fixture();
+    let clock = NOW;
+    const verifier = vi.fn(async () => {
+      clock = NOW + 299_000;
+      return proof({ uid: f.uid, authTimeSeconds: Math.floor(clock / 1000), checkedAtMs: clock });
+    });
+    const { app } = appFor(f, { now: () => clock, verify: verifier });
+    const started = await begin(app);
+    const assuranceBlock = await blockAssuranceInsert();
+    let pending: Promise<request.Response> | undefined;
+    try {
+      pending = exchange(app, started, started.body.state);
+      expect(await assuranceBlock.waitForInsert()).toBe(true);
+      expect(clock).toBeLessThan(new Date(started.body.expiresAt).getTime());
+      clock = NOW + 301_000;
+      expect(clock).toBeGreaterThanOrEqual(new Date(started.body.expiresAt).getTime());
+      expect(clock - Math.floor((NOW + 299_000) / 1000) * 1000).toBeLessThanOrEqual(60_000);
+      expect(clock - Math.floor((NOW + 299_000) / 1000) * 1000).toBeLessThanOrEqual(300_000);
+      await assuranceBlock.release();
+      const response = await pending;
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(response.headers["set-cookie"]?.join("\n") ?? "").not.toMatch(/session_token=[^;\s]+/);
+      expect(await db.select().from(authSessions).where(eq(authSessions.userId, f.userId))).toHaveLength(0);
+      expect(await db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.userId, f.userId))).toHaveLength(0);
+      const transaction = await db.select().from(firebaseOperatorLoginTransactions)
+        .where(eq(firebaseOperatorLoginTransactions.id, started.body.transactionId));
+      expect(transaction[0]?.consumedAt).toBeInstanceOf(Date);
+    } finally {
+      await assuranceBlock.release();
+      await pending?.catch(() => undefined);
+      await assuranceBlock.cleanup();
     }
   });
 
