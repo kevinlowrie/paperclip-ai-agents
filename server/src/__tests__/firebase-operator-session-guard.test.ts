@@ -1477,7 +1477,8 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     const sameUserSession = await addSameUserAssuredSession(fixture);
     const unrelated = await assuredUser();
     let clock = Date.now();
-    const deadlines = await setCoherentGuardDeadlines(fixture, clock, "live");
+    const deadlines = await setCoherentGuardDeadlines(fixture, clock, "idle");
+    const originalIdleDeadlineMs = deadlines.lastInteractiveAt.getTime() + 30 * 60_000;
     const [configuredAssurance] = await db.select().from(firebaseOperatorSessionAssurance)
       .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
     const beforeMembershipsAndGrants = await cloudSideEffects(fixture.userId);
@@ -1501,15 +1502,19 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     try {
       pending = guard.check({ sessionId: fixture.session.id, userId: fixture.userId, companyId: fixture.companyId });
       await providerStarted;
+      expect(originalIdleDeadlineMs).toBe(lookupStartedAt + 1_000);
       // Model an authorized interactive action committed during provider latency.
       // The timestamp is advanced with the injected clock; this is fixture setup,
       // not a claim about a UI or a human-presence signal.
-      clock = lookupStartedAt + 30_000;
+      clock = lookupStartedAt + 500;
+      expect(clock).toBeLessThan(originalIdleDeadlineMs);
       const refreshedAt = new Date(clock);
       await db.update(firebaseOperatorSessionAssurance)
         .set({ lastInteractiveAt: refreshedAt })
         .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
       clock = lookupStartedAt + 60_001;
+      expect(originalIdleDeadlineMs).toBeLessThanOrEqual(clock);
+      expect(clock).toBeLessThan(refreshedAt.getTime() + 30 * 60_000);
       assertDeadlineIsolation({
         target: "provider",
         checkedAtMs: lookupStartedAt,
