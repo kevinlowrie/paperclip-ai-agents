@@ -45,7 +45,7 @@ export const SUPPORTED_MANAGED_CONFIG_VERSION = 1;
 
 export interface ManagedInstanceConfig {
   v: typeof SUPPORTED_MANAGED_CONFIG_VERSION;
-  mode: "cloud";
+  mode: "cloud" | "operator";
   /** App feature-catalog version the document was validated against. */
   catalogVersion: string;
   features: Readonly<Partial<Record<ManagedExperimentalFeatureKey, boolean>>>;
@@ -82,20 +82,20 @@ export interface ManagedEnvironmentSpec {
  */
 export const SECRET_LIKE_CONFIG_KEY_PATTERN = /(api[-_]?key|token|secret|password|credential)/i;
 
-function findSecretLikeConfigKey(value: Record<string, unknown>, path: string): string | null {
+function findSecretLikeConfigKey(value: unknown, path: string): string | null {
+  if (Array.isArray(value)) {
+    for (const [index, element] of value.entries()) {
+      const nested = findSecretLikeConfigKey(element, `${path}[${index}]`);
+      if (nested) return nested;
+    }
+    return null;
+  }
+  if (!isPlainObject(value)) return null;
   for (const [key, child] of Object.entries(value)) {
     const childPath = path.length > 0 ? `${path}.${key}` : key;
     if (SECRET_LIKE_CONFIG_KEY_PATTERN.test(key)) return childPath;
-    if (isPlainObject(child)) {
-      const nested = findSecretLikeConfigKey(child, childPath);
-      if (nested) return nested;
-    } else if (Array.isArray(child)) {
-      for (const [index, element] of child.entries()) {
-        if (!isPlainObject(element)) continue;
-        const nested = findSecretLikeConfigKey(element, `${childPath}[${index}]`);
-        if (nested) return nested;
-      }
-    }
+    const nested = findSecretLikeConfigKey(child, childPath);
+    if (nested) return nested;
   }
   return null;
 }
@@ -140,6 +140,9 @@ function describeJsonValue(value: unknown): string {
  */
 export function parseManagedConfigEnv(env: ManagedConfigEnv): ManagedInstanceConfig | null {
   const raw = env[MANAGED_CONFIG_ENV_KEY];
+  if (raw !== undefined && env.PAPERCLIP_OPERATOR_CONFIG !== undefined) {
+    throw new Error("ambiguous Cloud and operator runtime configuration");
+  }
   if (raw === undefined) return null;
   if (raw.trim().length === 0) {
     fail(
@@ -347,6 +350,9 @@ export function getManagedInstanceConfig(
   env: ManagedConfigEnv = process.env,
 ): ManagedInstanceConfig | null {
   const raw = env[MANAGED_CONFIG_ENV_KEY];
+  if (raw !== undefined && env.PAPERCLIP_OPERATOR_CONFIG !== undefined) {
+    throw new Error("ambiguous Cloud and operator runtime configuration");
+  }
   if (cache && cache.raw === raw) return cache.config;
   const config = parseManagedConfigEnv(env);
   cache = { raw, config };

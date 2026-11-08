@@ -22,6 +22,9 @@ const mockPluginLoader = vi.hoisted(() => ({
   reloadExternalAdapter: vi.fn(),
 }));
 
+const mockExecFile = vi.hoisted(() => vi.fn());
+const mockSpawn = vi.hoisted(() => vi.fn());
+
 const overridingConfigSchemaAdapter: ServerAdapterModule = {
   type: "claude_local",
   execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
@@ -50,9 +53,13 @@ let findActiveServerAdapter: typeof import("../adapters/registry.js").findActive
 let setOverridePaused: typeof import("../adapters/registry.js").setOverridePaused;
 let adapterRoutes: typeof import("../routes/adapters.js").adapterRoutes;
 let errorHandler: typeof import("../middleware/index.js").errorHandler;
+let originalOperatorConfig: string | undefined;
 
 function registerModuleMocks() {
-  vi.doMock("node:child_process", async () => vi.importActual("node:child_process"));
+  vi.doMock("node:child_process", async () => {
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    return { ...actual, execFile: mockExecFile, spawn: mockSpawn };
+  });
   vi.doMock("../adapters/plugin-loader.js", () => mockPluginLoader);
   vi.doMock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
   vi.doMock("../routes/adapters.js", async () => vi.importActual("../routes/adapters.js"));
@@ -84,6 +91,7 @@ function createApp(
 
 describe("adapter routes", () => {
   beforeEach(async () => {
+    originalOperatorConfig = process.env.PAPERCLIP_OPERATOR_CONFIG;
     vi.resetModules();
     vi.doUnmock("node:child_process");
     vi.doUnmock("../adapters/registry.js");
@@ -93,6 +101,12 @@ describe("adapter routes", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
+    mockExecFile.mockReset().mockImplementation((...args: unknown[]) => {
+      const callback = args.at(-1);
+      if (typeof callback === "function") callback(new Error("blocked by adapter test harness"), "", "");
+      return {};
+    });
+    mockSpawn.mockReset().mockReturnValue({});
     mockAdapterPluginStore.listAdapterPlugins.mockReturnValue([]);
     mockAdapterPluginStore.addAdapterPlugin.mockResolvedValue(undefined);
     mockAdapterPluginStore.removeAdapterPlugin.mockReturnValue(false);
@@ -124,9 +138,32 @@ describe("adapter routes", () => {
   });
 
   afterEach(() => {
+    if (originalOperatorConfig === undefined) delete process.env.PAPERCLIP_OPERATOR_CONFIG;
+    else process.env.PAPERCLIP_OPERATOR_CONFIG = originalOperatorConfig;
     setOverridePaused("claude_local", false);
     unregisterServerAdapter("hermes_local");
     unregisterServerAdapter("claude_local");
+  });
+
+  it("keeps external adapter installation blocked under operator policy", async () => {
+    process.env.PAPERCLIP_OPERATOR_CONFIG = JSON.stringify({
+      v: 1,
+      mode: "operator",
+      catalogVersion: "2026.720.0",
+      features: {},
+      plugins: { autoInstall: ["kubernetes"] },
+      environments: [],
+    });
+    const app = createApp({ isInstanceAdmin: true, source: "session" });
+
+    const res = await request(app)
+      .post("/api/adapters/install")
+      .send({ packageName: "untrusted-paperclip-adapter" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.details).toMatchObject({ code: "adapter_install_platform_managed" });
+    expect(mockExecFile).not.toHaveBeenCalled();
+    expect(mockSpawn).not.toHaveBeenCalled();
   });
 
   it("GET /api/adapters includes capabilities object for each adapter", async () => {

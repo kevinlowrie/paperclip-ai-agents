@@ -33,6 +33,7 @@ import {
 import { conflict, forbidden } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
+import { isOperatorManagedInstance } from "./operator-config.js";
 import {
   resourceStatus,
   stockHash,
@@ -966,7 +967,7 @@ export function environmentService(db: Db) {
         throw new Error("Failed to ensure local environment");
       }
       const existingMetadata = (existing.metadata ?? {}) as Record<string, unknown>;
-      if (isCloudManagedInstance() && existingMetadata.managedByPaperclip !== true) {
+      if ((isCloudManagedInstance() || isOperatorManagedInstance()) && existingMetadata.managedByPaperclip !== true) {
         const adopted = await db
           .update(environments)
           .set({

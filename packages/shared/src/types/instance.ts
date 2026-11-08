@@ -160,17 +160,18 @@ export type ManagedExperimentalFeatureKey = {
 }[keyof InstanceExperimentalSettings];
 
 export const PAPERCLIP_CLOUD_MANAGED_BY = "paperclip-cloud" as const;
+export const PAPERCLIP_OPERATOR_MANAGED_BY = "operator" as const;
 
-/** Per-key metadata attached to settings responses for cloud-overlaid keys. */
+/** Per-key metadata attached to settings responses for runtime-policy keys. */
 export interface ManagedSettingMetadata {
   managed: true;
-  managedBy: typeof PAPERCLIP_CLOUD_MANAGED_BY;
+  managedBy: typeof PAPERCLIP_CLOUD_MANAGED_BY | typeof PAPERCLIP_OPERATOR_MANAGED_BY;
 }
 
 /**
- * Experimental settings as returned by the settings API. On cloud-managed
- * instances (`PAPERCLIP_MANAGED_CONFIG` present) `managedKeys` lists every key
- * whose value is overlaid by the harness; self-hosted responses omit it.
+ * Experimental settings as returned by the settings API. On Cloud- or
+ * operator-managed instances, `managedKeys` identifies keys overlaid by the
+ * active runtime policy; unmanaged responses omit it.
  */
 export interface InstanceExperimentalSettingsWithManaged extends InstanceExperimentalSettings {
   managedKeys?: Partial<Record<ManagedExperimentalFeatureKey, ManagedSettingMetadata>>;

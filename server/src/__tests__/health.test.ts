@@ -116,6 +116,26 @@ describe("GET /health", () => {
     });
   });
 
+  it("does not expose Cloud identity or operator policy data on operator-managed health", async () => {
+    const app = createApp(undefined, testServerInfo, undefined, {
+      PAPERCLIP_OPERATOR_CONFIG: JSON.stringify({
+        v: 1,
+        mode: "operator",
+        catalogVersion: "2026.720.0",
+        features: { enablePipelines: true },
+        plugins: { autoInstall: ["kubernetes"] },
+        environments: [{ name: "Sandbox", provider: "kubernetes", config: { image: "runner:v1" } }],
+      }),
+    });
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty("cloud");
+    expect(JSON.stringify(res.body)).not.toContain("operator");
+    expect(JSON.stringify(res.body)).not.toContain("runner:v1");
+  });
+
   it("lists operator-hidden settings and drops unknown keys", async () => {
     const app = createApp(undefined, testServerInfo, undefined, {
       PAPERCLIP_HIDDEN_SETTINGS: "instance.plugins,instance.adapters,instance.bogus",

@@ -52,10 +52,7 @@ import {
   migrationRefusalError,
   shouldReportStartupFailure,
 } from "./startup-refusals.js";
-import {
-  getManagedInstanceConfig,
-  type ManagedInstanceConfig,
-} from "./services/managed-config.js";
+import { getRuntimeInstancePolicy, type RuntimeInstancePolicy } from "./services/operator-config.js";
 import { getOperatorSettingDefaults } from "./services/setting-defaults.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
@@ -752,7 +749,7 @@ async function startServerWithDatabaseTeardown(
     serverPort: listenPort,
     databasePort: resolvedEmbeddedPostgresPort,
   });
-  // Cloud managed-config contract (harness → app). Parse PAPERCLIP_MANAGED_CONFIG
+  // Managed runtime policy contract. Parse the Cloud or self-host operator config
   // once so a malformed document (blank value, bad JSON, unknown feature key,
   // unsupported v, missing section) refuses startup with a precise error instead
   // of silently running without the feature overlay. Absent env = self-hosted:
@@ -760,9 +757,9 @@ async function startServerWithDatabaseTeardown(
   // overlays it per read. This MUST run before any instanceSettingsService(db)
   // construction — that constructor parses the same env, and it would otherwise
   // throw first, bypassing this fail-closed log path.
-  let managedConfig: ManagedInstanceConfig | null;
+  let managedConfig: RuntimeInstancePolicy | null;
   try {
-    managedConfig = getManagedInstanceConfig();
+    managedConfig = getRuntimeInstancePolicy();
     if (managedConfig) {
       logger.warn(
         {
@@ -770,11 +767,11 @@ async function startServerWithDatabaseTeardown(
           managedFeatureKeys: Object.keys(managedConfig.features).sort(),
           autoInstallPlugins: [...managedConfig.plugins.autoInstall],
         },
-        "cloud managed configuration active",
+        `${managedConfig.mode} managed configuration active`,
       );
     }
   } catch (err) {
-    logger.error({ err }, "invalid PAPERCLIP_MANAGED_CONFIG; refusing to start (fail closed)");
+    logger.error({ err }, "invalid managed runtime configuration; refusing to start (fail closed)");
     throw err;
   }
 

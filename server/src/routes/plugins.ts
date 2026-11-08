@@ -89,6 +89,7 @@ import {
   isWithinBundledPluginRoot,
 } from "../services/plugin-install-guard.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { isOperatorManagedInstance } from "../services/operator-config.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
@@ -1172,13 +1173,16 @@ export function pluginRoutes(
       return;
     }
 
-    // Cloud install floor: on harness-managed instances only bundled-catalog
-    // sources are installable, regardless of actor privileges or flag state.
+    // Managed-code install floor: Cloud and self-host operator instances only
+    // accept bundled-catalog sources, regardless of actor or flag state.
     const cloudManaged = isCloudManagedInstance();
-    if (cloudManaged && !isLocalPath) {
+    const operatorManaged = !cloudManaged && isOperatorManagedInstance();
+    const installRestricted = cloudManaged || operatorManaged;
+    if (installRestricted && !isLocalPath) {
       res.status(403).json({
-        error:
-          "npm installs are disabled on cloud-managed instances; only plugins bundled with the application may be installed",
+        error: operatorManaged
+          ? "npm installs are disabled on operator-managed instances; only plugins bundled with the application may be installed"
+          : "npm installs are disabled on cloud-managed instances; only plugins bundled with the application may be installed",
       });
       return;
     }
@@ -1192,10 +1196,11 @@ export function pluginRoutes(
         res.status(400).json({ error: `Invalid localPath: ${validated.reason}` });
         return;
       }
-      if (cloudManaged && !(await isWithinBundledPluginRoot(validated.canonicalPath))) {
+      if (installRestricted && !(await isWithinBundledPluginRoot(validated.canonicalPath))) {
         res.status(403).json({
-          error:
-            "cloud-managed instances may only install plugins from the bundled plugin catalog",
+          error: operatorManaged
+            ? "operator-managed instances may only install plugins from the bundled plugin catalog"
+            : "cloud-managed instances may only install plugins from the bundled plugin catalog",
         });
         return;
       }

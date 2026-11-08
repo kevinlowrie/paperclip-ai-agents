@@ -24,6 +24,25 @@ show an error rather than treating the user as signed out.
 Self-hosted authenticated instances retain their instance sign-in form, and
 `local_trusted` instances retain their normal access path.
 
+### Self-host operator policy
+
+An operator-managed self-hosted instance may receive `PAPERCLIP_OPERATOR_CONFIG`
+with the versioned v1 document (`mode: "operator"`, `v`, `catalogVersion`,
+`features`, `plugins.autoInstall`, and optional `environments`). It applies
+read-time feature overlays, positive bundled-plugin provisioning, and managed
+environment controls without asserting Cloud ownership. The same strict
+catalog, unknown-key, provider-coherence, and recursive secret-like-key checks
+apply; provider credentials remain process secrets and never belong in this
+document. The variable is mutually exclusive with `PAPERCLIP_MANAGED_CONFIG`
+and a nonblank Cloud tenant token.
+
+Operator mode retains sandbox-only execution, bundled plugin and adapter-code
+floors, managed environment edit/delete/marker protections, and redaction.
+Cloud-only actor/header trust, tenant company identity, Cloud sign-in, and
+Cloud-only company/import, backup, bootstrap, and lifecycle behavior remain
+Cloud-only. Operator mode does not create a Paperclip session or authorize a
+user; authenticated operator enrollment remains a separate identity contract.
+
 ## 1. Purpose
 
 Paperclip supports two runtime modes:

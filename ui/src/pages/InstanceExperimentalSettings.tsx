@@ -59,11 +59,11 @@ function formatActivationTimestamp(iso: string): string {
 // PAP-11233: keep Conference Room code intact, but hide the user-facing opt-in for now.
 const SHOW_CONFERENCE_ROOM_EXPERIMENTAL_SETTING = false;
 
-function ManagedByCloudBadge() {
+function ManagedByBadge({ managedBy }: { managedBy: ManagedSettingMetadata["managedBy"] }) {
   return (
     <Badge variant="outline" className="text-muted-foreground">
       <Lock aria-hidden="true" />
-      Managed by Paperclip Cloud
+      {managedBy === "operator" ? "Managed by operator" : "Managed by Paperclip Cloud"}
     </Badge>
   );
 }
@@ -99,7 +99,7 @@ function ExperimentalToggleCard({
         <div className="space-y-1.5">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-sm font-semibold">{title}</h3>
-            {isManaged ? <ManagedByCloudBadge /> : null}
+            {isManaged ? <ManagedByBadge managedBy={managed?.managedBy ?? "paperclip-cloud"} /> : null}
           </div>
           <p className="max-w-2xl text-sm text-muted-foreground">{description}</p>
           {footnote ? <p className="max-w-2xl text-xs text-muted-foreground">{footnote}</p> : null}
@@ -191,8 +191,8 @@ export function InstanceExperimentalSettings() {
   }
 
   const inWorktree = isWorktreeRuntime();
-  // Present only on cloud-managed instances: keys the managed overlay controls
-  // render locked with the "Managed by Paperclip Cloud" badge. Self-hosted
+  // Present only when a runtime policy controls a key; those toggles render
+  // locked with the policy owner's badge. Unmanaged
   // responses carry no `managedKeys`, so every card stays editable.
   const managedKeys = experimentalQuery.data?.managedKeys ?? {};
   const enableWorktreeRunExecution = experimentalQuery.data?.enableWorktreeRunExecution === true;
@@ -591,7 +591,7 @@ export function InstanceExperimentalSettings() {
                   <div className="space-y-1.5">
                     <div className="flex flex-wrap items-center gap-2">
                       <h3 className="text-sm font-semibold">Run tasks in this worktree</h3>
-                      {worktreeRunExecutionManaged ? <ManagedByCloudBadge /> : null}
+                      {worktreeRunExecutionManaged ? <ManagedByBadge managedBy={managedKeys.enableWorktreeRunExecution?.managedBy ?? "paperclip-cloud"} /> : null}
                     </div>
                     <p className="max-w-2xl text-sm text-muted-foreground">
                       This is an isolated git-worktree preview instance. Turn this on to let the scheduler execute runs

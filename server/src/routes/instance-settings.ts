@@ -12,6 +12,7 @@ import {
   getCloudStackContext,
   isCloudManagedInstance,
 } from "../services/cloud-instance.js";
+import { isOperatorManagedInstance } from "../services/operator-config.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
@@ -204,15 +205,22 @@ export function instanceSettingsRoutes(db: Db) {
       // never provisioned. Same-value writes pass so settings forms that echo
       // the full general-settings object keep working. Absent and "any" both
       // mean unrestricted, so they compare equal.
+      const cloudManaged = isCloudManagedInstance();
+      const executionModeManaged = cloudManaged || isOperatorManagedInstance();
       if (
-        isCloudManagedInstance() &&
+        executionModeManaged &&
         Object.prototype.hasOwnProperty.call(req.body, "executionMode")
       ) {
         const current = await svc.getGeneral();
         if ((req.body.executionMode ?? "any") !== (current.executionMode ?? "any")) {
-          throw forbidden("executionMode is platform-managed on cloud-managed instances", {
+          throw forbidden(
+            cloudManaged
+              ? "executionMode is platform-managed on cloud-managed instances"
+              : "executionMode is managed by the operator on this instance",
+            {
             code: "execution_mode_platform_managed",
-          });
+            },
+          );
         }
       }
       const hidden = getHiddenSettings();

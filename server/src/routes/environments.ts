@@ -18,7 +18,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, forbidden, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
-import { getManagedInstanceConfig, SECRET_LIKE_CONFIG_KEY_PATTERN } from "../services/managed-config.js";
+import { getRuntimeInstancePolicy, SECRET_LIKE_CONFIG_KEY_PATTERN } from "../services/operator-config.js";
 import { parseExecutionPolicyBootstrapEnv } from "../services/execution-policy-bootstrap.js";
 import { isExecutionForcedToKubernetes } from "../services/execution-allowlist.js";
 import { validate } from "../middleware/validate.js";
@@ -61,6 +61,10 @@ import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { closeWarmNativeSessionsForEnvironment } from "../services/native-runtime/native-session-executor.js";
 
+function isManagedPolicyActive(): boolean {
+  return isCloudManagedInstance() || getRuntimeInstancePolicy()?.mode === "operator";
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -80,25 +84,23 @@ export function isPlatformProvisionedEnvironment(environment: {
   );
 }
 
-function redactSecretLikeConfigKeys(value: Record<string, unknown>): Record<string, unknown> {
+function redactSecretLikeConfigValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSecretLikeConfigValue);
+  if (!isPlainRecord(value)) return value;
   const result: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
     if (SECRET_LIKE_CONFIG_KEY_PATTERN.test(key)) continue;
-    if (isPlainRecord(child)) {
-      result[key] = redactSecretLikeConfigKeys(child);
-    } else if (Array.isArray(child)) {
-      result[key] = child.map((element) =>
-        isPlainRecord(element) ? redactSecretLikeConfigKeys(element) : element,
-      );
-    } else {
-      result[key] = child;
-    }
+    result[key] = redactSecretLikeConfigValue(child);
   }
   return result;
 }
 
+function redactSecretLikeConfigKeys(value: Record<string, unknown>): Record<string, unknown> {
+  return redactSecretLikeConfigValue(value) as Record<string, unknown>;
+}
+
 /**
- * Floor view of a platform-provisioned environment on a cloud-managed
+ * Floor view of a platform-provisioned environment on a managed
  * instance: credential-shaped config keys are never echoed — to ANY actor,
  * including instance admins — while structural config (provider, image,
  * template, region, ...) and the managed markers in `metadata` stay
@@ -164,7 +166,7 @@ const PLATFORM_PROVISIONED_MARKER_KEYS = [
  */
 function isManagedSandboxProvisioningConfigured(): boolean {
   try {
-    if ((getManagedInstanceConfig()?.environments.length ?? 0) > 0) return true;
+    if ((getRuntimeInstancePolicy()?.environments.length ?? 0) > 0) return true;
   } catch {
     return true;
   }
@@ -286,7 +288,7 @@ async function assertPlatformProvisionedEnvironmentWritable(
     isForcedKubernetesExecution: () => Promise<boolean>;
   },
 ): Promise<void> {
-  if (!isCloudManagedInstance() || !isPlatformProvisionedEnvironment(environment)) return;
+  if (!isManagedPolicyActive() || !isPlatformProvisionedEnvironment(environment)) return;
   if (
     options !== undefined &&
     isPlatformMarkerClearOnlyPatch(options.patchBody) &&
@@ -297,9 +299,14 @@ async function assertPlatformProvisionedEnvironmentWritable(
     isTenantEnvVarsOnlyPatch(options.patchBody) &&
     isTenantEditableManagedSandbox(environment)
   ) return;
-  throw forbidden("Platform-provisioned environments are platform-managed on cloud-managed instances", {
+  throw forbidden(
+    isCloudManagedInstance()
+      ? "Platform-provisioned environments are platform-managed on cloud-managed instances"
+      : "Platform-provisioned environments are managed by the operator on this instance",
+    {
     code: "environment_platform_managed",
-  });
+    },
+  );
 }
 
 /**
@@ -311,11 +318,13 @@ async function assertPlatformProvisionedEnvironmentWritable(
  * Clearing (null/false) is allowed so stale markers can be removed.
  */
 function assertNoClientPlatformProvisionedMarkers(metadata: unknown): void {
-  if (!isCloudManagedInstance() || !isPlainRecord(metadata)) return;
+  if (!isManagedPolicyActive() || !isPlainRecord(metadata)) return;
   for (const key of PLATFORM_PROVISIONED_MARKER_KEYS) {
     if (metadata[key] !== undefined && metadata[key] !== null && metadata[key] !== false) {
       throw unprocessable(
-        `metadata.${key} is reserved to the platform on cloud-managed instances`,
+        isCloudManagedInstance()
+          ? `metadata.${key} is reserved to the platform on cloud-managed instances`
+          : `metadata.${key} is reserved to the operator on this instance`,
         { code: "environment_platform_marker_reserved" },
       );
     }
@@ -404,7 +413,7 @@ export function environmentRoutes(
     // no secrets by the managed-config contract) but never env vars — the
     // same envVars posture the restricted view applies to every other
     // environment, since tenant env vars can carry pasted credentials.
-    if (isCloudManagedInstance() && isPlatformProvisionedEnvironment(environment)) {
+    if (isManagedPolicyActive() && isPlatformProvisionedEnvironment(environment)) {
       const floored = applyPlatformProvisionedEnvironmentFloor(environment);
       if (canReadFullInstanceEnvironment(req)) {
         return floored;

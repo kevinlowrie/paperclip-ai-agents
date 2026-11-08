@@ -339,6 +339,16 @@ describe("parseManagedConfigEnv environments section", () => {
       ),
     ).toThrow(/adapters\[0\].clientSecret/);
   });
+
+  it("rejects credential keys inside arbitrarily nested arrays", () => {
+    expect(() =>
+      parseManagedConfigEnv(
+        envWith(validDoc({
+          environments: [entry({ config: { nested: [[{ apiToken: "synthetic" }]] } })],
+        })),
+      ),
+    ).toThrow(/nested\[0\]\[0\].apiToken/);
+  });
 });
 
 describe("getManagedInstanceConfig", () => {

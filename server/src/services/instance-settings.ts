@@ -15,6 +15,7 @@ import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   DEFAULT_BACKUP_RETENTION,
   PAPERCLIP_CLOUD_MANAGED_BY,
+  PAPERCLIP_OPERATOR_MANAGED_BY,
   instanceGeneralSettingsSchema,
   type InstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
@@ -33,7 +34,8 @@ import {
   stripOperatorGeneralEchoes,
 } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
-import { getManagedInstanceConfig, type ManagedInstanceConfig } from "./managed-config.js";
+import type { ManagedInstanceConfig } from "./managed-config.js";
+import { getRuntimeInstancePolicy } from "./operator-config.js";
 import { getOperatorSettingDefaults } from "./setting-defaults.js";
 
 const DEFAULT_SINGLETON_KEY = "default";
@@ -336,7 +338,7 @@ export function applyManagedExperimentalOverlay(
     // document during rollout, but never let retired flags disable Apps or MCP aggregators.
     if (key === "enableApps" || key === "enableMcpAggregators") continue;
     next[key] = value;
-    managedKeys[key] = { managed: true, managedBy: PAPERCLIP_CLOUD_MANAGED_BY };
+    managedKeys[key] = { managed: true, managedBy: managedConfig.mode === "operator" ? PAPERCLIP_OPERATOR_MANAGED_BY : PAPERCLIP_CLOUD_MANAGED_BY };
   }
   return { experimental: next, managedKeys };
 }
@@ -395,7 +397,7 @@ export function stripCloudCatalogDefaultEchoes(
   next: InstanceExperimentalSettings,
   managedConfig: ManagedInstanceConfig | null,
 ): Partial<InstanceExperimentalSettings> {
-  if (!managedConfig) return next;
+  if (!managedConfig || managedConfig.mode !== "cloud") return next;
   const stored =
     rawStored && typeof rawStored === "object" && !Array.isArray(rawStored)
       ? (rawStored as Record<string, unknown>)
@@ -420,7 +422,7 @@ export function stripCloudCatalogDefaultEchoes(
 export function instanceSettingsService(db: Db, options: InstanceSettingsServiceOptions = {}) {
   // Fail closed: a malformed PAPERCLIP_MANAGED_CONFIG throws here (and at
   // boot in index.ts) rather than silently running without the overlay.
-  const managedConfig = getManagedInstanceConfig(options.runtimeEnv ?? process.env);
+  const managedConfig = getRuntimeInstancePolicy(options.runtimeEnv ?? process.env);
   // Same posture for PAPERCLIP_SETTING_DEFAULTS: parsed once, applied per
   // read, never persisted (see applyOperatorGeneralDefaults) — including on
   // the write path, where a full-GET echo of the overlaid value is stripped
@@ -433,7 +435,9 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
 
   function toExperimentalView(raw: unknown): InstanceExperimentalSettingsWithManaged {
     const { experimental, managedKeys } = applyManagedExperimentalOverlay(
-      applyCloudCatalogDefaults(normalizeExperimentalSettings(raw), raw, managedConfig),
+      managedConfig?.mode === "cloud"
+        ? applyCloudCatalogDefaults(normalizeExperimentalSettings(raw), raw, managedConfig)
+        : normalizeExperimentalSettings(raw),
       managedConfig,
     );
     // Self-hosted responses stay byte-identical: no managedKeys field at all.

@@ -767,6 +767,51 @@ describe("instance settings routes", () => {
     });
   });
 
+  describe("executionMode floor on operator-managed instances", () => {
+    const originalOperatorConfig = process.env.PAPERCLIP_OPERATOR_CONFIG;
+    const originalCloudToken = process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+    afterEach(() => {
+      if (originalOperatorConfig === undefined) delete process.env.PAPERCLIP_OPERATOR_CONFIG;
+      else process.env.PAPERCLIP_OPERATOR_CONFIG = originalOperatorConfig;
+      if (originalCloudToken === undefined) delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      else process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = originalCloudToken;
+    });
+
+    it("rejects executionMode changes while preserving same-value writes", async () => {
+      delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      process.env.PAPERCLIP_OPERATOR_CONFIG = JSON.stringify({
+        v: 1,
+        mode: "operator",
+        catalogVersion: "2026.720.0",
+        features: { enableManagedSandboxOnly: true },
+        plugins: { autoInstall: ["kubernetes"] },
+        environments: [{ name: "Sandbox", provider: "kubernetes", config: { image: "runner:v1" } }],
+      });
+      mockInstanceSettingsService.getGeneral.mockResolvedValue({ executionMode: "kubernetes" });
+      const app = await createApp({
+        type: "board",
+        userId: "admin-1",
+        source: "session",
+        isInstanceAdmin: true,
+      });
+
+      const denied = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ executionMode: "any" });
+
+      expect(denied.status).toBe(403);
+      expect(denied.body.details).toMatchObject({ code: "execution_mode_platform_managed" });
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+
+      const echo = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ executionMode: "kubernetes" });
+
+      expect(echo.status).toBe(200);
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ executionMode: "kubernetes" });
+    });
+  });
+
   describe("operator-hidden settings floor", () => {
     const adminActor = {
       type: "board",

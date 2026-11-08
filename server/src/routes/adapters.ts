@@ -49,6 +49,7 @@ import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSour
 import { logger } from "../middleware/logger.js";
 import { forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { isOperatorManagedInstance } from "../services/operator-config.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { assertBoardOrgAccess, assertInstanceAdmin } from "./authz.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
@@ -56,7 +57,7 @@ import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 const execFileAsync = promisify(execFile);
 
 /**
- * Floor: on cloud-managed instances adapter code is bundled into the platform
+ * Floor: on managed instances adapter code is bundled into the platform
  * image; fetching and loading external adapter packages at runtime stays off
  * for every actor, including instance admins. Adapter code executes in the
  * server process, so a runtime install would let an instance admin read the
@@ -66,6 +67,11 @@ const execFileAsync = promisify(execFile);
 function assertAdapterCodeInstallAllowed() {
   if (isCloudManagedInstance()) {
     throw forbidden("Adapter installation is platform-managed on cloud-managed instances", {
+      code: "adapter_install_platform_managed",
+    });
+  }
+  if (isOperatorManagedInstance()) {
+    throw forbidden("Adapter installation is managed by the operator on this instance", {
       code: "adapter_install_platform_managed",
     });
   }

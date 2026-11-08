@@ -493,6 +493,10 @@ describe("environment routes", () => {
       memberships: [{ companyId: "company-1", status: "active", membershipRole: "owner" }],
       isInstanceAdmin: true,
     };
+    const operatorSessionAdminActor = {
+      ...ownerAdminActor,
+      source: "session",
+    };
 
     // A minimal valid managed-config document whose `environments` entry makes
     // the managed-sandbox provisioner own the marked sandbox slot row.
@@ -504,12 +508,18 @@ describe("environment routes", () => {
       plugins: { autoInstall: [] },
       environments: [{ name: "Sandbox", provider: "daytona" }],
     });
+    const originalOperatorConfig = process.env.PAPERCLIP_OPERATOR_CONFIG;
 
     beforeEach(() => {
       process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = "test-server-token";
     });
     afterEach(() => {
       delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      if (originalOperatorConfig === undefined) {
+        delete process.env.PAPERCLIP_OPERATOR_CONFIG;
+      } else {
+        process.env.PAPERCLIP_OPERATOR_CONFIG = originalOperatorConfig;
+      }
     });
 
     it("never echoes credential-shaped config keys, while tenant env vars round-trip", async () => {
@@ -584,6 +594,59 @@ describe("environment routes", () => {
       expect(res.status).toBe(403);
       expect(res.body.details).toMatchObject({ code: "environment_platform_managed" });
       expect(mockEnvironmentService.update).not.toHaveBeenCalled();
+    });
+
+    it("retains managed-row write protection under operator policy without Cloud identity", async () => {
+      delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      process.env.PAPERCLIP_OPERATOR_CONFIG = JSON.stringify({
+        v: 1,
+        mode: "operator",
+        catalogVersion: "2026.720.0",
+        features: {},
+        plugins: { autoInstall: ["daytona"] },
+        environments: [{ name: "Sandbox", provider: "daytona" }],
+      });
+      mockEnvironmentService.getById.mockResolvedValue(createPlatformSandboxEnvironment());
+      const app = createApp(operatorSessionAdminActor);
+
+      const existingRow = await request(app).get("/api/environments/env-managed-1");
+      expect(existingRow.status).toBe(200);
+
+      const res = await request(app)
+        .patch("/api/environments/env-managed-1")
+        .send({ name: "Renamed" });
+
+      expect(res.status).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "environment_platform_managed" });
+      expect(mockEnvironmentService.update).not.toHaveBeenCalled();
+    });
+
+    it("redacts credential keys inside arbitrarily nested arrays for operator reads", async () => {
+      delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      process.env.PAPERCLIP_OPERATOR_CONFIG = JSON.stringify({
+        v: 1,
+        mode: "operator",
+        catalogVersion: "2026.720.0",
+        features: {},
+        plugins: { autoInstall: ["daytona"] },
+        environments: [{ name: "Sandbox", provider: "daytona" }],
+      });
+      const row = createPlatformSandboxEnvironment();
+      row.config = {
+        provider: "daytona",
+        nested: [[{ apiToken: "must-not-echo", structural: "safe" }]],
+      };
+      mockEnvironmentService.getById.mockResolvedValue(row);
+      const app = createApp(operatorSessionAdminActor);
+
+      const res = await request(app).get("/api/environments/env-managed-1");
+
+      expect(res.status).toBe(200);
+      expect(res.body.config).toEqual({
+        provider: "daytona",
+        nested: [[{ structural: "safe" }]],
+      });
+      expect(JSON.stringify(res.body)).not.toContain("must-not-echo");
     });
 
     it("allows an envVars-only patch on the managed sandbox row", async () => {

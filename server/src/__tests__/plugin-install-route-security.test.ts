@@ -117,13 +117,16 @@ async function createBuiltPluginFixture(parentDir: string, nameSuffix: string): 
   return { packageName, pluginKey, packageRoot };
 }
 
-async function createInstallApp(db: ReturnType<typeof createDb>) {
+async function createInstallApp(
+  db: ReturnType<typeof createDb>,
+  loaderOverride?: ReturnType<typeof pluginLoader>,
+) {
   const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
     import("../routes/plugins.js"),
     import("../middleware/index.js"),
   ]);
 
-  const loader = pluginLoader(db, {
+  const loader = loaderOverride ?? pluginLoader(db, {
     enableLocalFilesystem: false,
     enableNpmDiscovery: false,
   });
@@ -150,6 +153,7 @@ describeEmbeddedPostgres("plugin install route security floor", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const cleanupPaths = new Set<string>();
   const originalManagedConfig = process.env["PAPERCLIP_MANAGED_CONFIG"];
+  const originalOperatorConfig = process.env["PAPERCLIP_OPERATOR_CONFIG"];
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-install-guard-");
@@ -167,6 +171,11 @@ describeEmbeddedPostgres("plugin install route security floor", () => {
       delete process.env["PAPERCLIP_MANAGED_CONFIG"];
     } else {
       process.env["PAPERCLIP_MANAGED_CONFIG"] = originalManagedConfig;
+    }
+    if (originalOperatorConfig === undefined) {
+      delete process.env["PAPERCLIP_OPERATOR_CONFIG"];
+    } else {
+      process.env["PAPERCLIP_OPERATOR_CONFIG"] = originalOperatorConfig;
     }
   });
 
@@ -355,6 +364,37 @@ describeEmbeddedPostgres("plugin install route security floor", () => {
     }, 30_000);
   });
 
+  it("keeps the npm install floor active for operator-managed instances", async () => {
+    delete process.env["PAPERCLIP_MANAGED_CONFIG"];
+    process.env["PAPERCLIP_OPERATOR_CONFIG"] = JSON.stringify({
+      v: 1,
+      mode: "operator",
+      catalogVersion: "2026.720.0",
+      features: {},
+      plugins: { autoInstall: ["kubernetes"] },
+      environments: [],
+    });
+    const installDir = await mkdtemp(path.join(os.tmpdir(), "operator-plugin-install-guard-"));
+    cleanupPaths.add(installDir);
+    const loader = pluginLoader(db, {
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+      installDir,
+    });
+    const installPlugin = vi.spyOn(loader, "installPlugin").mockRejectedValue(
+      new Error("install blocked by regression test harness"),
+    );
+    const app = await createInstallApp(db, loader);
+
+    const res = await request(app)
+      .post("/api/plugins/install")
+      .send({ packageName: "paperclip-plugin-untrusted", version: "1.0.0" });
+
+    expect(installPlugin).not.toHaveBeenCalled();
+    expect(res.status).toBe(403);
+    expect(mockLifecycle.load).not.toHaveBeenCalled();
+  });
+
   describe("self-hosted npm installs (behavior unchanged)", () => {
     it("still rejects package names with invalid characters", async () => {
       const app = await createInstallApp(db);
@@ -369,15 +409,27 @@ describeEmbeddedPostgres("plugin install route security floor", () => {
     });
 
     it("does not apply the cloud floor when PAPERCLIP_MANAGED_CONFIG is absent", async () => {
-      const app = await createInstallApp(db);
+      const installDir = await mkdtemp(path.join(os.tmpdir(), "self-hosted-plugin-install-guard-"));
+      cleanupPaths.add(installDir);
+      const loader = pluginLoader(db, {
+        enableLocalFilesystem: false,
+        enableNpmDiscovery: false,
+        installDir,
+      });
+      const installPlugin = vi.spyOn(loader, "installPlugin").mockRejectedValue(
+        new Error("npm install failed: isolated test installer"),
+      );
+      const app = await createInstallApp(db, loader);
 
       // A well-formed npm package name passes route validation and reaches
-      // the loader (which fails here because npm cannot resolve the package
-      // in the test environment) — proving the 403 floor did not trigger.
+      // the installer spy, which fails without touching npm — proving the
+      // 403 floor did not trigger.
+      const packageName = `paperclip-plugin-guard-missing-${randomUUID().slice(0, 8)}`;
       const res = await request(app)
         .post("/api/plugins/install")
-        .send({ packageName: `paperclip-plugin-guard-missing-${randomUUID().slice(0, 8)}` });
+        .send({ packageName });
 
+      expect(installPlugin).toHaveBeenCalledWith({ packageName, version: undefined });
       expect(res.status).toBe(400);
       expect(res.body.error).toContain("npm install failed");
       expect(mockLifecycle.load).not.toHaveBeenCalled();

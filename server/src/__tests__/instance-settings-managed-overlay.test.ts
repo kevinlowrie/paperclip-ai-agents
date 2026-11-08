@@ -82,6 +82,25 @@ describe("applyManagedExperimentalOverlay", () => {
 });
 
 describe("instanceSettingsService managed overlay", () => {
+  it("applies an operator feature overlay at read time without persisting it", async () => {
+    const { db, persistedSets } = stubDb(settingsRow({ enablePipelines: false }));
+    const service = instanceSettingsService(db, {
+      runtimeEnv: {
+        PAPERCLIP_OPERATOR_CONFIG: JSON.stringify({
+          v: 1,
+          mode: "operator",
+          catalogVersion: "2026.720.0",
+          features: { enablePipelines: true },
+          plugins: { autoInstall: ["kubernetes"] },
+          environments: [],
+        }),
+      },
+    });
+
+    expect(await service.getExperimental()).toMatchObject({ enablePipelines: true });
+    expect(persistedSets).toHaveLength(0);
+  });
+
   it.each([{}, { enableMcpAggregators: false }])("keeps aggregators on with legacy stored and managed values: %j", async (stored) => {
     const { db } = stubDb(settingsRow({ ...stored, enableChatConnectors: true }));
     const service = instanceSettingsService(db, { runtimeEnv: managedEnv(JSON.stringify({

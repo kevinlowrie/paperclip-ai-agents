@@ -23,6 +23,31 @@ function parsedConfig(overrides: Record<string, unknown> = {}) {
   return config;
 }
 
+describe("managed policy identity boundaries", () => {
+  it("fails closed when Cloud and operator policy documents are both configured", () => {
+    const cloudDocument = JSON.stringify({
+      v: 1,
+      mode: "cloud",
+      catalogVersion: "2026.720.0",
+      features: {},
+      plugins: { autoInstall: [] },
+      environments: [],
+    });
+
+    expect(() => parseManagedConfigEnv({
+      [MANAGED_CONFIG_ENV_KEY]: cloudDocument,
+      PAPERCLIP_OPERATOR_CONFIG: JSON.stringify({
+        v: 1,
+        mode: "operator",
+        catalogVersion: "2026.720.0",
+        features: {},
+        plugins: { autoInstall: [] },
+        environments: [],
+      }),
+    })).toThrow(/operator.*cloud|cloud.*operator|ambiguous/i);
+  });
+});
+
 function environmentRow(overrides: Record<string, unknown> = {}) {
   const now = new Date();
   return {
