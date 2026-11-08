@@ -14,10 +14,11 @@
  */
 
 import express from "express";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { authAccounts, createDb } from "@paperclipai/db";
+import { authAccounts, authSessions, createDb, firebaseOperatorBindings } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -51,6 +52,10 @@ function sessionCookies(response: request.Response): string[] {
   const raw = response.headers["set-cookie"];
   const cookies = Array.isArray(raw) ? raw : raw ? [raw] : [];
   return cookies.filter((cookie) => cookie.includes("session_token"));
+}
+
+function sha256(value: string) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 describeEmbeddedPostgres("Better Auth credential sign-up against the real schema", () => {
@@ -140,5 +145,141 @@ describeEmbeddedPostgres("Better Auth credential sign-up against the real schema
     expect(signIn.status).toBe(200);
     expect(signIn.body?.user?.email).toBe("legacy@example.com");
     expect(sessionCookies(signIn).length).toBeGreaterThan(0);
+  });
+
+  it("does not issue an ordinary credential session after the user is Firebase-bound", async () => {
+    const signUp = await request(app)
+      .post("/api/auth/sign-up/email")
+      .set("origin", ORIGIN)
+      .send({ email: "bound-credential@example.com", password: PASSWORD, name: "Bound User" });
+    expect(signUp.status).toBe(200);
+
+    const userId = signUp.body.user.id as string;
+    await db.insert(firebaseOperatorBindings).values({
+      firebaseUid: `bound-credential-${userId}`,
+      userId,
+      createdByUserId: userId,
+      updatedByUserId: userId,
+    });
+    const sessionsBefore = await db.select().from(authSessions);
+
+    const signIn = await request(app)
+      .post("/api/auth/sign-in/email")
+      .set("origin", ORIGIN)
+      .send({ email: "bound-credential@example.com", password: PASSWORD });
+
+    // The browser must not receive a normal session for an operator identity;
+    // checking both the HTTP cookie and persisted rows proves the real SDK hook.
+    expect.soft(sessionCookies(signIn)).toHaveLength(0);
+    expect.soft(await db.select().from(authSessions)).toHaveLength(sessionsBefore.length);
+  });
+
+  async function makeBoundUser(label: string) {
+    const email = `${label}-${randomUUID()}@example.test`;
+    const signUp = await request(app)
+      .post("/api/auth/sign-up/email")
+      .set("origin", ORIGIN)
+      .send({ email, password: PASSWORD, name: label });
+    expect(signUp.status).toBe(200);
+    const userId = signUp.body.user.id as string;
+    const [binding] = await db.insert(firebaseOperatorBindings).values({
+      firebaseUid: `bound-${userId}`,
+      userId,
+      createdByUserId: userId,
+      updatedByUserId: userId,
+    }).returning();
+    return { userId, bindingId: binding!.id, bindingRevision: binding!.revision };
+  }
+
+  async function loadIssuanceCapability() {
+    const moduleSpecifier = "../auth/firebase-operator-session-issuance.js";
+    let capability: {
+      withFirebaseOperatorSessionIssuance<T>(input: {
+        userId: string;
+        bindingId: string;
+        bindingRevision: number;
+        sessionTokenHash: string;
+      }, operation: () => Promise<T>): Promise<T>;
+    } | undefined;
+    try {
+      capability = await import(moduleSpecifier) as never;
+    } catch (error) {
+      expect.fail(`session issuance capability is not implemented yet: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return capability.withFirebaseOperatorSessionIssuance;
+  }
+
+  async function sessionAdapterFor() {
+    const auth = createBetterAuthInstance(db, testConfig(), [ORIGIN]);
+    const context = await (auth as unknown as { $context: Promise<{
+      internalAdapter: {
+        createSession(userId: string, dontRememberMe?: boolean, override?: Record<string, unknown>, overrideAll?: boolean): Promise<unknown>;
+      };
+    }> }).$context;
+    return context.internalAdapter;
+  }
+
+  it("allows the actual SDK token only through a matching one-shot issuance capability", async () => {
+    const bound = await makeBoundUser("capability-positive");
+    const capability = await loadIssuanceCapability();
+    const adapter = await sessionAdapterFor();
+    const token = `preallocated-${randomUUID()}`;
+    const created = await capability({ ...bound, sessionTokenHash: sha256(token) }, () =>
+      adapter.createSession(bound.userId, false, { token }, true));
+
+    expect(created).toMatchObject({ userId: bound.userId, token });
+    expect(await db.select().from(authSessions).where(eq(authSessions.userId, bound.userId)))
+      .toHaveLength(2);
+  });
+
+  it("denies a capability whose preallocated token does not match actual SDK data.token", async () => {
+    const bound = await makeBoundUser("capability-wrong-token");
+    const capability = await loadIssuanceCapability();
+    const adapter = await sessionAdapterFor();
+    const before = await db.select().from(authSessions).where(eq(authSessions.userId, bound.userId));
+    const reserved = `reserved-${randomUUID()}`;
+    const actual = `actual-${randomUUID()}`;
+
+    await expect(capability({ ...bound, sessionTokenHash: sha256(reserved) }, () =>
+      adapter.createSession(bound.userId, false, { token: actual }, true))).rejects.toBeDefined();
+    await expect(db.select().from(authSessions).where(eq(authSessions.userId, bound.userId)))
+      .resolves.toHaveLength(before.length);
+  });
+
+  it("denies using another bound user's capability on an actual SDK session", async () => {
+    const issuer = await makeBoundUser("capability-wrong-user-issuer");
+    const target = await makeBoundUser("capability-wrong-user-target");
+    const capability = await loadIssuanceCapability();
+    const adapter = await sessionAdapterFor();
+    const token = `wrong-user-${randomUUID()}`;
+    const before = await db.select().from(authSessions).where(eq(authSessions.userId, target.userId));
+
+    await expect(capability({ ...issuer, sessionTokenHash: sha256(token) }, () =>
+      adapter.createSession(target.userId, false, { token }, true))).rejects.toBeDefined();
+    await expect(db.select().from(authSessions).where(eq(authSessions.userId, target.userId)))
+      .resolves.toHaveLength(before.length);
+  });
+
+  it("denies stale binding revisions and replayed capability consumption", async () => {
+    const stale = await makeBoundUser("capability-stale-revision");
+    const capability = await loadIssuanceCapability();
+    const staleAdapter = await sessionAdapterFor();
+    const staleToken = `stale-${randomUUID()}`;
+    await db.update(firebaseOperatorBindings).set({ revision: stale.bindingRevision + 1 })
+      .where(eq(firebaseOperatorBindings.id, stale.bindingId));
+    await expect(capability({ ...stale, sessionTokenHash: sha256(staleToken) }, () =>
+      staleAdapter.createSession(stale.userId, false, { token: staleToken }, true))).rejects.toBeDefined();
+
+    const replay = await makeBoundUser("capability-replay");
+    const replayAdapter = await sessionAdapterFor();
+    const firstToken = `first-${randomUUID()}`;
+    const replayToken = `replay-${randomUUID()}`;
+    const created = await capability({ ...replay, sessionTokenHash: sha256(firstToken) }, async () => {
+      const first = await replayAdapter.createSession(replay.userId, false, { token: firstToken }, true);
+      await expect(replayAdapter.createSession(replay.userId, false, { token: replayToken }, true))
+        .rejects.toBeDefined();
+      return first;
+    });
+    expect(created).toMatchObject({ userId: replay.userId, token: firstToken });
   });
 });
