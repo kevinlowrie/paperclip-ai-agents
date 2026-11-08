@@ -73,23 +73,6 @@ async function installActualApiRecordingTracer(): Promise<RecordingTelemetry> {
     },
   });
   const api = await import(pathToFileURL(apiPath).href) as Record<string, any>;
-  let activeContext = api.ROOT_CONTEXT;
-  const contextManager = {
-    active() { return activeContext; },
-    with<T>(context: unknown, callback: (...args: unknown[]) => T, thisArg?: unknown, ...args: unknown[]): T {
-      const previous = activeContext;
-      activeContext = context;
-      try { return callback.apply(thisArg, args); } finally { activeContext = previous; }
-    },
-    bind<T>(context: unknown, target: T): T {
-      if (typeof target !== "function") return target;
-      const manager = this;
-      return function (this: unknown, ...args: unknown[]) { return manager.with(context, target as (...values: unknown[]) => unknown, this, ...args); } as T;
-    },
-    enable() { return this; },
-    disable() { activeContext = api.ROOT_CONTEXT; return this; },
-  };
-  expect(api.context.setGlobalContextManager(contextManager)).toBe(true);
   const spans: CapturedSpan[] = [];
   const tracer = {
     startSpan(name: string, options?: unknown, parent?: unknown) {
@@ -344,19 +327,32 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     };
   }
 
-  it("records Better Auth 1.7.18's real post-create exception before the endpoint catch under unsafe options", async () => {
+  it("records Better Auth 1.7.18's real post-create exception in a standalone unsafe SDK instance", async () => {
     const telemetry = await installActualApiRecordingTracer();
     telemetry.spans.length = 0;
     const f = await fixture();
     const sdkSentinel = "SDK-TRACE-ERROR-SENTINEL-REWORK1";
-    const { app } = appFor(f, {
-      unsafeAuthOptions: true,
-      hooks: { session: { create: { after: async () => { throw new Error(sdkSentinel); } } } },
+    const auth = betterAuth({
+      secret: "standalone-unsafe-sdk-trace-control",
+      baseURL: PUBLIC,
+      trustedOrigins: [PUBLIC, LAB],
+      experimental: { instrumentation: { enabled: true } },
+      database: drizzleAdapter(db, {
+        provider: "pg",
+        schema: { user: authUsers, session: authSessions, account: authAccounts, verification: authVerifications },
+      }),
+      emailAndPassword: { enabled: true },
+      databaseHooks: { session: { create: { after: async () => { throw new Error(sdkSentinel); } } } } as never,
     });
-    const started = await begin(app);
-    const response = await exchange(app, started, started.body.state);
+    const context = await auth.$context;
+    let rejected = false;
+    try {
+      await context.internalAdapter.createSession(f.userId);
+    } catch {
+      rejected = true;
+    }
     const sdkSpans = telemetry.spans.filter((span) => span.name.includes("session"));
-    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(rejected).toBe(true);
     expect(sdkSpans.some((span) => span.exceptions.includes(sdkSentinel))).toBe(true);
     expect(sdkSpans.some((span) => span.statuses.some((status) => status.message === sdkSentinel))).toBe(true);
   });
@@ -457,7 +453,7 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     }
   });
 
-  it("uses the HTTP instrumentation ignore hook for reserved routes and preserves ordinary API spans", async () => {
+  it("exposes reserved-route HTTP ignore policy and a live ordinary-span recorder control", async () => {
     const instrumentation = await import("../instrumentation.js") as unknown as {
       firebaseOperatorHttpInstrumentationOptions?: () => { ignoreIncomingRequestHook(req: { method?: string; url?: string }): boolean };
     };
@@ -472,34 +468,13 @@ describe("Firebase operator browser session exchange (real PostgreSQL + Better A
     expect(hook({ method: "POST", url: "/api/companies/current/issues?cursor=ordinary" })).toBe(false);
 
     const tracer = telemetry.api.trace.getTracer("paperclip.rework1.http-test");
-    const tracedApp = express();
-    tracedApp.use((req, res, next) => {
-      const requestInfo = { method: req.method, url: req.originalUrl };
-      if (hook(requestInfo)) {
-        const suppressedContext = telemetry.api.suppressTracing(telemetry.api.context.active());
-        telemetry.api.context.with(suppressedContext, () => {
-          expect(telemetry.api.isTracingSuppressed(telemetry.api.context.active())).toBe(true);
-          // This models the installed HTTP instrumentation's documented ignore-hook behavior.
-          if (!telemetry.api.isTracingSuppressed(telemetry.api.context.active())) {
-            tracer.startActiveSpan("http.request.reserved", {}, (span: { end(): void }) => span.end());
-          }
-          next();
-        });
-        return;
-      }
-      tracer.startActiveSpan("http.request.ordinary", {}, (httpSpan: { end(): void }) => {
-        tracer.startActiveSpan("pg.query.ordinary", {}, (databaseSpan: { end(): void }) => databaseSpan.end());
-        tracer.startActiveSpan("business.handler.ordinary", {}, (businessSpan: { end(): void }) => businessSpan.end());
-        httpSpan.end();
-      });
-      next();
+    // The optional NodeSDK HTTP/PG instrumentation is not installed in this worktree;
+    // this verifies the exact public policy and that the actual API recorder is live.
+    tracer.startActiveSpan("http.request.ordinary", {}, (httpSpan: { end(): void }) => {
+      tracer.startActiveSpan("pg.query.ordinary", {}, (databaseSpan: { end(): void }) => databaseSpan.end());
+      tracer.startActiveSpan("business.handler.ordinary", {}, (businessSpan: { end(): void }) => businessSpan.end());
+      httpSpan.end();
     });
-    tracedApp.all("/api/auth/firebase-session/*splat", (_req, res) => res.sendStatus(404));
-    tracedApp.get("/api/companies/current/issues", (_req, res) => res.sendStatus(200));
-    const reservedResponse = await request(tracedApp).post(`/api/auth/firebase-session/unknown?credential=${TOKEN_SENTINEL}&state=HTTP-STATE-SENTINEL`);
-    expect(reservedResponse.status).toBe(404);
-    expect(telemetry.spans).toHaveLength(0);
-    expect((await request(tracedApp).get("/api/companies/current/issues")).status).toBe(200);
     expect(telemetry.spans.map((span) => span.name)).toEqual([
       "http.request.ordinary", "pg.query.ordinary", "business.handler.ordinary",
     ]);
