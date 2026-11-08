@@ -4,7 +4,7 @@
   "contracts": [
     {
       "name": "paperclip-firebase-session-v1",
-      "authority_repository": "/srv/home/klowrie/homelab",
+      "authority_repository": "kevinlowrie/homelab",
       "authority_revision": "531f61e32432aced4584e9ab8cce95888fdd866d",
       "source_path": "docs/contracts/paperclip-firebase-session-v1.md",
       "destination_path": "doc/contracts/paperclip-firebase-session-v1.md",
@@ -12,7 +12,7 @@
     },
     {
       "name": "consumer-firebase-totp-v1",
-      "authority_repository": "/srv/home/klowrie/homelab",
+      "authority_repository": "kevinlowrie/homelab",
       "authority_revision": "9ece677a8211b67c5db8bb2c1a3102a52cbd84e4",
       "source_path": "docs/contracts/consumer-firebase-totp-v1.md",
       "destination_path": "doc/contracts/consumer-firebase-totp-v1.md",
@@ -20,9 +20,9 @@
     }
   ],
   "implemented_scope": [
-    "PFS001 project-pinned Firebase ID-token verification primitive",
-    "PFS002 minimal Google/TOTP current-user proof primitive",
-    "PFS012 current-user and revocation revalidation primitive"
+    "PFS001/CFT001\u2013003 project-pinned production token proof primitive",
+    "PFS002 five-minute authentication freshness primitive",
+    "PFS012 current-user revocation/factor snapshot primitives; no persisted session lifecycle"
   ],
   "not_implemented": [
     "PFS003 through PFS011 and PFS013 through PFS014",
