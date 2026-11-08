@@ -232,6 +232,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  const executionTargetUsesPaperclipBridge = adapterExecutionTargetUsesPaperclipBridge(executionTarget);
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -327,7 +328,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // selection is already handled via the --model CLI flag.  Set after the
   // envConfig loop so user overrides cannot disable this guard.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  if (authToken) {
+  // The host bearer is used by the controller-side bridge only. Never put it
+  // in an environment that may be sent to a remote target for setup/probing.
+  if (authToken && !(executionTargetIsRemote && executionTargetUsesPaperclipBridge)) {
     env.PAPERCLIP_API_KEY = authToken;
   }
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
@@ -519,7 +522,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runtimeRootDir: remoteRuntimeRootDir,
         adapterKey: "opencode",
         timeoutSec,
-        hostApiToken: preparedRuntimeConfig.env.PAPERCLIP_API_KEY,
+        hostApiToken: authToken,
         onLog,
       });
       if (paperclipBridge) {

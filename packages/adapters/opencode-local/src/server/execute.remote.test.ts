@@ -156,6 +156,7 @@ describe("opencode remote execution", () => {
 
     const result = await execute({
       runId: "run-1",
+      authToken: "trusted-host-bearer-sentinel",
       agent: {
         id: "agent-1",
         companyId: "company-1",
@@ -281,6 +282,7 @@ describe("opencode remote execution", () => {
     expect(modelProbeCall?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
     expect(call?.[3].env.XDG_RUNTIME_DIR).toBe(`${home}/runtime`);
     expect(modelProbeCall?.[3].env.SCOPED_PROVIDER_KEY).toBe("fixture-scoped-key");
+    expect(modelProbeCall?.[3].env.PAPERCLIP_API_KEY).toBeUndefined();
     expect(runSshCommand).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining(`${home}/.claude/skills`),
@@ -320,6 +322,16 @@ describe("opencode remote execution", () => {
     }
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
+    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(
+      expect.objectContaining({ hostApiToken: "trusted-host-bearer-sentinel" }),
+    );
+    expect(call?.[3].env.PAPERCLIP_API_KEY).toBe("bridge-token");
+    // Setup, model discovery, shell staging and final spawn all receive target
+    // state. The host bearer must stay in the controller and bridge constructor.
+    expect(JSON.stringify(runChildProcess.mock.calls)).not.toContain("trusted-host-bearer-sentinel");
+    expect(JSON.stringify(runSshCommand.mock.calls)).not.toContain("trusted-host-bearer-sentinel");
+    expect(JSON.stringify(syncDirectoryToSsh.mock.calls)).not.toContain("trusted-host-bearer-sentinel");
+    expect(JSON.stringify(ensureCommandResolvable.mock.calls)).not.toContain("trusted-host-bearer-sentinel");
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(ensureCommandResolvable).toHaveBeenCalled();
     for (const callArgs of ensureCommandResolvable.mock.calls as unknown as unknown[][]) {
