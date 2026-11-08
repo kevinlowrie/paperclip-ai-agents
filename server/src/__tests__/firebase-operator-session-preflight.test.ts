@@ -4,8 +4,9 @@ import { Writable } from "node:stream";
 import express from "express";
 import request from "supertest";
 import pino from "pino";
-import { afterEach, describe, expect, it } from "vitest";
-import { createHttpLogger } from "../middleware/logger.js";
+import { ROOT_CONTEXT, trace } from "@opentelemetry/api";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { createHttpLogger, logger } from "../middleware/logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { firebaseOperatorPreAuthRequestHandler } from "../auth/firebase-operator-session-preflight.js";
 
@@ -14,18 +15,54 @@ const LAB = "https://paperclip.lab.example.test";
 const PATH = "/api/auth/firebase-session/begin";
 const EXCHANGE = "/api/auth/firebase-session/exchange";
 const JSON_TYPE = "application/json";
+const QUERY_TOKEN = "PREFLIGHT-QUERY-TOKEN-SENTINEL";
+const QUERY_STATE = "PREFLIGHT-QUERY-STATE-SENTINEL";
+const BODY_STATE = "PREFLIGHT-BODY-STATE-SENTINEL";
+const HEADER_SENTINEL = "PREFLIGHT-HEADER-SENTINEL";
 
-function appFor(options: { maxBodyBytes?: number; origins?: string[]; logs?: string[]; sdkError?: string } = {}) {
+type CapturedSpan = {
+  name: string;
+  parent: unknown;
+  attributes: Record<string, unknown>;
+  ended: boolean;
+};
+const spans: CapturedSpan[] = [];
+let tracerThrows = false;
+const recordingTracer = {
+  startSpan(name: string, options?: { attributes?: Record<string, unknown> }, parent?: unknown) {
+    if (tracerThrows) throw new Error("PREFLIGHT-TRACE-FAIL-SENTINEL");
+    const span: CapturedSpan = { name, parent, attributes: { ...(options?.attributes ?? {}) }, ended: false };
+    spans.push(span);
+    return {
+      setAttribute(key: string, value: unknown) { span.attributes[key] = value; return this; },
+      end() { span.ended = true; },
+    };
+  },
+};
+const recordingProvider = { getTracer: () => recordingTracer };
+
+function appFor(options: {
+  maxBodyBytes?: number;
+  origins?: string[];
+  logs?: string[];
+  sdkError?: string;
+  audit?: (event: unknown) => void;
+  downstreamCalls?: string[];
+  globalParserFirst?: boolean;
+} = {}) {
   const app = express();
   if (options.logs) {
     const stream = new Writable({ write(chunk, _encoding, callback) { options.logs!.push(chunk.toString()); callback(); } });
     app.use(createHttpLogger(pino({ level: "trace", redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
   }
+  if (options.globalParserFirst) app.use(express.json({ limit: "10mb" }));
   app.use(firebaseOperatorPreAuthRequestHandler({
     trustedOrigins: new Set(options.origins ?? [PUBLIC, LAB]),
     ...(options.maxBodyBytes ? { maxBodyBytes: options.maxBodyBytes } : {}),
-  }));
+    ...(options.audit ? { audit: options.audit } : {}),
+  } as never));
   app.post([PATH, EXCHANGE], (req, res, next) => {
+    options.downstreamCalls?.push(`${req.method} ${req.originalUrl}`);
     if (options.sdkError) {
       const error = new Error(options.sdkError);
       (res as express.Response & { err?: Error }).err = error;
@@ -41,10 +78,46 @@ function appFor(options: { maxBodyBytes?: number; origins?: string[]; logs?: str
   return app;
 }
 
+function assertObservedDenial(input: {
+  events: unknown[];
+  expectedReason: string;
+  response: request.Response;
+  expectedStatus?: number;
+  logLines?: string[];
+  sentinels?: string[];
+}) {
+  expect.soft(input.events).toHaveLength(1);
+  const event = (input.events[0] ?? {}) as Record<string, unknown>;
+  expect.soft(event).toMatchObject({ event: "preflight", outcome: "denied", reason: input.expectedReason });
+  expect.soft(Object.keys(event).sort()).toEqual(["correlationId", "event", "outcome", "reason"]);
+  expect.soft(event.correlationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  expect.soft(spans).toHaveLength(1);
+  expect.soft(spans[0]?.name).toBe("firebase.operator_session.preflight");
+  expect.soft(spans[0]?.parent).toBe(ROOT_CONTEXT);
+  expect.soft(spans[0]?.ended).toBe(true);
+  expect.soft(spans[0]?.attributes).toEqual({
+    "firebase_operator.outcome": "denied",
+    "firebase_operator.reason": input.expectedReason,
+  });
+  if (input.expectedStatus !== undefined) expect.soft(input.response.status).toBe(input.expectedStatus);
+  expect.soft(input.response.body).toEqual({ error: "Request rejected" });
+  const surface = JSON.stringify({ event, span: spans[0], logs: input.logLines ?? [], body: input.response.body, headers: input.response.headers });
+  for (const sentinel of input.sentinels ?? []) expect.soft(surface).not.toContain(sentinel);
+}
+
 describe("Firebase operator pre-auth HTTP boundary", () => {
   const servers: http.Server[] = [];
+  beforeAll(() => {
+    expect(trace.setGlobalTracerProvider(recordingProvider as never)).toBe(true);
+  });
+  afterAll(() => {
+    trace.disable();
+  });
   afterEach(async () => {
     await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))));
+    spans.length = 0;
+    tracerThrows = false;
+    vi.restoreAllMocks();
   });
 
   it("passes only exact POST routes when raw Host authority and exact HTTPS Origin map together", async () => {
@@ -237,5 +310,288 @@ describe("Firebase operator pre-auth HTTP boundary", () => {
     expect(combinedLogs).not.toContain("/exchange/");
     expect(combinedLogs).not.toContain("unknown-suffix");
     expect(combinedLogs).not.toContain("FIREBASE-SESSION");
+  });
+
+  it("audits and records one safe ROOT_CONTEXT span for each reserved-path denial", async () => {
+    const events: unknown[] = [];
+    const logLines: string[] = [];
+    const downstreamCalls: string[] = [];
+    const app = appFor({ audit: (event) => events.push(event), logs: logLines, downstreamCalls });
+    const requestCases: Array<{
+      label: string;
+      expectedStatus: number;
+      expectedReason: string;
+      send: () => Promise<request.Response>;
+    }> = [
+      {
+        label: "query credential",
+        expectedStatus: 404,
+        expectedReason: "bad_request",
+        send: () => request(app).post(`${EXCHANGE}?credential=${QUERY_TOKEN}&state=${QUERY_STATE}`)
+          .set("Host", new URL(PUBLIC).host).set("Origin", PUBLIC).set("Content-Type", JSON_TYPE).send({}),
+      },
+      {
+        label: "foreign Origin",
+        expectedStatus: 403,
+        expectedReason: "origin_denied",
+        send: () => request(app).post(PATH).set("Host", new URL(PUBLIC).host)
+          .set("Origin", "https://attacker.example.test").set("Content-Type", JSON_TYPE).send({}),
+      },
+      {
+        label: "null Origin",
+        expectedStatus: 403,
+        expectedReason: "origin_denied",
+        send: () => request(app).post(PATH).set("Host", new URL(PUBLIC).host)
+          .set("Origin", "null").set("Content-Type", JSON_TYPE).send({}),
+      },
+      {
+        label: "missing Origin",
+        expectedStatus: 403,
+        expectedReason: "origin_denied",
+        send: () => request(app).post(PATH).set("Host", new URL(PUBLIC).host).set("Content-Type", JSON_TYPE).send({}),
+      },
+      {
+        label: "mismatched Host and Origin",
+        expectedStatus: 403,
+        expectedReason: "origin_denied",
+        send: () => request(app).post(PATH).set("Host", new URL(LAB).host)
+          .set("Origin", PUBLIC).set("Content-Type", JSON_TYPE).send({}),
+      },
+      {
+        label: "wrong method",
+        expectedStatus: 405,
+        expectedReason: "bad_request",
+        send: () => request(app).get(PATH).set("Host", new URL(PUBLIC).host).set("Origin", PUBLIC).set("Content-Type", JSON_TYPE),
+      },
+      {
+        label: "case variant",
+        expectedStatus: 404,
+        expectedReason: "bad_request",
+        send: () => request(app).post("/api/auth/Firebase-session/begin").set("Host", new URL(PUBLIC).host)
+          .set("Origin", PUBLIC).set("Content-Type", JSON_TYPE).send({}),
+      },
+      {
+        label: "trailing slash",
+        expectedStatus: 404,
+        expectedReason: "bad_request",
+        send: () => request(app).post(`${PATH}/`).set("Host", new URL(PUBLIC).host)
+          .set("Origin", PUBLIC).set("Content-Type", JSON_TYPE).send({}),
+      },
+      {
+        label: "unknown namespace suffix",
+        expectedStatus: 404,
+        expectedReason: "bad_request",
+        send: () => request(app).post("/api/auth/firebase-session/unknown-suffix").set("Host", new URL(PUBLIC).host)
+          .set("Origin", PUBLIC).set("Content-Type", JSON_TYPE).send({ state: BODY_STATE }),
+      },
+      {
+        label: "unsupported Content-Type",
+        expectedStatus: 415,
+        expectedReason: "bad_request",
+        send: () => request(app).post(PATH).set("Host", new URL(PUBLIC).host).set("Origin", PUBLIC)
+          .set("Content-Type", "text/plain").send("{}"),
+      },
+      {
+        label: "malformed JSON",
+        expectedStatus: 400,
+        expectedReason: "bad_request",
+        send: () => request(app).post(PATH).set("Host", new URL(PUBLIC).host).set("Origin", PUBLIC)
+          .set("Content-Type", JSON_TYPE).send(`{"state":"${BODY_STATE}"`),
+      },
+      {
+        label: "oversized fixed-length body",
+        expectedStatus: 413,
+        expectedReason: "bad_request",
+        send: () => request(app).post(PATH).set("Host", new URL(PUBLIC).host).set("Origin", PUBLIC)
+          .set("Content-Type", JSON_TYPE).send(JSON.stringify({ value: "x".repeat(4085) })),
+      },
+    ];
+    const correlations: string[] = [];
+    for (const scenario of requestCases) {
+      events.length = 0;
+      spans.length = 0;
+      const response = await scenario.send();
+      assertObservedDenial({
+        events,
+        expectedReason: scenario.expectedReason,
+        response,
+        expectedStatus: scenario.expectedStatus,
+        logLines,
+        sentinels: [QUERY_TOKEN, QUERY_STATE, BODY_STATE, HEADER_SENTINEL],
+      });
+      correlations.push((events[0] as { correlationId: string } | undefined)?.correlationId ?? "");
+      expect(downstreamCalls).toHaveLength(0);
+    }
+    expect.soft(new Set(correlations).size).toBe(correlations.length);
+    const combinedLogs = logLines.join("\n");
+    for (const sentinel of [QUERY_TOKEN, QUERY_STATE, BODY_STATE, HEADER_SENTINEL]) expect(combinedLogs).not.toContain(sentinel);
+  });
+
+  it("audits raw duplicate fields and chunked size denials before downstream dispatch", async () => {
+    const events: unknown[] = [];
+    const logs: string[] = [];
+    const downstreamCalls: string[] = [];
+    const server = http.createServer(appFor({ audit: (event) => events.push(event), logs, downstreamCalls }));
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+    const rawSocket = (fields: string[], body = "{}") => new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const socket = net.connect(port, "127.0.0.1", () => {
+        socket.write(`POST ${PATH} HTTP/1.1\r\n${fields.join("\r\n")}\r\n\r\n${body}`);
+      });
+      let text = "";
+      socket.on("data", (chunk: Buffer) => { text += chunk.toString(); });
+      socket.on("end", () => resolve({ status: Number(text.match(/^HTTP\/1\.1 (\d+)/)?.[1] ?? 0), text }));
+      socket.on("error", reject);
+    });
+    const base = [`Host: ${new URL(PUBLIC).host}`, `Origin: ${PUBLIC}`, `Content-Type: ${JSON_TYPE}`, "Content-Length: 2", "Connection: close"];
+    const duplicateCases = [
+      [...base, `Origin: ${PUBLIC}`],
+      [...base, `Host: ${new URL(PUBLIC).host}`],
+      [...base, `Authorization: Bearer ${HEADER_SENTINEL}`, "Authorization: Bearer second"],
+      [...base, `Content-Type: ${JSON_TYPE}`],
+    ];
+    for (const fields of duplicateCases) {
+      events.length = 0;
+      spans.length = 0;
+      const response = await rawSocket(fields);
+      const [rawHeaders, rawBody = ""] = response.text.split("\r\n\r\n");
+      const parsedHeaders = Object.fromEntries((rawHeaders ?? "").split("\r\n").slice(1).map((line) => {
+        const colon = line.indexOf(":");
+        return [line.slice(0, colon).toLowerCase(), line.slice(colon + 1).trim()];
+      }));
+      const responseLike = {
+        status: response.status,
+        body: JSON.parse(rawBody),
+        headers: parsedHeaders,
+      } as request.Response;
+      assertObservedDenial({
+        events,
+        expectedReason: "bad_request",
+        response: responseLike,
+        expectedStatus: 400,
+        logLines: logs,
+        sentinels: [HEADER_SENTINEL],
+      });
+      expect(downstreamCalls).toHaveLength(0);
+    }
+
+    events.length = 0;
+    spans.length = 0;
+    const chunked = JSON.stringify({ value: `${BODY_STATE}${"x".repeat(4085)}` });
+    const chunkedResponse = await new Promise<{ status: number; text: string; headers: Record<string, string | string[] | undefined> }>((resolve, reject) => {
+      const req = http.request({
+        host: "127.0.0.1", port, method: "POST", path: PATH,
+        headers: { Host: new URL(PUBLIC).host, Origin: PUBLIC, "Content-Type": JSON_TYPE, "Transfer-Encoding": "chunked" },
+      }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString(), headers: res.headers }));
+      });
+      req.on("error", reject);
+      req.write(chunked.slice(0, 2000));
+      req.write(chunked.slice(2000, 4000));
+      req.end(chunked.slice(4000));
+    });
+    assertObservedDenial({
+      events,
+      expectedReason: "bad_request",
+      response: { status: chunkedResponse.status, body: JSON.parse(chunkedResponse.text), headers: chunkedResponse.headers } as request.Response,
+      expectedStatus: 413,
+      logLines: logs,
+      sentinels: [BODY_STATE],
+    });
+    expect(downstreamCalls).toHaveLength(0);
+  });
+
+  it("audits already-parsed missing-capture and rate denials without duplicate success events", async () => {
+    const events: unknown[] = [];
+    const downstreamCalls: string[] = [];
+    const app = appFor({ audit: (event) => events.push(event), downstreamCalls, globalParserFirst: true });
+    const oversizedValid = `${JSON.stringify({ transactionId: "tx", state: BODY_STATE })}${" ".repeat(5000)}`;
+    const parsed = await request(app).post(EXCHANGE).set("Host", new URL(PUBLIC).host).set("Origin", PUBLIC)
+      .set("Content-Type", JSON_TYPE).send(oversizedValid);
+    assertObservedDenial({
+      events,
+      expectedReason: "bad_request",
+      response: parsed,
+      expectedStatus: 400,
+      sentinels: [BODY_STATE],
+    });
+    expect(downstreamCalls).toHaveLength(0);
+
+    events.length = 0;
+    spans.length = 0;
+    const limitedEvents: unknown[] = [];
+    const calls: string[] = [];
+    const limited = appFor({ audit: (event) => limitedEvents.push(event), downstreamCalls: calls });
+    let final: request.Response | undefined;
+    for (let i = 0; i < 11; i += 1) {
+      final = await request(limited).post(PATH).set("Host", new URL(PUBLIC).host).set("Origin", PUBLIC)
+        .set("Content-Type", JSON_TYPE).send({});
+      if (i < 10) expect(final.status).toBe(200);
+    }
+    expect.soft(final?.status).toBe(429);
+    expect.soft(calls).toHaveLength(10);
+    expect.soft(limitedEvents).toHaveLength(1);
+    expect.soft(limitedEvents[0]).toMatchObject({ event: "preflight", outcome: "denied", reason: "rate_limited" });
+    expect.soft(spans).toHaveLength(1);
+    expect.soft(spans[0]).toMatchObject({ name: "firebase.operator_session.preflight", parent: ROOT_CONTEXT, ended: true });
+  });
+
+  it("uses the default Pino audit sink for preflight denials", async () => {
+    const spies = ["debug", "info", "warn", "error"].map((level) => vi.spyOn(logger, level as "warn").mockImplementation(() => undefined as never));
+    try {
+      const app = appFor();
+      const response = await request(app).post(PATH).set("Host", new URL(PUBLIC).host)
+        .set("Origin", "https://attacker.example.test").set("Content-Type", JSON_TYPE).send({ state: BODY_STATE });
+      expect.soft(response.status).toBe(403);
+      const calls = spies.flatMap((spy) => spy.mock.calls);
+      expect.soft(calls).toHaveLength(1);
+      expect.soft(JSON.stringify(calls)).toContain("preflight");
+      expect.soft(JSON.stringify(calls)).toContain("origin_denied");
+      expect.soft(JSON.stringify(calls)).not.toContain(BODY_STATE);
+      expect.soft(spans).toHaveLength(1);
+      expect.soft(spans[0]).toMatchObject({ name: "firebase.operator_session.preflight", parent: ROOT_CONTEXT, ended: true });
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
+
+  it("preserves denial responses when injected audit and tracer sinks throw", async () => {
+    let auditCalls = 0;
+    const auditDownstream: string[] = [];
+    const auditLogs: string[] = [];
+    const auditApp = appFor({
+      audit: () => { auditCalls += 1; throw new Error("PREFLIGHT-AUDIT-FAIL-SENTINEL"); },
+      downstreamCalls: auditDownstream,
+      logs: auditLogs,
+    });
+    const auditResponse = await request(auditApp).post(PATH).set("Host", new URL(PUBLIC).host)
+      .set("Origin", "https://attacker.example.test").set("Content-Type", JSON_TYPE).send({ state: BODY_STATE });
+    expect.soft(auditResponse.status).toBe(403);
+    expect.soft(auditResponse.body).toEqual({ error: "Request rejected" });
+    expect.soft(auditCalls).toBe(1);
+    expect.soft(auditDownstream).toHaveLength(0);
+    expect.soft(spans).toHaveLength(1);
+    expect.soft(JSON.stringify({ response: auditResponse.body, headers: auditResponse.headers, logs: auditLogs }))
+      .not.toContain("PREFLIGHT-AUDIT-FAIL-SENTINEL");
+
+    spans.length = 0;
+    tracerThrows = true;
+    const traceEvents: unknown[] = [];
+    const traceDownstream: string[] = [];
+    const traceLogs: string[] = [];
+    const traceApp = appFor({ audit: (event) => traceEvents.push(event), downstreamCalls: traceDownstream, logs: traceLogs });
+    const traceResponse = await request(traceApp).post(PATH).set("Host", new URL(PUBLIC).host)
+      .set("Origin", "https://attacker.example.test").set("Content-Type", JSON_TYPE).send({ state: BODY_STATE });
+    expect.soft(traceResponse.status).toBe(403);
+    expect.soft(traceResponse.body).toEqual({ error: "Request rejected" });
+    expect.soft(traceEvents).toHaveLength(1);
+    expect.soft(traceDownstream).toHaveLength(0);
+    expect.soft(spans).toHaveLength(0);
+    const traceSurface = JSON.stringify({ events: traceEvents, body: traceResponse.body, headers: traceResponse.headers, logs: traceLogs });
+    expect.soft(traceSurface).not.toContain("PREFLIGHT-TRACE-FAIL-SENTINEL");
+    expect.soft(traceSurface).not.toContain(BODY_STATE);
   });
 });
