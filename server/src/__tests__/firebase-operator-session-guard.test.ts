@@ -1472,6 +1472,94 @@ describe("Firebase operator guard core and common HTTP boundary", () => {
     }
   });
 
+  it("preserves a currently valid session when authorized interaction refreshes during verifier wait", async () => {
+    const fixture = await assuredUser();
+    const sameUserSession = await addSameUserAssuredSession(fixture);
+    const unrelated = await assuredUser();
+    let clock = Date.now();
+    const deadlines = await setCoherentGuardDeadlines(fixture, clock, "live");
+    const [configuredAssurance] = await db.select().from(firebaseOperatorSessionAssurance)
+      .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+    const beforeMembershipsAndGrants = await cloudSideEffects(fixture.userId);
+    let lookupStartedAt = 0;
+    let providerReleased = false;
+    let signalProvider!: () => void;
+    let releaseProvider!: (proof: Record<string, unknown>) => void;
+    const providerStarted = new Promise<void>((resolve) => { signalProvider = resolve; });
+    const providerResult = new Promise<Record<string, unknown>>((resolve) => { releaseProvider = resolve; });
+    const guard = await createGuard({
+      now: () => clock,
+      checkUser: async (proof) => {
+        lookupStartedAt = proof.checkedAtMs;
+        signalProvider();
+        return providerResult;
+      },
+    }) as {
+      check: (input: { sessionId: string; userId: string; companyId?: string }) => Promise<Record<string, unknown>>;
+    };
+    let pending: Promise<Record<string, unknown>> | undefined;
+    try {
+      pending = guard.check({ sessionId: fixture.session.id, userId: fixture.userId, companyId: fixture.companyId });
+      await providerStarted;
+      // Model an authorized interactive action committed during provider latency.
+      // The timestamp is advanced with the injected clock; this is fixture setup,
+      // not a claim about a UI or a human-presence signal.
+      clock = lookupStartedAt + 30_000;
+      const refreshedAt = new Date(clock);
+      await db.update(firebaseOperatorSessionAssurance)
+        .set({ lastInteractiveAt: refreshedAt })
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+      clock = lookupStartedAt + 60_001;
+      assertDeadlineIsolation({
+        target: "provider",
+        checkedAtMs: lookupStartedAt,
+        finalAtMs: clock,
+        sessionExpiresAt: deadlines.sessionExpiresAt,
+        sessionCreatedAt: deadlines.sessionCreatedAt,
+        absoluteExpiresAt: deadlines.absoluteExpiresAt,
+        lastInteractiveAt: refreshedAt,
+      });
+      releaseProvider({
+        projectId: "thl-pclipd-api",
+        uid: `uid-${fixture.userId}`,
+        authTimeSeconds: configuredAssurance!.authTimeSeconds,
+        totpFactors: [{ factorId: "totp", uid: `factor-${fixture.userId}` }],
+        checkedAtMs: lookupStartedAt,
+      });
+      providerReleased = true;
+      const decision = await pending;
+      expect.soft(decision).toMatchObject({ kind: "denied", status: 503, reason: "dependency_unavailable" });
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, fixture.session.id)))
+        .resolves.toHaveLength(1);
+      const [targetSession] = await db.select().from(authSessions)
+        .where(eq(authSessions.id, fixture.session.id));
+      const [targetAssurance] = await db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, fixture.session.id));
+      expect.soft(targetSession?.expiresAt).toEqual(deadlines.sessionExpiresAt);
+      expect.soft(targetSession?.createdAt).toEqual(deadlines.sessionCreatedAt);
+      expect.soft(targetAssurance?.lastInteractiveAt).toEqual(refreshedAt);
+      expect.soft(targetAssurance?.absoluteExpiresAt).toEqual(deadlines.absoluteExpiresAt);
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, sameUserSession.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, sameUserSession.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(authSessions).where(eq(authSessions.id, unrelated.session.id))).resolves.toHaveLength(1);
+      await expect.soft(db.select().from(firebaseOperatorSessionAssurance)
+        .where(eq(firebaseOperatorSessionAssurance.sessionId, unrelated.session.id))).resolves.toHaveLength(1);
+      await expect.soft(cloudSideEffects(fixture.userId)).resolves.toEqual(beforeMembershipsAndGrants);
+    } finally {
+      if (lookupStartedAt && !providerReleased) {
+        releaseProvider({
+          projectId: configuredAssurance!.projectId,
+          uid: configuredAssurance!.firebaseUid,
+          authTimeSeconds: configuredAssurance!.authTimeSeconds,
+          totpFactors: configuredAssurance!.totpFactors,
+          checkedAtMs: lookupStartedAt,
+        });
+      }
+      if (pending) await pending.catch(() => undefined);
+    }
+  });
+
   it("rechecks current PostgreSQL authorization on a positive-cache hit", async () => {
     const fixture = await assuredUser();
     let providerCalls = 0;
