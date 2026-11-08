@@ -346,7 +346,7 @@ describe("Firebase operator pre-auth HTTP boundary", () => {
       },
       {
         label: "missing Origin",
-        expectedStatus: 403,
+        expectedStatus: 400,
         expectedReason: "origin_denied",
         send: () => request(app).post(PATH).set("Host", new URL(PUBLIC).host).set("Content-Type", JSON_TYPE).send({}),
       },
@@ -435,13 +435,13 @@ describe("Firebase operator pre-auth HTTP boundary", () => {
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as import("node:net").AddressInfo).port;
-    const rawSocket = (fields: string[], body = "{}") => new Promise<{ status: number; text: string }>((resolve, reject) => {
+    const rawSocket = (fields: string[], body = "{}", protocol = "HTTP/1.1") => new Promise<{ status: number; text: string }>((resolve, reject) => {
       const socket = net.connect(port, "127.0.0.1", () => {
-        socket.write(`POST ${PATH} HTTP/1.1\r\n${fields.join("\r\n")}\r\n\r\n${body}`);
+        socket.write(`POST ${PATH} ${protocol}\r\n${fields.join("\r\n")}\r\n\r\n${body}`);
       });
       let text = "";
       socket.on("data", (chunk: Buffer) => { text += chunk.toString(); });
-      socket.on("end", () => resolve({ status: Number(text.match(/^HTTP\/1\.1 (\d+)/)?.[1] ?? 0), text }));
+      socket.on("end", () => resolve({ status: Number(text.match(/^HTTP\/1\.[01] (\d+)/)?.[1] ?? 0), text }));
       socket.on("error", reject);
     });
     const base = [`Host: ${new URL(PUBLIC).host}`, `Origin: ${PUBLIC}`, `Content-Type: ${JSON_TYPE}`, "Content-Length: 2", "Connection: close"];
@@ -475,6 +475,28 @@ describe("Firebase operator pre-auth HTTP boundary", () => {
       });
       expect(downstreamCalls).toHaveLength(0);
     }
+
+    events.length = 0;
+    spans.length = 0;
+    const missingHostFields = [`Origin: ${PUBLIC}`, `Content-Type: ${JSON_TYPE}`, "Content-Length: 2", "Connection: close"];
+    const missingHostResponse = await rawSocket(missingHostFields, "{}", "HTTP/1.0");
+    const [missingHostHeaders, missingHostBody = ""] = missingHostResponse.text.split("\r\n\r\n");
+    const missingHostParsedHeaders = Object.fromEntries((missingHostHeaders ?? "").split("\r\n").slice(1).map((line) => {
+      const colon = line.indexOf(":");
+      return [line.slice(0, colon).toLowerCase(), line.slice(colon + 1).trim()];
+    }));
+    assertObservedDenial({
+      events,
+      expectedReason: "bad_request",
+      response: {
+        status: missingHostResponse.status,
+        body: JSON.parse(missingHostBody),
+        headers: missingHostParsedHeaders,
+      } as request.Response,
+      expectedStatus: 400,
+      logLines: logs,
+    });
+    expect(downstreamCalls).toHaveLength(0);
 
     events.length = 0;
     spans.length = 0;
