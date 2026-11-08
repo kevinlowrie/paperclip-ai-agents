@@ -12,9 +12,9 @@ const firebaseAdminMocks = vi.hoisted(() => {
   };
   return {
     getApps: vi.fn(() => []),
-    initializeApp: vi.fn(() => ({ name: "synthetic-paperclip-app" })),
+    initializeApp: vi.fn((_options?: Record<string, unknown>, _name?: string) => ({ name: "synthetic-paperclip-app" })),
     getAuth: vi.fn(() => auth),
-    applicationDefault: vi.fn(() => { throw new Error("ADC must not be accessed by this test"); }),
+    applicationDefault: vi.fn(() => ({ credentialMarker: "synthetic-adc-credential" })),
     cert: vi.fn(() => { throw new Error("credentials must not be accessed by this test"); }),
     auth,
   };
@@ -111,6 +111,7 @@ async function expectSafeFailure(promise: Promise<unknown>, status: 401 | 503) {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllEnvs();
   firebaseAdminMocks.getApps.mockReset().mockReturnValue([]);
   firebaseAdminMocks.initializeApp.mockReset().mockReturnValue({ name: "synthetic-paperclip-app" });
@@ -155,6 +156,31 @@ describe("Firebase operator verifier", () => {
       user: { tokensValidAfterTime: new Date((nowSeconds - 301) * 1000).toISOString() },
     });
     await expect(verifier.verify(token)).resolves.toMatchObject({ authTimeSeconds: nowSeconds - 300 });
+  });
+
+  it("rejects auth that exceeds five minutes by a fractional second", async () => {
+    const auth = {
+      verifyIdToken: vi.fn(async () => claims({ auth_time: nowSeconds - 300 })),
+      getUser: vi.fn(async () => user()),
+    };
+    const verifier = createFirebaseOperatorVerifier({ auth, now: () => nowMs + 999 });
+    await expectSafeFailure(verifier.verify(token), 401);
+  });
+
+  it.each([null, "not-claims", []])("rejects malformed SDK claims safely: %s", async (decoded) => {
+    const verifier = createFirebaseOperatorVerifier({
+      auth: { verifyIdToken: vi.fn(async () => decoded), getUser: vi.fn(async () => user()) },
+      now: () => nowMs,
+    });
+    await expectSafeFailure(verifier.verify(token), 401);
+  });
+
+  it.each([null, "not-a-user", []])("rejects malformed SDK user records safely: %s", async (currentUser) => {
+    const verifier = createFirebaseOperatorVerifier({
+      auth: { verifyIdToken: vi.fn(async () => claims()), getUser: vi.fn(async () => currentUser) },
+      now: () => nowMs,
+    });
+    await expectSafeFailure(verifier.verify(token), 401);
   });
 
   it("accepts a non-ASCII Firebase UID within the supported length", async () => {
@@ -250,6 +276,20 @@ describe("Firebase operator verifier", () => {
     await expectSafeFailure(makeVerifier({ reject: Object.assign(new Error("provider-secret"), { code: "auth/internal-error" }) }).verifier.verify(token), 503);
   });
 
+  it("rejects an emulator enabled while ID-token verification is in flight", async () => {
+    vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "");
+    const auth = {
+      verifyIdToken: vi.fn(async () => {
+        vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "localhost:9099");
+        return claims();
+      }),
+      getUser: vi.fn(async () => user()),
+    };
+    const verifier = createFirebaseOperatorVerifier({ auth, now: () => nowMs });
+    await expectSafeFailure(verifier.verify(token), 503);
+    expect(auth.getUser).not.toHaveBeenCalled();
+  });
+
   it("rechecks the authoritative user every time and rejects changed factors", async () => {
     const auth = {
       verifyIdToken: vi.fn(async () => claims()),
@@ -301,7 +341,9 @@ describe("production Firebase verifier", () => {
     expect(firebaseAdminMocks.getAuth).not.toHaveBeenCalled();
   });
 
-  it("pins the production project and uses SDK revocation checking without ADC", async () => {
+  it("pins the production project and uses SDK revocation checking with synthetic ADC", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(nowMs);
     vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", "");
     vi.stubEnv("FIREBASE_PROJECT_ID", "attacker-selected-project");
     firebaseAdminMocks.auth.verifyIdToken.mockResolvedValue(claims());
@@ -310,7 +352,10 @@ describe("production Firebase verifier", () => {
     await verifier.verify(token);
     expect(firebaseAdminMocks.initializeApp.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ projectId }));
     expect(firebaseAdminMocks.auth.verifyIdToken).toHaveBeenCalledExactlyOnceWith(token, true);
-    expect(firebaseAdminMocks.applicationDefault).not.toHaveBeenCalled();
+    expect(firebaseAdminMocks.applicationDefault).toHaveBeenCalledExactlyOnceWith();
+    expect(firebaseAdminMocks.initializeApp.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      credential: { credentialMarker: "synthetic-adc-credential" },
+    }));
     expect(firebaseAdminMocks.cert).not.toHaveBeenCalled();
   });
 
