@@ -479,6 +479,66 @@ const support = externalDatabaseUrl
       expect(actions[0]).toMatchObject({ status: "resolved", evidence: { continuationDelivery: "pending", executionReconciliation: { runId: source.runId } } });
       await db.update(issueRecoveryActions).set({ evidence: { ...actions[0]!.evidence, continuationDelivery: "invalidated" } }).where(eq(issueRecoveryActions.id, action!.id));
     });
+    it("retires duplicate legacy holds for one reconciled run without adding delivery owners", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" })
+        .where(eq(heartbeatRuns.id, source.runId)).returning();
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const [older] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      await db.update(issueRecoveryActions).set({ status: "resolved", evidence: {
+        ...older.evidence, automaticRecovery: { replay: "blocked", reason: "Preserve uncertain actions" },
+      } }).where(eq(issueRecoveryActions.id, older.id));
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const [current] = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.sourceIssueId, source.issueId), eq(issueRecoveryActions.status, "active"),
+      ));
+      expect(current.id).not.toBe(older.id);
+      await db.transaction(async tx => {
+        await markExecutionReconciliation(tx as unknown as typeof db, current, {
+          runId: source.runId, providerStopped: true, actionOutcome: "not_performed",
+          outcomeEvidence: "The fixture provider stopped before performing actions.",
+        }, "operator");
+        await tx.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, current.id));
+      });
+      expect(await getExecutionBlocker(db, source.companyId, source.issueId)).toBeNull();
+      const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      expect(actions.filter(action => action.evidence.continuationDelivery === "pending").map(action => action.id)).toEqual([current.id]);
+      expect(actions.find(action => action.id === older.id)?.evidence).toMatchObject({
+        continuationDelivery: "invalidated",
+        coalescedIntoRecoveryActionId: current.id,
+        executionReconciliation: { runId: source.runId },
+      });
+      expect(actions.find(action => action.id === older.id)?.evidence.automaticRecovery).toBeUndefined();
+    });
+
+    it.each(["run", "issue", "company", "cause", "fingerprint", "kind", "workspace", "restoreRecovery", "systemRecovery", "reconciliation"])("preserves a legacy hold with a different %s during reconciliation", async mismatch => {
+      const source = await seed(), other = await seed();
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" })
+        .where(eq(heartbeatRuns.id, source.runId)).returning();
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      const evidence = { runId: mismatch === "run" ? other.runId : source.runId, automaticRecovery: { replay: "blocked" },
+        ...(mismatch === "workspace" ? { workspaceRestoreFailure: "restore_unsafe_archive" } : {}),
+        ...(mismatch === "restoreRecovery" ? { workspaceRestoreRecovery: {} } : {}),
+        ...(mismatch === "systemRecovery" ? { systemRecovery: {} } : {}),
+        ...(mismatch === "reconciliation" ? { executionReconciliation: {} } : {}),
+      };
+      const [untouched] = await db.insert(issueRecoveryActions).values({
+        ...action, id: randomUUID(), status: "resolved", evidence,
+        companyId: mismatch === "company" ? other.companyId : source.companyId,
+        sourceIssueId: mismatch === "issue" ? other.issueId : source.issueId,
+        cause: mismatch === "cause" ? "uncertain_provider_action" : action.cause,
+        fingerprint: mismatch === "fingerprint" ? "different-fingerprint" : action.fingerprint,
+        kind: mismatch === "kind" ? "different-kind" : action.kind,
+      }).returning();
+      await markExecutionReconciliation(db, action, {
+        runId: source.runId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "The fixture provider stopped before performing actions.",
+      }, "operator");
+      const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, untouched.id));
+      expect(after.evidence).toEqual(evidence);
+    });
+
     it("surfaces a failed current reviewer without transferring the original assignment", async () => {
       const source = await seed();
       const reviewerId = randomUUID();
