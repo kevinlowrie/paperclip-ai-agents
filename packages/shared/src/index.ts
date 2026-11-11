@@ -1270,6 +1270,7 @@ export type {
   GitWorktreeBranchIncoherenceEvidence,
   GitWorktreeInProgressOperation,
   HeartbeatRun,
+  IssueRunFinalResponse,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
   ProviderTraceDebugRequest,

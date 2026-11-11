@@ -6,6 +6,7 @@ const mockActivityService = vi.hoisted(() => ({
   list: vi.fn(),
   forIssue: vi.fn(),
   runsForIssue: vi.fn(),
+  finalResponseForIssueRun: vi.fn(),
   issuesForRun: vi.fn(),
   create: vi.fn(),
 }));
@@ -26,6 +27,13 @@ const mockAccessService = vi.hoisted(() => ({
 
 const mockAgentActionAuditService = vi.hoisted(() => ({
   list: vi.fn(),
+}));
+const mockRunRedaction = vi.hoisted(() => vi.fn());
+vi.mock("../services/run-secret-redaction.js", () => ({
+  createRunSecretRedactionRegistry: () => ({ redactForRun: mockRunRedaction }),
+}));
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => ({ getGeneral: async () => ({ censorUsernameInLogs: false }) }),
 }));
 
 vi.mock("../services/activity.js", () => ({
@@ -109,6 +117,8 @@ describe.sequential("activity routes", () => {
     mockAccessService.decide.mockReset();
     mockAccessService.canUser.mockReset();
     mockAgentActionAuditService.list.mockReset();
+    mockRunRedaction.mockReset();
+    mockRunRedaction.mockImplementation(async (_company, _run, value) => value);
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       action: "company_scope:read",
@@ -116,6 +126,73 @@ describe.sequential("activity routes", () => {
       explanation: "Allowed by test mock.",
     });
     mockAccessService.canUser.mockResolvedValue(false);
+  });
+
+  const responseRun = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const responseIssue = { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", companyId: "company-1", projectId: null,
+    parentId: null, assigneeAgentId: "agent-1", assigneeUserId: null, status: "done" };
+
+  it("reads only the authorized issue response and applies run redaction", async () => {
+    mockIssueService.getById.mockResolvedValue(responseIssue);
+    mockActivityService.finalResponseForIssueRun.mockResolvedValue({
+      companyId: "company-1", issueId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", runId: responseRun, text: "private-value",
+    });
+    mockRunRedaction.mockImplementation(async (_company, _run, value) => ({ ...value, text: "[REDACTED]" }));
+    const app = await createApp({ type: "agent", agentId: "agent-1", companyId: "company-1",
+      source: "agent_key", keyId: "key-1", keyScope: { kind: "task_bridge", parentIssueId: "parent-1" } });
+    const res = await requestApp(app, base => request(base).get(`/api/issues/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/runs/${responseRun}/final-response`));
+    expect(res.status).toBe(200);
+    expect(res.headers["cache-control"]).toBe("no-store");
+    expect(res.body.text).toBe("[REDACTED]");
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "issue:read", resource: expect.objectContaining({ companyId: "company-1", issueId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }),
+    }));
+    expect(mockActivityService.finalResponseForIssueRun).toHaveBeenCalledWith("company-1", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", responseRun);
+    expect(mockRunRedaction).toHaveBeenCalledWith("company-1", responseRun, expect.any(Object));
+  });
+
+  it.each(["foreign", "denied", "missing"])("hides %s issue responses before reading run data", async mode => {
+    mockIssueService.getById.mockResolvedValue(mode === "missing" ? null : {
+      ...responseIssue, companyId: mode === "foreign" ? "company-2" : "company-1",
+    });
+    if (mode === "denied") mockAccessService.decide.mockResolvedValue({ allowed: false });
+    const app = await createApp();
+    const res = await requestApp(app, base => request(base).get(`/api/issues/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/runs/${responseRun}/final-response`));
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "Issue not found" });
+    expect(mockActivityService.finalResponseForIssueRun).not.toHaveBeenCalled();
+    expect(mockRunRedaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects anonymous response reads before looking up the issue", async () => {
+    const app = await createApp({ type: "none", source: "none" });
+    const res = await requestApp(app, base => request(base).get(`/api/issues/${responseIssue.id}/runs/${responseRun}/final-response`));
+    expect(res.status).toBe(401);
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockActivityService.finalResponseForIssueRun).not.toHaveBeenCalled();
+    expect(mockRunRedaction).not.toHaveBeenCalled();
+  });
+
+  it("does not return the response when secret redaction fails", async () => {
+    mockIssueService.getById.mockResolvedValue(responseIssue);
+    mockActivityService.finalResponseForIssueRun.mockResolvedValue({ text: "private-response-marker" });
+    mockRunRedaction.mockRejectedValue(new Error("Redaction provider unavailable"));
+    const app = await createApp();
+    const res = await requestApp(app, base => request(base).get(`/api/issues/${responseIssue.id}/runs/${responseRun}/final-response`));
+    expect(res.status).toBe(500);
+    expect(res.headers["cache-control"]).toBe("no-store");
+    expect(JSON.stringify(res.body)).not.toContain("private-response-marker");
+  });
+
+  it("returns 404 for an unbound run and refuses malformed run IDs", async () => {
+    mockIssueService.getById.mockResolvedValue(responseIssue);
+    mockActivityService.finalResponseForIssueRun.mockResolvedValue(null);
+    const app = await createApp();
+    const absent = await requestApp(app, base => request(base).get(`/api/issues/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/runs/${responseRun}/final-response`));
+    expect(absent.status).toBe(404);
+    const malformed = await requestApp(app, base => request(base).get("/api/issues/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/runs/not-uuid/final-response"));
+    expect(malformed.status).toBe(400);
+    expect(mockActivityService.finalResponseForIssueRun).toHaveBeenCalledTimes(1);
   });
 
   it("returns redacted all-actors rows to a basic company reader", async () => {

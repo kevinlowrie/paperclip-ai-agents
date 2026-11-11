@@ -150,6 +150,34 @@ describeEmbeddedPostgres("activity service", () => {
     expect(result.map((event) => event.action)).toEqual(["test.newest", "test.middle"]);
   });
 
+  it("bounds final responses and requires the run's original issue and company", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Fixture", issuePrefix: `F${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Fixture", role: "engineer",
+      status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId,
+      invocationSource: "assignment", status: "succeeded", contextSnapshot: { issueId },
+      resultJson: { summary: "final reply", stdout: "must not return", privateData: "must not return" } });
+    const service = activityService(db);
+    expect(await service.finalResponseForIssueRun(companyId, issueId, runId)).toEqual({
+      schemaVersion: "issue-run-final-response/v1", companyId, issueId, runId, agentId,
+      runStatus: "succeeded", source: "adapter_summary", availability: "available", text: "final reply",
+    });
+    expect(await service.finalResponseForIssueRun(randomUUID(), issueId, runId)).toBeNull();
+    expect(await service.finalResponseForIssueRun(companyId, randomUUID(), runId)).toBeNull();
+    expect(await service.finalResponseForIssueRun(companyId, issueId, randomUUID())).toBeNull();
+    for (const summary of ["x".repeat(16385), "é".repeat(8193), "", 12, null]) {
+      await db.update(heartbeatRuns).set({ resultJson: { summary } }).where(eq(heartbeatRuns.id, runId));
+      expect(await service.finalResponseForIssueRun(companyId, issueId, runId)).toMatchObject({ availability: "unavailable", text: null });
+    }
+    for (const status of ["running", "queued", "failed", "cancelled", "timed_out"] as const) {
+      await db.update(heartbeatRuns).set({ status, resultJson: { summary: "not successful" } }).where(eq(heartbeatRuns.id, runId));
+      expect(await service.finalResponseForIssueRun(companyId, issueId, runId)).toMatchObject({
+        availability: status === "running" || status === "queued" ? "pending" : "unavailable", text: null,
+      });
+    }
+  });
+
   it("returns compact usage and result summaries for issue runs", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
