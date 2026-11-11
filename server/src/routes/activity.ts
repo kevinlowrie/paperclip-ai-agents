@@ -10,6 +10,9 @@ import { sanitizeRecord } from "../redaction.js";
 import { badRequest, forbidden } from "../errors.js";
 import { agentActionAuditService } from "../services/agent-action-audit.js";
 import { logActivity } from "../services/activity-log.js";
+import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { redactCurrentUserValue } from "../log-redaction.js";
 
 /** Max rows a single CSV export will stream (guards against runaway exports). */
 const AUDIT_CSV_EXPORT_MAX_ROWS = 10_000;
@@ -123,6 +126,8 @@ export function activityRoutes(db: Db) {
   const heartbeat = heartbeatService(db);
   const issueSvc = issueService(db);
   const agentAudit = agentActionAuditService(db);
+  const runRedactions = createRunSecretRedactionRegistry(db);
+  const instanceSettings = instanceSettingsService(db);
 
   async function hasAgentAuditPermission(req: import("express").Request, companyId: string) {
     if (req.actor.type !== "board") return false;
@@ -345,6 +350,37 @@ export function activityRoutes(db: Db) {
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const result = await svc.forIssue(issue.id);
     res.json(result);
+  });
+
+  router.get("/issues/:id/runs/:runId/final-response", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    assertAuthenticated(req);
+    const rawId = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, resolveIssueByRef(rawId), "Issue not found");
+    if (!issue) return;
+    // Hide inaccessible issue existence rather than revealing a separate denial.
+    const decision = await access.decide({
+      actor: req.actor, action: "issue:read",
+      resource: { type: "issue", companyId: issue.companyId, issueId: issue.id,
+        projectId: issue.projectId, parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId,
+        status: issue.status },
+    });
+    if (!decision.allowed) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    const runId = z.string().uuid().safeParse(req.params.runId);
+    if (!runId.success) throw badRequest("Invalid run ID");
+    const result = await svc.finalResponseForIssueRun(issue.companyId, issue.id, runId.data);
+    if (!result) {
+      res.status(404).json({ error: "Run response not found" });
+      return;
+    }
+    const redacted = await runRedactions.redactForRun(issue.companyId, runId.data, result);
+    res.json(redactCurrentUserValue(redacted, {
+      enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+    }));
   });
 
   router.get("/issues/:id/runs", async (req, res) => {

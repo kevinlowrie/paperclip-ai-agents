@@ -20,6 +20,9 @@ import { hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, ISSUE_CONTINUATIO
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { classifyRunLiveness } from "./run-liveness.js";
+import type { IssueRunFinalResponse } from "@paperclipai/shared";
+
+export const ISSUE_RUN_FINAL_RESPONSE_MAX_BYTES = 16_384;
 
 export interface ActivityFilters {
   companyId: string;
@@ -387,6 +390,32 @@ export function activityService(db: Db) {
           ),
         )
         .orderBy(desc(activityLog.createdAt)),
+
+    finalResponseForIssueRun: async (companyId: string, issueId: string, runId: string): Promise<IssueRunFinalResponse | null> => {
+      const [run] = await db.select({
+        runId: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        runStatus: heartbeatRuns.status,
+        // Bound the database projection itself; never load logs or a full result blob.
+        text: sql<string | null>`case
+          when ${heartbeatRuns.status} = 'succeeded'
+            and jsonb_typeof(${heartbeatRuns.resultJson} -> 'summary') = 'string'
+            and octet_length(${heartbeatRuns.resultJson} ->> 'summary') between 1 and ${ISSUE_RUN_FINAL_RESPONSE_MAX_BYTES}
+          then ${heartbeatRuns.resultJson} ->> 'summary' else null end`,
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, runId),
+        eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+      )).limit(1);
+      if (!run) return null;
+      const pending = run.runStatus === "queued" || run.runStatus === "running";
+      return {
+        schemaVersion: "issue-run-final-response/v1",
+        ...run, issueId, source: "adapter_summary",
+        availability: pending ? "pending" : run.text === null ? "unavailable" : "available",
+      };
+    },
 
     runsForIssue: async (companyId: string, issueId: string) => {
       scheduleRunLivenessBackfill(companyId, issueId);
