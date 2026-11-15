@@ -1,0 +1,1 @@
+export default { esbuild: { jsx: 'automatic' }, test: { include: ['ui/src/pages/PlanningInventory.test.tsx'], environment: 'node' } };
