@@ -20,3 +20,18 @@ Seven offline source/rendering tests independently pass. Account/membership
 gating, account/company cache keys and noncoalesced native requests address the
 review findings. Full UI build/browser lifecycle/live authentication remain
 unverified, and this commit is not deployment approval.
+
+Follow-up verification: full native Vite production build passed on candidate
+2e425c863 (7670 modules, existing large-chunk/CSS warnings). Eight Chromium
+lifecycle assertions pass with real React Query but synthetic identity/API
+boundaries: membership gating, delayed prior-account response, same-company
+account switch, logout, company switch, and failed refresh clearing.
+Run PORTAL_PLAYWRIGHT_MODULE=/path/to/installed/playwright/index.mjs
+node scripts/test-planning-inventory-browser.mjs. Loopback only; test server and
+browser close afterward. This does not verify deployed authentication or a live
+user session. Fixtures are outside production ui/src.
+
+Independent browser-test review approved: eight Chromium checks, zero page errors.
+Full UI TypeScript noEmit also passed after linking already-installed React/type
+dependencies into the isolated SDK package's ignored node_modules. No packages
+downloaded and no shared dependency tree modified. Production page unchanged.
