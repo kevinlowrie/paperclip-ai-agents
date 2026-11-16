@@ -1,5 +1,6 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import fs from "node:fs/promises";
+import { stageManagedCommand, managedCommandPath, type StagedManagedCommand } from "./managed-command.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -595,7 +596,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
       : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
-  const command = asString(config.command, "codex");
+  let command = asString(config.command, "codex");
   const model = asString(config.model, "");
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
@@ -637,6 +638,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   const envConfig = parseObject(config.env);
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  if (config.managedCommand != null && !executionTargetIsRemote) {
+    throw new Error("Managed command requires a remote execution target");
+  }
   let configuredCodexHome =
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
@@ -750,7 +754,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
   let stagedCodexHomeDir: string | null = null;
+  let stagedCommand: StagedManagedCommand | null = null;
   try {
+    if (config.managedCommand != null) {
+      stagedCommand = await stageManagedCommand(config.managedCommand);
+    }
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
     }
@@ -824,10 +832,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 : undefined,
             syncWorkspace: targetWorkspaceRealization?.mode !== "in_place",
             installCommand: SANDBOX_INSTALL_COMMAND,
-            detectCommand: command,
+            // Installation precedes asset upload: detect the underlying CLI, not the unstaged wrapper.
+            detectCommand: stagedCommand ? "codex" : command,
             onProgress: (line) => onLog("stdout", line),
             onRuntimeProgress: ctx.onRuntimeProgress,
             assets: [
+              ...(stagedCommand ? [{ key: "command", localDir: stagedCommand.directory }] : []),
               {
                 key: "home",
                 localDir: stagedCodexHomeDir,
@@ -869,6 +879,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           });
         })()
       : null;
+    if (stagedCommand) {
+      try {
+        command = managedCommandPath(stagedCommand, preparedExecutionTargetRuntime?.assetDirs.command);
+      } catch (error) {
+        // Preparation succeeded but returned no command asset: release its workspace
+        // before the main execution guard exists; never dispatch the old command.
+        try { await preparedExecutionTargetRuntime?.restoreWorkspace(); } catch { /* preserve admission error */ }
+        throw error;
+      }
+    }
     if (preparedExecutionTargetRuntime?.workspaceRemoteDir) {
       effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir;
     }
@@ -1042,8 +1062,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       graceSec,
       onLog,
     });
-    await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv);
-    const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
+    // Verify the uploaded wrapper using the same realized target/cwd used for dispatch.
+    const commandTarget = stagedCommand ? runtimeExecutionTarget : executionTarget;
+    const commandCwd = stagedCommand ? effectiveExecutionCwd : cwd;
+    await ensureAdapterExecutionTargetCommandResolvable(command, commandTarget, commandCwd, runtimeEnv);
+    const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, commandTarget, commandCwd, runtimeEnv);
     const loggedEnv = buildInvocationEnvForLogs(env, {
       runtimeEnv,
       includeRuntimeKeys: ["HOME"],
@@ -1614,6 +1637,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Remove the staged CODEX_HOME allowlist temp dir on every exit path
     // (teardown AND error), never only the happy path. Cleanup failure is
     // logged, not fatal — a leaked temp dir must not crash the run.
+    if (stagedCommand) {
+      await fs.rm(stagedCommand.directory, { recursive: true, force: true }).catch(async () => {
+        try {
+          await onLog("stderr", "[paperclip] Failed to remove staged managed command.\n");
+        } catch { /* cleanup must continue even when logging fails */ }
+      });
+    }
     if (stagedCodexHomeDir) {
       await fs.rm(stagedCodexHomeDir, { recursive: true, force: true }).catch(async (error) => {
         await onLog(
