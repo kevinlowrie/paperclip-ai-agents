@@ -124,12 +124,12 @@ describe("A1/A2 real process adapter selected-target refusal", () => {
 });
 
 describe("A3 actual resolver and capability denial controls", () => {
-  it("keeps process SSH unsupported and does not resolve a credential config", async () => {
-    const target = await resolveEnvironmentExecutionTarget({ db: {} as never,
+  it("explicitly refuses unadmitted process SSH without resolving credential config", async () => {
+    await expect(resolveEnvironmentExecutionTarget({ db: {} as never,
       companyId: "22222222-2222-4222-8222-222222222222", adapterType: "process",
       environment: { id: "env-fixture", driver: "ssh", config: {} },
-      leaseId: "lease-fixture", leaseMetadata: {}, lease: null, environmentRuntime: null });
-    expect(target).toBeNull();
+      leaseId: "lease-fixture", leaseMetadata: {}, lease: null, environmentRuntime: null }))
+      .rejects.toMatchObject({code:"managed_handoff_invalid"});
     expect(configResolver).not.toHaveBeenCalled();
   });
   it("does not advertise process SSH, sandbox or plugin runs while ownership is unqualified", () => {
