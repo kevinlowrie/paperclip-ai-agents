@@ -1,3 +1,4 @@
+import {managedProcessLeaseSettled} from "./managed-process-handoff.js";
 import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -1216,7 +1217,18 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async releaseRunLease(input) {
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      const fresh = await environmentsSvc.getLeaseById(input.lease.id);
+      if (!fresh) return null;
+      if (Object.hasOwn(fresh.metadata ?? {},"managedProcessHandoff")) {
+        if (!managedProcessLeaseSettled(fresh)) {
+          return await environmentsSvc.releaseLease(fresh.id,"pending_cleanup",{cleanupStatus:"failed",
+            expectedManagedHandoff:fresh.metadata!.managedProcessHandoff as Record<string,unknown>});
+        }
+        return await environmentsSvc.releaseLease(fresh.id,input.status,{cleanupStatus:"success",
+          expectedManagedHandoff:fresh.metadata!.managedProcessHandoff as Record<string,unknown>,
+          remoteExecutionTermination:remoteTerminationReceipt(fresh,{providerLeaseId:fresh.providerLeaseId,state:"stopped"})});
+      }
+      return await environmentsSvc.releaseLease(fresh.id,input.status,{expectedManagedHandoffAbsent:true});
     },
 
     async realizeWorkspace(input) {
@@ -3944,7 +3956,7 @@ export function environmentRuntimeService(
           and(
             eq(environmentLeases.heartbeatRunId, heartbeatRunId),
             or(eq(environmentLeases.status, "active"), and(eq(environmentLeases.status, "pending_cleanup"),
-              sql`(${environmentLeases.metadata} ? 'nativeWorkspaceExportResume' or ${environmentLeases.metadata} ? 'sandboxStopAndRetain')`)),
+              sql`(${environmentLeases.metadata} ? 'nativeWorkspaceExportResume' or ${environmentLeases.metadata} ? 'sandboxStopAndRetain' or ${environmentLeases.metadata} ? 'managedProcessHandoff')`)),
           ),
         );
       if (leaseRows.length === 0) {

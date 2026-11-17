@@ -1,3 +1,4 @@
+import {executeManagedHandoff} from "./managed-handoff.js";
 import path from "node:path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "../types.js";
 import {
@@ -57,6 +58,7 @@ function refuseUnownedTarget(ctx: AdapterExecutionContext): AdapterExecutionResu
   if (selected.transport !== "ssh") {
     return bootstrapRefusal("process_execution_target_unsupported", "Selected process transport is unsupported.");
   }
+  if (selected.managedHandoff && selected.recordManagedHandoffOutcome) return null;
   // SSH client/process-group termination and lease release cannot certify remote
   // work teardown. Keep managed dispatch disabled until its real owner qualifies.
   return bootstrapRefusal("process_ssh_owned_control_unavailable", "Selected SSH target has no verified owned command control.");
@@ -66,6 +68,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const { runId, agent, config, onLog, onMeta, authToken } = ctx;
   const targetRefusal = refuseUnownedTarget(ctx);
   if (targetRefusal) return targetRefusal;
+  const selected = ctx.executionTarget ? parseAdapterExecutionTarget(ctx.executionTarget) : null;
+  if (selected?.kind === "remote" && selected.transport === "ssh" && selected.managedHandoff) {
+    return executeManagedHandoff(ctx,selected);
+  }
   const command = asString(config.command, "");
   if (!command) throw new Error("Process adapter missing command");
 

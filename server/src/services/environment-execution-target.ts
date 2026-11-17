@@ -1,3 +1,4 @@
+import {resolveManagedProcessHandoff,recordManagedProcessOutcome} from "./managed-process-handoff.js";
 import type { Db } from "@paperclipai/db";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
@@ -628,16 +629,21 @@ export async function resolveEnvironmentExecutionTarget(input: {
   }
 
   if (
-    !adapterSupportsRemoteManagedEnvironments(input.adapterType) ||
+    (!adapterSupportsRemoteManagedEnvironments(input.adapterType) && input.adapterType !== "process") ||
     input.environment.driver !== "ssh"
   ) {
     return null;
   }
 
+  const managed = input.adapterType === "process"
+    ? await resolveManagedProcessHandoff(input.db,input.companyId,input.environment.id ?? "",input.leaseId ?? "")
+    : undefined;
+  const selectedEnvironment = managed?.environment ?? input.environment;
+  const settlementProfile = managed ? structuredClone(managed.profile) : undefined;
   const parsed = await resolveEnvironmentDriverConfigForRuntime(input.db, input.companyId, {
-    id: input.environment.id,
-    driver: input.environment.driver as "ssh",
-    config: parseObject(input.environment.config),
+    id: selectedEnvironment.id,
+    driver: selectedEnvironment.driver as "ssh",
+    config: parseObject(selectedEnvironment.config),
   });
   if (parsed.driver !== "ssh") {
     return null;
@@ -651,6 +657,8 @@ export async function resolveEnvironmentExecutionTarget(input: {
   return {
     kind: "remote",
     transport: "ssh",
+    ...(managed ? {managedHandoff:managed.profile,recordManagedHandoffOutcome:(outcome:import("@paperclipai/adapter-utils/managed-ssh-handoff").ManagedControlResult)=>
+      recordManagedProcessOutcome(input.db,input.leaseId!,settlementProfile!,outcome)} : {}),
     environmentId: input.environment.id ?? null,
     leaseId: input.leaseId ?? null,
     remoteCwd,

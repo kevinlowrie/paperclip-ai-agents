@@ -1,3 +1,4 @@
+import {ManagedHandoffInvalid,ManagedHandoffUnavailable} from "@paperclipai/adapter-utils/managed-ssh-handoff";
 /**
  * Centralized environment run orchestrator.
  *
@@ -374,6 +375,16 @@ export function environmentRunOrchestrator(
       effectiveExecutionWorkspaceMode,
     } = input;
     let { lease, persistedExecutionWorkspace } = input;
+    const managedProcess = adapterType === "process" && environment.driver === "ssh";
+    if (managedProcess) {
+      let selected;
+      try { selected = await environmentsSvc.getLeaseById(lease.id); }
+      catch {
+        throw new EnvironmentRunError("transport_resolution_failed","Managed handoff unavailable.",{cause:new ManagedHandoffUnavailable()});
+      }
+      if (!selected) throw new EnvironmentRunError("transport_resolution_failed","Managed handoff unavailable.",{cause:new ManagedHandoffInvalid()});
+      lease = selected;
+    }
 
     // Step 1: Build workspace realization request
     const workspaceRealizationRequest = buildWorkspaceRealizationRequest({
@@ -497,7 +508,10 @@ export function environmentRunOrchestrator(
         ...(lease.metadata ?? {}),
         workspaceRealization,
       };
-      const updatedLease = await environmentsSvc.updateLeaseMetadata(lease.id, nextLeaseMetadata);
+      // The admitted process profile is keyed to fresh persisted ownership.
+      // Workspace realization must not overwrite a concurrently changed marker.
+      const updatedLease = managedProcess ? null
+        : await environmentsSvc.updateLeaseMetadata(lease.id, nextLeaseMetadata);
       if (updatedLease) {
         lease = updatedLease;
       }

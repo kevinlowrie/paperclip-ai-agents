@@ -1,3 +1,4 @@
+import {parseManagedSshHandoff, type ManagedSshHandoff, type ManagedControlResult} from "./managed-ssh-handoff.js";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -136,6 +137,9 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 }
 
 export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
+  managedHandoff?: ManagedSshHandoff;
+  /** Trusted native factory closure only; never serialized or task supplied. */
+  recordManagedHandoffOutcome?: (outcome:ManagedControlResult)=>Promise<void>;
   kind: "remote";
   transport: "ssh";
   environmentId?: string | null;
@@ -1355,6 +1359,8 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
   if (kind === "remote" && readStringMeta(parsed, "transport") === "ssh") {
     const spec = parseSshRemoteExecutionSpec(parseObject(parsed.spec));
     if (!spec) return null;
+    const managedHandoff = parsed.managedHandoff == null ? undefined : parseManagedSshHandoff(parsed.managedHandoff);
+    if (parsed.managedHandoff != null && !managedHandoff) return null;
     return {
       kind: "remote",
       transport: "ssh",
@@ -1362,6 +1368,8 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
       leaseId: readStringMeta(parsed, "leaseId"),
       remoteCwd: spec.remoteCwd,
       spec,
+      ...(managedHandoff ? {managedHandoff} : {}),
+      ...(typeof parsed.recordManagedHandoffOutcome === "function" ? {recordManagedHandoffOutcome:parsed.recordManagedHandoffOutcome as (outcome:ManagedControlResult)=>Promise<void>} : {}),
     };
   }
 
