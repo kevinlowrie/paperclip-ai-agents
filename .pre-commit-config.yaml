@@ -1,0 +1,27 @@
+# .pre-commit-config.yaml — paperclip-ai-agents
+#
+# Branch-aware local hooks via scripts/hook_policy.py.
+#   FAST profile on WIP/PR branches (fast commit/push loop).
+#   FULL profile on protected branches (main, testing, freeze,
+#   release-candidate, release, prod).
+#
+# Setup (once per clone):
+#   pre-commit install          # or: make hooks-install
+#   python3 scripts/hook_policy.py status
+
+repos:
+  - repo: local
+    hooks:
+      - id: policy-pre-commit
+        name: Branch-aware pre-commit checks
+        entry: python3 scripts/hook_policy.py pre-commit
+        language: system
+        pass_filenames: true
+        stages: [pre-commit]
+      - id: policy-pre-push
+        name: Branch-aware pre-push gate
+        entry: python3 scripts/hook_policy.py pre-push
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
