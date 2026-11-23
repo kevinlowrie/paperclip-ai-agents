@@ -6,6 +6,7 @@ name: policy-ci
 # before installing dependencies. No DB, browser or network services required.
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
