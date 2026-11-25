@@ -127,6 +127,15 @@ export interface ManagedControlResult {
   owner: {instance_id:string;operation_id:unknown;generation:unknown;context_digest:unknown;payload_digest:unknown} | null;
   status: string; cleanup_complete: boolean; error_code: unknown; result_ref: unknown;
 }
+export function managedOutputRef(request: string): {path:string; expected_uid:number} | null {
+  try {
+    const ref = JSON.parse(request)?.frame?.admitted_context?.business_command?.output_ref;
+    if (!record(ref) || !keys(ref,["path","expected_uid","expected_mode"]) || !absolute(ref.path) ||
+        path.posix.normalize(ref.path) !== ref.path || !Number.isSafeInteger(ref.expected_uid) ||
+        Number(ref.expected_uid) < 0 || ref.expected_mode !== 0o700) return null;
+    return {path:path.posix.join(ref.path,"manifest.json"),expected_uid:Number(ref.expected_uid)};
+  } catch { return null; }
+}
 export function validManagedHandoffOwner(owner:unknown,binding:Record<string,unknown>): boolean {
   if (!record(owner) || !keys(owner,["instance_id","operation_id","generation","context_digest","payload_digest"]) ||
       typeof owner.instance_id!=="string" || !/^[1-9][0-9]*:[0-9]+$/.test(owner.instance_id) ||
@@ -135,7 +144,8 @@ export function validManagedHandoffOwner(owner:unknown,binding:Record<string,unk
       !["context_digest","payload_digest"].every(k=>typeof owner[k]==="string" && /^[a-f0-9]{64}$/.test(owner[k] as string))) return false;
   return ["operation_id","generation","context_digest","payload_digest"].every(k=>isDeepStrictEqual(owner[k],binding[k]));
 }
-export function parseManagedControlResult(value: unknown, profile: ManagedSshHandoff, action: string): ManagedControlResult {
+export function parseManagedControlResult(value: unknown, profile: ManagedSshHandoff, action: string,
+  expected: {path:string; expected_uid:number} | null = null): ManagedControlResult {
   if (!record(value) || !keys(value,["schema","action","binding","custody_status","owner","status","cleanup_complete","error_code","result_ref"]) ||
       value.schema !== "homie.managed-control-result.v1" || value.action !== action ||
       !isDeepStrictEqual(value.binding,profile.binding) ||
@@ -147,11 +157,12 @@ export function parseManagedControlResult(value: unknown, profile: ManagedSshHan
       !["succeeded","failed","cancelled"].includes(String(value.status)))) return invalid();
   if (value.result_ref !== null) {
     const ref=value.result_ref;
-    if (!record(ref) || !keys(ref,["path","sha256","size_bytes","media_type","expected_uid","expected_mode"]) ||
-        !absolute(ref.path) || typeof ref.sha256!=="string" || !/^[a-f0-9]{64}$/.test(ref.sha256) ||
+    if (!expected || !record(ref) || !keys(ref,["path","sha256","size_bytes","media_type","expected_uid","expected_mode"]) ||
+        ref.path !== expected.path || ref.expected_uid !== expected.expected_uid ||
+        typeof ref.sha256!=="string" || !/^[a-f0-9]{64}$/.test(ref.sha256) ||
         !Number.isSafeInteger(ref.size_bytes) || Number(ref.size_bytes)<1 || Number(ref.size_bytes)>65536 ||
-        ref.media_type!=="application/json" || !Number.isSafeInteger(ref.expected_uid) || Number(ref.expected_uid)<0 ||
-        ref.expected_mode!==0o600 || value.status!=="succeeded" || value.cleanup_complete!==true) return invalid();
+        ref.media_type!=="application/json" || ref.expected_mode!==0o600 ||
+        value.status!=="succeeded" || value.cleanup_complete!==true) return invalid();
   }
   if (value.status==="succeeded" && (value.cleanup_complete!==true || value.error_code!==null || value.result_ref===null)) return invalid();
   return value as unknown as ManagedControlResult;
