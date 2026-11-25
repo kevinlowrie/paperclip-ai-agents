@@ -1,6 +1,6 @@
 # Native C2 assembly supplement
 
-Run only on BillIron:
+Run only on a trusted Linux test host with the documented fixture prerequisites:
 
 `node tests/process-ssh-c2-assembly/run.mjs /absolute/pinned/prepare_native.py`
 
