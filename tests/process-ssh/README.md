@@ -1,6 +1,6 @@
 # Process/SSH qualification lane
 
-This is an explicit source-test lane. Ordinary Vitest discovery excludes exactly its two server suites and one adapter-utils suite; it does not import a mandatory-root test or start SSH fixtures accidentally. The default exclusion rules remain intact. The stable server walker uses the same two exact server paths before sharding.
+This is an explicit source-test lane. Ordinary Vitest discovery excludes its two server suites; the dedicated adapter test is outside the workspace projects and runs only in this lane. This avoids importing a mandatory-root test or starting SSH fixtures accidentally. The default exclusion rules remain intact. The stable server walker uses the same two exact server paths before sharding.
 
 From the repository root, with installed workspace dependencies:
 
