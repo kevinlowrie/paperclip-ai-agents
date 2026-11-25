@@ -1,6 +1,6 @@
 /** Selected, privately admitted SSH -> existing HGL stdin control. No launcher here. */
 import {isDeepStrictEqual} from "node:util";
-import {readManagedSshProfile,readManagedSshRequest,parseManagedControlResult,type ManagedControlResult} from "@paperclipai/adapter-utils/managed-ssh-handoff";
+import {readManagedSshProfile,readManagedSshRequest,managedOutputRef,parseManagedControlResult,type ManagedControlResult} from "@paperclipai/adapter-utils/managed-ssh-handoff";
 import {runSshCommand,shellQuote} from "@paperclipai/adapter-utils/ssh";
 import type {AdapterSshExecutionTarget} from "@paperclipai/adapter-utils/execution-target";
 import type {AdapterExecutionContext,AdapterExecutionResult} from "../types.js";
@@ -21,6 +21,7 @@ export async function executeManagedHandoff(ctx:AdapterExecutionContext,target:A
         profile.binding.company_id!==ctx.agent.companyId || profile.binding.lease_id!==target.leaseId ||
         profile.binding.environment_id!==target.environmentId) return pending("process_managed_handoff_invalid");
     const submit=await readManagedSshRequest(profile);
+    const expectedOutput=managedOutputRef(submit);
     const request=JSON.parse(submit);
     const refs=request.frame.credential_refs;
     const leaseEnd=Math.min(Number(profile.binding.deadline),
@@ -33,12 +34,12 @@ export async function executeManagedHandoff(ctx:AdapterExecutionContext,target:A
       const end=Math.min(leaseEnd,cleanupDeadline??leaseEnd,Date.now()+(action==="cancel"?1000:8000));
       if(end<=Date.now())throw new Error("Managed control deadline reached.");
       const result=await runSshCommand(target.spec,command(action),{
-        inputMode:"private_v1",stdin:input,env:profile.control_env,
+        inputMode:"private_v1",privateStdout:"trusted_protocol_v1",stdin:input,env:profile.control_env,
         deadlineEpochMs:Math.floor(end),timeoutMs:Math.max(1,end-Date.now()),maxBuffer:65536});
       // private_v1 proves transport custody only. Program output gains meaning
       // from the fixed trusted HGL CLI, independent protected binding, exact
       // protocol/owner checks and native settlement CAS.
-      return parseManagedControlResult(JSON.parse(result.stdout),profile,action);
+      return parseManagedControlResult(JSON.parse(result.stdout),profile,action,expectedOutput);
     };
     const cancel=()=>{
       cancellationRequested=true;

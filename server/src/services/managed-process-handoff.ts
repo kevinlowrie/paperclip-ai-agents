@@ -3,7 +3,7 @@ import {and,eq,inArray,sql} from "drizzle-orm";
 import {agents,authUsers,companyMemberships,environments,environmentLeases,executionWorkspaces,heartbeatRuns,issues,
  type Db} from "@paperclipai/db";
 import {isDeepStrictEqual} from "node:util";
-import {ManagedHandoffInvalid,ManagedHandoffUnavailable,readManagedSshProfile,parseManagedControlResult,validManagedHandoffOwner,type ManagedSshHandoff,type ManagedControlResult} from "@paperclipai/adapter-utils/managed-ssh-handoff";
+import {ManagedHandoffInvalid,ManagedHandoffUnavailable,readManagedSshProfile,readManagedSshRequest,managedOutputRef,parseManagedControlResult,validManagedHandoffOwner,type ManagedSshHandoff,type ManagedControlResult} from "@paperclipai/adapter-utils/managed-ssh-handoff";
 import {authorizationService,responsibleUserAuthzShadowMode} from "./authorization.js";
 
 export async function resolveManagedProcessHandoff(db:Db,companyId:string,environmentId:string,leaseId:string) {
@@ -55,7 +55,8 @@ export async function resolveManagedProcessHandoff(db:Db,companyId:string,enviro
 export async function recordManagedProcessOutcome(
   db:Db,leaseId:string,profile:ManagedSshHandoff,result:ManagedControlResult,
 ):Promise<void> {
-  const verified=parseManagedControlResult(result,profile,result.action);
+  const expected=managedOutputRef(await readManagedSshRequest(profile));
+  const verified=parseManagedControlResult(result,profile,result.action,expected);
   const [lease]=await db.select().from(environmentLeases).where(eq(environmentLeases.id,leaseId));
   let marker=lease?.metadata?.managedProcessHandoff as Record<string,unknown>|undefined;
   if(!lease||!marker||!isDeepStrictEqual(marker.binding,profile.binding)||
