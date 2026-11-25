@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
-const expectedSha = "8808012de9c53ea006598ce6052351dc2b7e3780d03b88fb32ab1d8b3fe2e333";
+const expectedSha = "42c8fb2905b8583d14609aa472c59917c98c9fadf5b87fb5c57d133b52a60ea9";
 const replacements = [
   [
     "      const config = await buildSshEnvLabFixtureConfig(state);\n      await ensureSshWorkspaceReady(config);",
