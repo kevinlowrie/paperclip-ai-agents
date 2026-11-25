@@ -9,7 +9,7 @@ export const serverDedicatedTests = Object.freeze([
   "server/src/__tests__/process-adapter-ssh-target.test.ts",
   "server/src/__tests__/process-adapter-ssh-lifecycle.test.ts",
 ]);
-const unit = Object.freeze([serverDedicatedTests[0], "packages/adapter-utils/src/ssh-private-input.test.ts"]);
+const unit = Object.freeze([serverDedicatedTests[0], "tests/process-ssh/ssh-private-input.test.ts"]);
 const ssh = Object.freeze([serverDedicatedTests[1], "tests/process-ssh/supplemental.test.ts"]);
 export const lanes = Object.freeze({ unit: { files: unit, count: 41 }, ssh: { files: ssh, count: 8 },
   all: { files: Object.freeze([...unit, ...ssh]), count: 49 } });
