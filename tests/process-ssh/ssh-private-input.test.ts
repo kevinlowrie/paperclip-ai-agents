@@ -1,9 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { runSshCommand } from "./ssh.js";
-import { createPreWireObserver } from "../../../server/src/__tests__/fixtures/process-ssh-target/observer-fixture.js";
-import { PRIVATE_CANARIES } from "../../../server/src/__tests__/fixtures/process-ssh-target/constants.js";
+import { runSshCommand } from "../../packages/adapter-utils/src/ssh.js";
+import { createPreWireObserver } from "../../server/src/__tests__/fixtures/process-ssh-target/observer-fixture.js";
+import { PRIVATE_CANARIES } from "../../server/src/__tests__/fixtures/process-ssh-target/constants.js";
 
 const parent = process.env.PAPERCLIP_PROCESS_SSH_TEST_ROOT;
 if (!parent || !path.isAbsolute(parent)) throw new Error("explicit private fixture root required");
