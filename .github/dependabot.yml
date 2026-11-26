@@ -3,8 +3,7 @@ updates:
   - package-ecosystem: npm
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: "daily"
       time: "06:00"
     # Each dependency update gets its own pull request, including major
     # version bumps. A grouped major PR cannot merge when one member has
@@ -33,8 +32,7 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: "daily"
       time: "06:00"
     open-pull-requests-limit: 5
     ignore:
@@ -52,8 +50,7 @@ updates:
       - "/docker/untrusted-review"
       - "/packages/plugins/sandbox-providers/cloudflare/bridge-template"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "06:00"
     open-pull-requests-limit: 5
     labels:
@@ -66,8 +63,7 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/packages/paperclip-runner/runner"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "06:00"
     open-pull-requests-limit: 5
     labels:
@@ -80,8 +76,7 @@ updates:
   - package-ecosystem: "gomod"
     directory: "/tools/agent-shim"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "06:00"
     open-pull-requests-limit: 5
     labels:
@@ -103,8 +98,7 @@ updates:
       - "/packages/plugins/sandbox-providers/modal"
       - "/packages/plugins/sandbox-providers/novita"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "06:00"
     open-pull-requests-limit: 10
     labels:
