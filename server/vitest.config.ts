@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   resolve: {
@@ -16,6 +16,10 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
+    // These mandatory-root suites run only through the guarded public lane.
+    exclude: [...configDefaults.exclude,
+      "src/__tests__/process-adapter-ssh-target.test.ts",
+      "src/__tests__/process-adapter-ssh-lifecycle.test.ts"],
     // Each server suite boots + tears down its own embedded Postgres in
     // beforeAll/afterAll. Under the loaded serial shard (maxWorkers=1) the
     // graceful shutdown can occasionally cross vitest's default 10s hookTimeout,

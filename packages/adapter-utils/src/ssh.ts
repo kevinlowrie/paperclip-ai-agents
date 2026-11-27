@@ -36,6 +36,15 @@ export interface SshCommandResult {
   stderr: string;
 }
 
+export interface RunSshCommandOptions {
+  env?: Record<string, string>;
+  stdin?: string;
+  timeoutMs?: number;
+  maxBuffer?: number;
+  inputMode?: "legacy" | "private_v1";
+  deadlineEpochMs?: number;
+}
+
 export interface SshRemoteExecutionSpec extends SshConnectionConfig {
   remoteCwd: string;
 }
@@ -223,14 +232,17 @@ async function spawnText(
   file: string,
   args: string[],
   options: {
-    stdin?: string;
+    stdin?: string | Buffer;
     timeout?: number;
     maxBuffer?: number;
+    env?: NodeJS.ProcessEnv;
+    privateTransport?: boolean;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
     const child = spawn(file, args, {
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+      env: options.env,
     });
 
     const maxBuffer = options.maxBuffer ?? 1024 * 128;
@@ -238,6 +250,8 @@ async function spawnText(
     let stderr = "";
     let settled = false;
     let timedOut = false;
+    let outputExceeded = false;
+    let inputFailed = false;
 
     const finishReject = (error: Error & { stdout?: string; stderr?: string; code?: number | null; killed?: boolean }) => {
       if (settled) return;
@@ -259,10 +273,15 @@ async function spawnText(
         stderr += text;
       }
       if (Buffer.byteLength(stdout, "utf8") > maxBuffer || Buffer.byteLength(stderr, "utf8") > maxBuffer) {
-        child.kill("SIGTERM");
-        finishReject(Object.assign(new Error(`Process output exceeded maxBuffer of ${maxBuffer} bytes.`), {
-          code: null,
-        }));
+        if (options.privateTransport) {
+          outputExceeded = true;
+          child.kill("SIGKILL");
+        } else {
+          child.kill("SIGTERM");
+          finishReject(Object.assign(new Error(`Process output exceeded maxBuffer of ${maxBuffer} bytes.`), {
+            code: null,
+          }));
+        }
       }
     };
 
@@ -270,6 +289,10 @@ async function spawnText(
     const timeout = options.timeout && options.timeout > 0
       ? setTimeout(() => {
           timedOut = true;
+          if (options.privateTransport) {
+            child.kill("SIGKILL");
+            return;
+          }
           child.kill("SIGTERM");
           // Escalate to SIGKILL after a 5s grace window so a hung remote
           // command that ignores SIGTERM cannot keep the child alive
@@ -307,7 +330,7 @@ async function spawnText(
       clearTimers();
       if (settled) return;
       settled = true;
-      if (code === 0) {
+      if (code === 0 && !(options.privateTransport && (timedOut || outputExceeded || inputFailed))) {
         resolve({ stdout, stderr });
         return;
       }
@@ -320,6 +343,12 @@ async function spawnText(
       }));
     });
 
+    if (options.privateTransport) {
+      child.stdin?.on("error", () => {
+        inputFailed = true;
+        child.kill("SIGKILL");
+      });
+    }
     if (options.stdin != null && child.stdin) {
       child.stdin.end(options.stdin);
     }
@@ -354,58 +383,83 @@ async function resolveCommandPath(command: string): Promise<string | null> {
   }
 }
 
+function sshCleanupReferences(error: unknown): string[] {
+  const references = (error as { cleanupReferences?: unknown } | null)?.cleanupReferences;
+  return Array.isArray(references) ? references.filter((value): value is string => typeof value === "string") : [];
+}
+
+function sshCredentialCleanupUnverified(references: string[]): Error {
+  const error = new Error("Private SSH credential cleanup is unverified.");
+  // Keep owned references available to the trusted caller without serializing
+  // them into logs/task JSON or discarding them on an IO exception.
+  Object.defineProperty(error, "cleanupReferences", { value: [...new Set(references)], enumerable: false });
+  return error;
+}
+
 async function withTempFile(
   prefix: string,
   contents: string,
   mode: number,
+  strictCleanup = false,
 ): Promise<{ path: string; cleanup: () => Promise<void> }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   const filePath = path.join(dir, "payload");
   const normalizedContents = contents.endsWith("\n") ? contents : `${contents}\n`;
-  await fs.writeFile(filePath, normalizedContents, { mode, encoding: "utf8" });
-  return {
-    path: filePath,
-    cleanup: async () => {
-      await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
-    },
+  const cleanup = async () => {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch {
+      if (strictCleanup) throw sshCredentialCleanupUnverified([dir]);
+    }
   };
+  try {
+    await fs.writeFile(filePath, normalizedContents, { mode, encoding: "utf8" });
+  } catch (error) {
+    if (strictCleanup) await cleanup();
+    throw error;
+  }
+  return { path: filePath, cleanup };
 }
 
 async function createSshAuthArgs(
   config: Pick<SshConnectionConfig, "privateKey" | "knownHosts" | "strictHostKeyChecking">,
+  strictCleanup = false,
 ): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
   const tempFiles: Array<() => Promise<void>> = [];
-  const sshArgs = [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=10",
-    "-o",
-    `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`,
-  ];
-
-  if (config.strictHostKeyChecking) {
-    if (config.knownHosts) {
-      const knownHosts = await withTempFile("paperclip-ssh-known-hosts-", config.knownHosts, 0o600);
-      tempFiles.push(knownHosts.cleanup);
-      sshArgs.push("-o", `UserKnownHostsFile=${knownHosts.path}`);
+  const cleanup = async () => {
+    if (!strictCleanup) {
+      await Promise.all(tempFiles.map(release => release()));
+      return;
     }
-  } else {
-    sshArgs.push("-o", "UserKnownHostsFile=/dev/null");
-  }
-
-  if (config.privateKey) {
-    const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600);
-    tempFiles.push(privateKey.cleanup);
-    sshArgs.push("-i", privateKey.path);
-  }
-
-  return {
-    args: sshArgs,
-    cleanup: async () => {
-      await Promise.all(tempFiles.map((cleanup) => cleanup()));
-    },
+    const outcomes = await Promise.allSettled(tempFiles.map(release => release()));
+    const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+    if (failures.length) throw sshCredentialCleanupUnverified(failures.flatMap(outcome => sshCleanupReferences(outcome.reason)));
   };
+  try {
+    const sshArgs = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o",
+      `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`];
+    if (config.strictHostKeyChecking) {
+      if (config.knownHosts) {
+        const knownHosts = await withTempFile("paperclip-ssh-known-hosts-", config.knownHosts, 0o600, strictCleanup);
+        tempFiles.push(knownHosts.cleanup);
+        sshArgs.push("-o", `UserKnownHostsFile=${knownHosts.path}`);
+      }
+    } else {
+      sshArgs.push("-o", "UserKnownHostsFile=/dev/null");
+    }
+    if (config.privateKey) {
+      const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600, strictCleanup);
+      tempFiles.push(privateKey.cleanup);
+      sshArgs.push("-i", privateKey.path);
+    }
+    return { args: sshArgs, cleanup };
+  } catch (error) {
+    if (strictCleanup) {
+      try { await cleanup(); }
+      catch (cleanupError) { throw sshCredentialCleanupUnverified([...sshCleanupReferences(error), ...sshCleanupReferences(cleanupError)]); }
+    }
+    throw error;
+  }
 }
 
 function tarExcludeArgs(exclude: string[] | undefined): string[] {
@@ -1189,16 +1243,139 @@ export function buildKnownHostsEntry(input: {
   return `[${input.host}]:${input.port} ${input.publicKey.trim()}`;
 }
 
+// Constant nonsecret bootstrap. Command source uses a separate descriptor so
+// neither transport argv nor the shell argv contains the private command body.
+// This owns only this foreground transport, never a daemon/capsule lifecycle.
+const PRIVATE_SSH_BOOTSTRAP = String.raw`
+const {spawn}=require("node:child_process");
+const chunks=[]; let size=0;
+const fail=()=>{process.stderr.write("Private SSH input rejected.\n");process.exitCode=64;};
+process.stdin.on("data",chunk=>{
+  size+=chunk.length;
+  if(size>1130560){process.stdin.destroy();fail();return;}
+  chunks.push(chunk);
+});
+process.stdin.on("end",()=>{
+  try {
+    const bytes=Buffer.concat(chunks);let offset=0;
+    const line=()=>{
+      const end=bytes.indexOf(10,offset);
+      if(end<0||end-offset>32)throw 0;
+      const value=bytes.subarray(offset,end).toString("ascii");offset=end+1;return value;
+    };
+    if(line()!=="PAPERCLIP_SSH_PRIVATE_V1")throw 0;
+    const lengths=[line(),line(),line()];
+    if(lengths.some(value=>! /^(0|[1-9][0-9]{0,6})$/.test(value))||offset>64)throw 0;
+    const [envSize,commandSize,inputSize]=lengths.map(Number);
+    if(envSize>65536||commandSize<1||commandSize>16384||inputSize>1048576||
+       offset+envSize+commandSize+inputSize!==bytes.length)throw 0;
+    const envBytes=bytes.subarray(offset,offset+=envSize);
+    const commandBytes=bytes.subarray(offset,offset+=commandSize);
+    const input=bytes.subarray(offset,offset+inputSize);
+    const supplied=JSON.parse(envBytes.toString("utf8"));
+    if(!supplied||typeof supplied!=="object"||Array.isArray(supplied)||Object.keys(supplied).length>64)throw 0;
+    const env={};
+    for(const name of ["PATH","HOME","CODEX_HOME","USER","LOGNAME","LANG","LC_ALL","TZ"]){
+      if(typeof process.env[name]==="string")env[name]=process.env[name];
+    }
+    const blocked=new Set(["HOME","CODEX_HOME","USER","LOGNAME","SHELL","SSH_AUTH_SOCK","SSH_AGENT_PID",
+      "KRB5CCNAME","BASH_ENV","ENV","NODE_OPTIONS","NODE_PATH","LD_PRELOAD","LD_LIBRARY_PATH"]);
+    for(const [name,value] of Object.entries(supplied)){
+      if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)||typeof value!=="string"||value.includes("\0")||blocked.has(name))throw 0;
+      env[name]=value;
+    }
+    if(commandBytes.includes(0)||!Buffer.from(commandBytes.toString("utf8")).equals(commandBytes)||
+       !Buffer.from(envBytes.toString("utf8")).equals(envBytes))throw 0;
+    const child=spawn("/bin/sh",["-c","exec 4<&0; exec 0<&3; exec /bin/sh -s"],{env,stdio:["pipe","inherit","inherit","pipe"]});
+    child.stdin.on("error",()=>{});child.stdio[3].on("error",()=>{});
+    child.on("error",()=>{process.stderr.write("Private SSH command could not start.\n");process.exitCode=127;});
+    child.on("close",(code,signal)=>{process.exitCode=code??(signal?128:127);});
+    child.stdio[3].end(Buffer.concat([Buffer.from("{\n"),commandBytes,Buffer.from("\n} <&4\n")]));child.stdin.end(input);
+  }catch{fail();}
+});
+`;
+
+const PRIVATE_SSH_IDENTITY_ENV = new Set([
+  "HOME", "CODEX_HOME", "USER", "LOGNAME", "SHELL", "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+  "KRB5CCNAME", "BASH_ENV", "ENV", "NODE_OPTIONS", "NODE_PATH", "LD_PRELOAD", "LD_LIBRARY_PATH",
+]);
+
+async function runPrivateSshCommand(
+  config: SshConnectionConfig,
+  command: string,
+  options: RunSshCommandOptions,
+): Promise<SshCommandResult> {
+  const enteredAt = Date.now();
+  const requested = options.deadlineEpochMs;
+  const timeout = options.timeoutMs ?? 15_000;
+  const maxBuffer = options.maxBuffer ?? 131_072;
+  if (!Number.isSafeInteger(requested) || requested! <= enteredAt || requested! > enteredAt + 60_000 ||
+      !Number.isFinite(timeout) || timeout <= 0 || !Number.isSafeInteger(maxBuffer) || maxBuffer <= 0) {
+    throw new Error("Invalid private SSH deadline or buffer limit.");
+  }
+  const deadline = Math.min(requested!, enteredAt + timeout, enteredAt + 15_000);
+  const supplied = options.env ?? {};
+  const entries = Object.entries(supplied);
+  if (entries.length > 64 || entries.some(([name, value]) => !isValidShellEnvKey(name) ||
+      typeof value !== "string" || value.includes("\0") || PRIVATE_SSH_IDENTITY_ENV.has(name))) {
+    throw new Error("Invalid private SSH environment.");
+  }
+  if (typeof command !== "string" || !command || command.includes("\0") ||
+      (options.stdin != null && typeof options.stdin !== "string")) {
+    throw new Error("Invalid private SSH command or input.");
+  }
+  const segments = [Buffer.from(JSON.stringify(supplied)), Buffer.from(command), Buffer.from(options.stdin ?? "")];
+  if (segments[0].length > 65536 || segments[1].length > 16384 || segments[2].length > 1048576) {
+    throw new Error("Private SSH input exceeds the configured bounds.");
+  }
+  const header = Buffer.from("PAPERCLIP_SSH_PRIVATE_V1\n" + segments.map(part => String(part.length) + "\n").join(""));
+  const input = Buffer.concat([header, ...segments]);
+  if (header.length > 64 || input.length > 1130560) throw new Error("Private SSH input exceeds the configured bounds.");
+  if (!config.privateKey || !config.knownHosts || config.strictHostKeyChecking !== true ||
+      !config.host || !config.username || /^[\s-]/.test(config.host) || /^[\s-]/.test(config.username) ||
+      /[\s\0]/.test(config.host + config.username) || !Number.isInteger(config.port) || config.port < 1 || config.port > 65535) {
+    throw new Error("Private SSH requires an explicit identity, target and strict known-host policy.");
+  }
+  const transportEnv = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
+    typeof value === "string" && ["PATH", "HOME", "CODEX_HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR", "SystemRoot"].includes(name)));
+  const secrets = [...new Set([...entries.map(([, value]) => value), command, options.stdin ?? ""])]
+    .filter(Boolean).sort((left, right) => right.length - left.length);
+  const redact = (text: string) => secrets.reduce((result, value) => result.split(value).join("[redacted]"), text);
+  let cleanup: (() => Promise<void>) | undefined;
+  try {
+    const auth = await createSshAuthArgs(config, true);
+    cleanup = auth.cleanup;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Private SSH setup deadline expired.");
+    const bootstrap = `/usr/bin/env -u NODE_OPTIONS -u NODE_PATH -u LD_PRELOAD -u LD_LIBRARY_PATH /usr/bin/node -e ${shellQuote(PRIVATE_SSH_BOOTSTRAP)}`;
+    const result = await spawnText("ssh", ["-F", "/dev/null", "-o", "IdentityAgent=none", "-o", "IdentitiesOnly=yes",
+      "-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "GlobalKnownHostsFile=/dev/null", ...auth.args,
+      "-p", String(config.port), `${config.username}@${config.host}`, bootstrap], {
+      stdin: input, timeout: remaining, maxBuffer, env: transportEnv, privateTransport: true,
+    });
+    return { stdout: redact(result.stdout), stderr: redact(result.stderr) };
+  } catch (error) {
+    const failure = error as { code?: unknown; killed?: unknown };
+    // No raw child error/stdout/stderr/argv is attached: application output is
+    // not a credential boundary, and transport loss is never a stop receipt.
+    const references = sshCleanupReferences(error);
+    const safe = references.length ? sshCredentialCleanupUnverified(references)
+      : new Error("Private SSH command failed; remote completion is unverified.");
+    throw Object.assign(safe, { code: typeof failure.code === "number" ? failure.code : null,
+      killed: failure.killed === true });
+  } finally {
+    try { await cleanup?.(); }
+    catch (error) { throw sshCredentialCleanupUnverified(sshCleanupReferences(error)); }
+  }
+}
+
 export async function runSshCommand(
   config: SshConnectionConfig,
   remoteCommand: string,
-  options: {
-    env?: Record<string, string>;
-    stdin?: string;
-    timeoutMs?: number;
-    maxBuffer?: number;
-  } = {},
+  options: RunSshCommandOptions = {},
 ): Promise<SshCommandResult> {
+  if (options.inputMode === "private_v1") return runPrivateSshCommand(config, remoteCommand, options);
+  if (options.inputMode != null && options.inputMode !== "legacy") throw new Error("Unsupported SSH input mode.");
   let cleanup: () => Promise<void> = () => Promise.resolve();
   try {
     const auth = await createSshAuthArgs(config);

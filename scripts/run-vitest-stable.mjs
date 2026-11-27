@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
+import { isDedicatedProcessSshServerTest } from "../tests/process-ssh/lane.mjs";
 
 const repoRoot = process.cwd();
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
@@ -495,6 +496,7 @@ const routeTests = walk(serverTestsDir)
 const generalServerTestFiles = walk(serverSrcDir)
   .map((file) => toRepoPath(file))
   .filter((repoPath) => repoPath.endsWith(".test.ts"))
+  .filter((repoPath) => !isDedicatedProcessSshServerTest(repoPath))
   .filter((repoPath) => !isRouteOrAuthzTest(repoPath))
   .sort((a, b) => a.localeCompare(b));
 
