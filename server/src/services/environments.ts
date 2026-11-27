@@ -1620,6 +1620,8 @@ export function environmentService(db: Db) {
       status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed" | "retained" | "pending_cleanup"> = "released",
       options?: {
         expectedPendingCleanupAttemptId?: string;
+        expectedManagedHandoff?: Record<string,unknown>;
+        expectedManagedHandoffAbsent?: boolean;
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         remoteExecutionTermination?: Record<string, unknown>;
@@ -1641,7 +1643,14 @@ export function environmentService(db: Db) {
             ? sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
             : sql`${environmentLeases.metadata} - 'remoteExecutionTermination'`,
         })
-        .where(and(eq(environmentLeases.id, id), options?.expectedPendingCleanupAttemptId
+        .where(and(eq(environmentLeases.id, id),
+          options?.expectedManagedHandoff !== undefined
+            ? sql`${environmentLeases.metadata}->'managedProcessHandoff' = ${JSON.stringify(options.expectedManagedHandoff)}::jsonb`
+            : undefined,
+          options?.expectedManagedHandoffAbsent
+            ? sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'managedProcessHandoff')`
+            : undefined,
+          options?.expectedPendingCleanupAttemptId
           ? and(eq(environmentLeases.status, "pending_cleanup"),
               sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${options.expectedPendingCleanupAttemptId}`)
           : undefined))

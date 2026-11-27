@@ -42,6 +42,8 @@ export interface RunSshCommandOptions {
   timeoutMs?: number;
   maxBuffer?: number;
   inputMode?: "legacy" | "private_v1";
+  /** Only for a trusted protocol consumer that validates stdout and never logs it. */
+  privateStdout?: "trusted_protocol_v1";
   deadlineEpochMs?: number;
 }
 
@@ -237,6 +239,7 @@ async function spawnText(
     maxBuffer?: number;
     env?: NodeJS.ProcessEnv;
     privateTransport?: boolean;
+    strictUtf8Stdout?: boolean;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
@@ -252,6 +255,8 @@ async function spawnText(
     let timedOut = false;
     let outputExceeded = false;
     let inputFailed = false;
+    const stdoutBytes: Buffer[] = [];
+    let stdoutSize = 0;
 
     const finishReject = (error: Error & { stdout?: string; stderr?: string; code?: number | null; killed?: boolean }) => {
       if (settled) return;
@@ -314,7 +319,20 @@ async function spawnText(
       if (killEscalation) clearTimeout(killEscalation);
     };
 
+    if (options.privateTransport) {
+      if (!options.strictUtf8Stdout) child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+    }
     child.stdout?.on("data", (chunk) => {
+      if (options.strictUtf8Stdout) {
+        const bytes = Buffer.from(chunk);
+        stdoutSize += bytes.length;
+        if (stdoutSize > maxBuffer) {
+          outputExceeded = true;
+          child.kill("SIGKILL");
+        } else stdoutBytes.push(bytes);
+        return;
+      }
       append("stdout", chunk);
     });
     child.stderr?.on("data", (chunk) => {
@@ -330,6 +348,10 @@ async function spawnText(
       clearTimers();
       if (settled) return;
       settled = true;
+      if (options.strictUtf8Stdout && !outputExceeded) {
+        try { stdout = new TextDecoder("utf-8", {fatal: true}).decode(Buffer.concat(stdoutBytes)); }
+        catch { reject(new Error("Invalid private SSH protocol encoding.")); return; }
+      }
       if (code === 0 && !(options.privateTransport && (timedOut || outputExceeded || inputFailed))) {
         resolve({ stdout, stderr });
         return;
@@ -1309,6 +1331,9 @@ async function runPrivateSshCommand(
   const requested = options.deadlineEpochMs;
   const timeout = options.timeoutMs ?? 15_000;
   const maxBuffer = options.maxBuffer ?? 131_072;
+  if (options.privateStdout != null && options.privateStdout !== "trusted_protocol_v1") {
+    throw new Error("Unsupported private SSH stdout mode.");
+  }
   if (!Number.isSafeInteger(requested) || requested! <= enteredAt || requested! > enteredAt + 60_000 ||
       !Number.isFinite(timeout) || timeout <= 0 || !Number.isSafeInteger(maxBuffer) || maxBuffer <= 0) {
     throw new Error("Invalid private SSH deadline or buffer limit.");
@@ -1352,8 +1377,10 @@ async function runPrivateSshCommand(
       "-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "GlobalKnownHostsFile=/dev/null", ...auth.args,
       "-p", String(config.port), `${config.username}@${config.host}`, bootstrap], {
       stdin: input, timeout: remaining, maxBuffer, env: transportEnv, privateTransport: true,
+      strictUtf8Stdout: options.privateStdout === "trusted_protocol_v1",
     });
-    return { stdout: redact(result.stdout), stderr: redact(result.stderr) };
+    return { stdout: options.privateStdout === "trusted_protocol_v1" ? result.stdout : redact(result.stdout),
+      stderr: redact(result.stderr) };
   } catch (error) {
     const failure = error as { code?: unknown; killed?: unknown };
     // No raw child error/stdout/stderr/argv is attached: application output is
@@ -1375,6 +1402,7 @@ export async function runSshCommand(
   options: RunSshCommandOptions = {},
 ): Promise<SshCommandResult> {
   if (options.inputMode === "private_v1") return runPrivateSshCommand(config, remoteCommand, options);
+  if (options.privateStdout != null) throw new Error("Private SSH stdout mode requires private transport.");
   if (options.inputMode != null && options.inputMode !== "legacy") throw new Error("Unsupported SSH input mode.");
   let cleanup: () => Promise<void> = () => Promise.resolve();
   try {
