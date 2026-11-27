@@ -3,8 +3,7 @@ updates:
   - package-ecosystem: npm
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: "daily"
       time: "06:00"
     # Each dependency update gets its own pull request, including major
     # version bumps. A grouped major PR cannot merge when one member has
@@ -33,10 +32,79 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: "daily"
       time: "06:00"
     open-pull-requests-limit: 5
     ignore:
       # This first-party workflow follows CODEOWNERS-protected master.
       - dependency-name: "paperclipai/paperclip/.github/workflows/pr-trusted.yml"
+
+  # Added: ecosystems this repo ships that the entries above do not cover.
+  - package-ecosystem: "docker"
+    directories:
+      - "/"
+      - "/.github"
+      - "/docker/daytona-runner"
+      - "/docker/hermes-gateway-smoke"
+      - "/docker/openclaw-smoke"
+      - "/docker/untrusted-review"
+      - "/packages/plugins/sandbox-providers/cloudflare/bridge-template"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      docker-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+  - package-ecosystem: "cargo"
+    directory: "/packages/paperclip-runner/runner"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+  - package-ecosystem: "gomod"
+    directory: "/tools/agent-shim"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      gomod-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+  - package-ecosystem: "npm"
+    directories:
+      - "/packages/plugins/sandbox-providers/cloudflare"
+      - "/packages/plugins/sandbox-providers/cloudflare/bridge-template"
+      - "/packages/plugins/sandbox-providers/createos"
+      - "/packages/plugins/sandbox-providers/daytona"
+      - "/packages/plugins/sandbox-providers/e2b"
+      - "/packages/plugins/sandbox-providers/exe-dev"
+      - "/packages/plugins/sandbox-providers/kubernetes"
+      - "/packages/plugins/sandbox-providers/modal"
+      - "/packages/plugins/sandbox-providers/novita"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
