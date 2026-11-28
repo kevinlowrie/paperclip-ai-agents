@@ -73,4 +73,3 @@ export function managedCommandPath(staged: StagedManagedCommand, remoteDirectory
   if (!remoteDirectory || !path.posix.isAbsolute(remoteDirectory)) throw fail();
   return path.posix.join(remoteDirectory, staged.entrypoint);
 }
-
