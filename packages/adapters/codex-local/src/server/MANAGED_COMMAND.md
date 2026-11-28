@@ -3,13 +3,16 @@
 This source change does not deploy a wrapper or change an agent configuration.
 It provides an explicit adapter-config `managedCommand` package independent of
 the selected project checkout. Without this field, command behavior is unchanged.
-The field requires a remote target. It is trusted operator adapter configuration,
-not task or workspace content.
+Use a remote target and explicitly set `"engine": "cli"`. The adapter
+rejects the package before dispatch when the engine resolves to ACP, including
+when the engine is omitted or set to `auto`. Keep the package definition in
+trusted operator adapter configuration.
 
 Example shape (replace both digest placeholders with reviewed file hashes):
 
 ```json
 {
+  "engine": "cli",
   "managedCommand": {
     "sourceDir": "/opt/paperclip/operator-command",
     "entrypoint": "wrapper.mjs",
