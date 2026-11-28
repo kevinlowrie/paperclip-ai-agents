@@ -246,8 +246,9 @@ async function prepareCodexHelloProbe(input: {
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
+  const config = parseObject(ctx.config);
   const engineSelection = await resolveCodexExecutionEngineForRun({
-    config: parseObject(ctx.config),
+    config,
     executionTarget: ctx.executionTarget,
   });
   if (engineSelection.unavailableReason) {
@@ -258,7 +259,7 @@ export async function testEnvironment(
         code: "adapter_engine_unavailable",
         level: "error",
         message: engineSelection.unavailableReason,
-        hint: ctx.executionTarget?.kind === "remote"
+        hint: ctx.executionTarget?.kind === "remote" && config.managedCommand == null
           ? "In the agent’s runtime settings, select the CLI engine, or use a sandbox image with the Codex ACP server installed."
           : undefined,
       }],
@@ -270,7 +271,6 @@ export async function testEnvironment(
   }
 
   const checks: AdapterEnvironmentCheck[] = [];
-  const config = parseObject(ctx.config);
   const command = asString(config.command, "codex");
   const target = ctx.executionTarget ?? null;
   const targetIsRemote = target?.kind === "remote";

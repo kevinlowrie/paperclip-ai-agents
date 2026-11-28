@@ -90,6 +90,12 @@ export async function resolveCodexExecutionEngineForRun(
   const selection = normalizeEngine(input.config.engine);
   // Engine availability must never change the agent's execution or permission contract.
   if (selection.engine === "cli") return selection;
+  if (input.config.managedCommand != null) {
+    return {
+      ...selection,
+      unavailableReason: "Managed command packages require the remote Codex CLI. Explicitly set engine=cli and use a remote execution target.",
+    };
+  }
   const unavailable = (reason: string): CodexEngineSelection => ({
     ...selection,
     unavailableReason: `${reason} Repair the ACP setup, or explicitly set engine=cli to use the CLI engine.`,
