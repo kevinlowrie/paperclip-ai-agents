@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { HttpError } from "../errors.js";
-import { normalizeEnvironmentConfig, parseEnvironmentDriverConfig } from "../services/environment-config.ts";
+import {
+  normalizeEnvironmentConfig,
+  normalizeEnvironmentConfigForPersistence,
+  normalizeEnvironmentConfigForProbe,
+  normalizeLifecycleSshConfigProposal,
+  parseEnvironmentDriverConfig,
+} from "../services/environment-config.ts";
 
 describe("environment config helpers", () => {
   it("normalizes SSH config into its canonical stored shape", () => {
@@ -103,6 +109,97 @@ describe("environment config helpers", () => {
         strictHostKeyChecking: false,
       },
     });
+  });
+
+  it("normalizes a lifecycle SSH proposal without any static SSH target or credential", () => {
+    expect(normalizeLifecycleSshConfigProposal({
+      mode: "lifecycle",
+      version: "ssh-lifecycle/v1",
+      controllerRef: "operator-runner",
+      operationIdentitySource: "company_environment_agent_heartbeat",
+    })).toEqual({
+      mode: "lifecycle",
+      version: "ssh-lifecycle/v1",
+      controllerRef: "operator-runner",
+      operationIdentitySource: "company_environment_agent_heartbeat",
+    });
+  });
+
+  it.each([
+    { version: "ssh-lifecycle/v2" },
+    { controllerRef: "" },
+    { controllerRef: "https://controller.example.test" },
+    { controllerRef: "../runner" },
+    { operationIdentitySource: "caller_supplied" },
+    { host: "ssh.example.test" },
+    { port: 22 },
+    { username: "ssh-user" },
+    { remoteWorkspacePath: "/tmp/workspace" },
+    { privateKey: "PRIVATE KEY" },
+    { privateKeySecretRef: { type: "secret_ref", secretId: "11111111-1111-1111-1111-111111111111" } },
+    { knownHosts: "ssh.example.test ssh-ed25519 AAAA" },
+    { strictHostKeyChecking: false },
+  ])("rejects lifecycle SSH proposal override %j", (override) => {
+    expect(() => normalizeLifecycleSshConfigProposal({
+      mode: "lifecycle",
+      version: "ssh-lifecycle/v1",
+      controllerRef: "operator-runner",
+      operationIdentitySource: "company_environment_agent_heartbeat",
+      ...override,
+    })).toThrow(HttpError);
+  });
+
+  it("does not echo a rejected lifecycle private key in the validation error", () => {
+    try {
+      normalizeLifecycleSshConfigProposal({
+        mode: "lifecycle",
+        version: "ssh-lifecycle/v1",
+        controllerRef: "operator-runner",
+        operationIdentitySource: "company_environment_agent_heartbeat",
+        privateKey: "SENSITIVE_PRIVATE_KEY_MARKER",
+      });
+      throw new Error("Expected lifecycle proposal rejection");
+    } catch (error) {
+      expect(error).toBeInstanceOf(HttpError);
+      expect(JSON.stringify(error)).not.toContain("SENSITIVE_PRIVATE_KEY_MARKER");
+      expect(String(error)).not.toContain("SENSITIVE_PRIVATE_KEY_MARKER");
+    }
+  });
+
+  it("fails closed for a valid lifecycle proposal on existing save and runtime paths", () => {
+    const proposal = {
+      mode: "lifecycle",
+      version: "ssh-lifecycle/v1",
+      controllerRef: "operator-runner",
+      operationIdentitySource: "company_environment_agent_heartbeat",
+    };
+    expect(() => normalizeEnvironmentConfig({ driver: "ssh", config: proposal }))
+      .toThrow("runtime support");
+    expect(() => parseEnvironmentDriverConfig({ driver: "ssh", config: proposal }))
+      .toThrow("runtime support");
+  });
+
+  it("rejects lifecycle probe and persistence before touching a database or secret provider", async () => {
+    const proposal = {
+      mode: "lifecycle",
+      version: "ssh-lifecycle/v1",
+      controllerRef: "operator-runner",
+      operationIdentitySource: "company_environment_agent_heartbeat",
+    };
+    expect(() => normalizeEnvironmentConfigForProbe({
+      db: null as never,
+      companyId: "company-1",
+      driver: "ssh",
+      config: proposal,
+    })).toThrow("runtime support");
+    await expect(normalizeEnvironmentConfigForPersistence({
+      db: null as never,
+      companyId: "company-1",
+      environmentName: "test",
+      driver: "ssh",
+      secretProvider: null as never,
+      config: proposal,
+    })).rejects.toThrow("runtime support");
   });
 
   it("normalizes sandbox config into its canonical stored shape", () => {

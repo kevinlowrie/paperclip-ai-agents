@@ -5,6 +5,7 @@ import type {
   Environment,
   EnvironmentDriver,
   FakeSandboxEnvironmentConfig,
+  LifecycleSshEnvironmentConfig,
   LocalEnvironmentConfig,
   PluginEnvironmentConfig,
   PluginSandboxEnvironmentConfig,
@@ -67,6 +68,33 @@ const sshEnvironmentConfigProbeSchema = sshEnvironmentConfigSchema.extend({
 }).strict();
 
 const sshEnvironmentConfigPersistenceSchema = sshEnvironmentConfigProbeSchema;
+
+const lifecycleSshConfigProposalSchema = z.object({
+  mode: z.literal("lifecycle"),
+  version: z.literal("ssh-lifecycle/v1"),
+  controllerRef: z.string().regex(
+    /^[a-z0-9][a-z0-9-]{0,62}$/,
+    "SSH lifecycle controller reference must be an operator name.",
+  ),
+  operationIdentitySource: z.literal("company_environment_agent_heartbeat"),
+}).strict();
+
+/** Validate a future lifecycle config without making it runnable or saveable. */
+export function normalizeLifecycleSshConfigProposal(input: Record<string, unknown>) {
+  const parsed = lifecycleSshConfigProposalSchema.safeParse(parseObject(input));
+  if (!parsed.success) {
+    throw unprocessable(toErrorMessage(parsed.error), {
+      issues: parsed.error.issues,
+    });
+  }
+  return parsed.data satisfies LifecycleSshEnvironmentConfig;
+}
+
+function refuseUnwiredLifecycleSshConfig(raw: Record<string, unknown>) {
+  if (raw.mode !== "lifecycle") return;
+  normalizeLifecycleSshConfigProposal(raw);
+  throw unprocessable("SSH lifecycle runtime support is not yet available.");
+}
 
 const fakeSandboxEnvironmentConfigSchema = z.object({
   provider: z.literal("fake").default("fake"),
@@ -442,7 +470,9 @@ export function normalizeEnvironmentConfig(input: {
   }
 
   if (input.driver === "ssh") {
-    const parsed = sshEnvironmentConfigSchema.safeParse(parseObject(input.config));
+    const raw = parseObject(input.config);
+    refuseUnwiredLifecycleSshConfig(raw);
+    const parsed = sshEnvironmentConfigSchema.safeParse(raw);
     if (!parsed.success) {
       throw unprocessable(toErrorMessage(parsed.error), {
         issues: parsed.error.issues,
@@ -488,7 +518,9 @@ export function normalizeEnvironmentConfigForProbe(input: {
   pluginWorkerManager?: PluginWorkerManager;
 }): Promise<Record<string, unknown>> | Record<string, unknown> {
   if (input.driver === "ssh") {
-    const parsed = sshEnvironmentConfigProbeSchema.safeParse(parseObject(input.config));
+    const raw = parseObject(input.config);
+    refuseUnwiredLifecycleSshConfig(raw);
+    const parsed = sshEnvironmentConfigProbeSchema.safeParse(raw);
     if (!parsed.success) {
       throw unprocessable(toErrorMessage(parsed.error), {
         issues: parsed.error.issues,
@@ -552,7 +584,9 @@ export async function normalizeEnvironmentConfigForPersistence(input: {
   pluginWorkerManager?: PluginWorkerManager;
 }): Promise<Record<string, unknown>> {
   if (input.driver === "ssh") {
-    const parsed = sshEnvironmentConfigPersistenceSchema.safeParse(parseObject(input.config));
+    const raw = parseObject(input.config);
+    refuseUnwiredLifecycleSshConfig(raw);
+    const parsed = sshEnvironmentConfigPersistenceSchema.safeParse(raw);
     if (!parsed.success) {
       throw unprocessable(toErrorMessage(parsed.error), {
         issues: parsed.error.issues,
@@ -796,7 +830,9 @@ export function parseEnvironmentDriverConfig(
   }
 
   if (environment.driver === "ssh") {
-    const parsed = sshEnvironmentConfigSchema.parse(parseObject(environment.config));
+    const raw = parseObject(environment.config);
+    refuseUnwiredLifecycleSshConfig(raw);
+    const parsed = sshEnvironmentConfigSchema.parse(raw);
     return {
       driver: "ssh",
       config: parsed,

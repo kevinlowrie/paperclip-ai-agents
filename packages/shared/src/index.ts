@@ -794,6 +794,7 @@ export type {
   EnvironmentProbeResult,
   FakeSandboxEnvironmentConfig,
   LocalEnvironmentConfig,
+  LifecycleSshEnvironmentConfig,
   PluginSandboxEnvironmentConfig,
   PluginEnvironmentConfig,
   SandboxEnvironmentConfig,
