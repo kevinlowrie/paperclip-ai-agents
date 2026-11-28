@@ -4905,13 +4905,31 @@ function createAdapterRuntimeMcpAccess(
   });
 }
 
-function createAdapterRuntimeToolAccess(input: {
+async function createAdapterRuntimeToolAccess(input: {
+  db: Db;
   agentId: string;
   companyId: string;
   runId: string;
   responsibleUserId: string | null;
-}): AdapterRuntimeToolAccess | undefined {
+}): Promise<AdapterRuntimeToolAccess | undefined> {
   if (!input.responsibleUserId) return undefined;
+  // A timer wake can have a responsible user without a persisted task. Do not
+  // advertise a required capability that its initialize handler will reject.
+  // Reuse the same persisted-run validation before minting; the handler still
+  // revalidates every request to protect against changes after admission.
+  try {
+    await connectionIntentService(input.db).validate({
+      sub: input.agentId,
+      company_id: input.companyId,
+      run_id: input.runId,
+      responsible_user_id: input.responsibleUserId,
+    });
+  } catch (error) {
+    if (error instanceof HttpError && [403, 404, 409, 422].includes(error.status)) {
+      return undefined;
+    }
+    throw error;
+  }
   const minted = createRuntimeToolsToken({
     agentId: input.agentId,
     companyId: input.companyId,
@@ -24854,7 +24872,8 @@ export function heartbeatService(
                   }
                 : {}),
             };
-            const runtimeTools = createAdapterRuntimeToolAccess({
+            const runtimeTools = await createAdapterRuntimeToolAccess({
+              db,
               agentId: agent.id,
               companyId: agent.companyId,
               runId: run.id,

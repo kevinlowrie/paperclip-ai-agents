@@ -1,5 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
+import fsp from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -80,6 +82,7 @@ describe("codex remote execution", () => {
   const cleanupDirs: string[] = [];
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
@@ -88,7 +91,7 @@ describe("codex remote execution", () => {
     }
   });
 
-  it("prepares the workspace, syncs CODEX_HOME, and restores workspace changes for remote SSH execution", async () => {
+  it.each([false, true, "cleanup-failure"])("prepares selected workspace and optional pinned wrapper (managed=%s)", async (managed) => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
@@ -98,9 +101,28 @@ describe("codex remote execution", () => {
     await mkdir(codexHomeDir, { recursive: true });
     await writeFile(path.join(rootDir, "instructions.md"), "Use the remote workspace.\n", "utf8");
     await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+    const packageDir = path.join(rootDir, "operator-package");
+    await mkdir(packageDir);
+    const wrapper = "#!/usr/bin/env node\nimport './bridge.mjs';\n";
+    const bridge = "export const ready = true;\n";
+    await writeFile(path.join(packageDir, "wrapper.mjs"), wrapper);
+    await writeFile(path.join(packageDir, "bridge.mjs"), bridge);
+    const managedCommand = { sourceDir: packageDir, entrypoint: "wrapper.mjs", files: [
+      { path: "wrapper.mjs", sha256: createHash("sha256").update(wrapper).digest("hex") },
+      { path: "bridge.mjs", sha256: createHash("sha256").update(bridge).digest("hex") },
+    ] };
     const alternateWorkspaceDir = path.join(rootDir, "alternate-workspace");
     await mkdir(alternateWorkspaceDir, { recursive: true });
 
+    const originalRm = fsp.rm.bind(fsp);
+    const removed: string[] = [];
+    if (managed === "cleanup-failure") {
+      vi.spyOn(fsp, "rm").mockImplementation(async (file, options) => {
+        const name = String(file); removed.push(name);
+        if (name.includes("paperclip-managed-command-")) { cleanupDirs.push(name); throw new Error("fixture cleanup failure"); }
+        return originalRm(file, options);
+      });
+    }
     await execute({
       runId: "run-1",
       agent: {
@@ -118,7 +140,8 @@ describe("codex remote execution", () => {
       },
       config: {
         engine: "cli",
-        command: "codex",
+        command: managed ? "/workspace/scripts/missing-wrapper.mjs" : "codex",
+        ...(managed ? { managedCommand } : {}),
         env: {
           CODEX_HOME: codexHomeDir,
         },
@@ -169,10 +192,10 @@ describe("codex remote execution", () => {
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
-    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(managed ? 2 : 1);
     // The home asset now syncs a curated *staged* allowlist dir, not the raw
     // managed CODEX_HOME, and carries no `exclude` denylist.
-    const homeSyncArgs = (syncDirectoryToSsh.mock.calls[0] as unknown[])?.[0] as {
+    const homeSyncArgs = (syncDirectoryToSsh.mock.calls[managed ? 1 : 0] as unknown[])?.[0] as {
       localDir: string;
       remoteDir: string;
       followSymlinks?: boolean;
@@ -188,6 +211,23 @@ describe("codex remote execution", () => {
     const call = runChildProcess.mock.calls[0] as unknown as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
+    if (managed) {
+      const expected = managedRemoteWorkspace + "/.paperclip-runtime/codex/command/wrapper.mjs";
+      expect(call?.[1]).toBe(expected);
+      const commandSync = (syncDirectoryToSsh.mock.calls[0] as unknown[])[0] as {localDir:string;remoteDir:string};
+      expect(commandSync.remoteDir).toBe(path.posix.dirname(expected));
+      if (managed !== "cleanup-failure") {
+        await expect(readFile(path.join(commandSync.localDir, "wrapper.mjs"))).rejects.toThrow();
+      } else {
+        expect(removed.some((name) => name.includes("paperclip-codex-home-sync"))).toBe(true);
+        vi.restoreAllMocks();
+      }
+      // Both preflight operations must use the uploaded path, never the original missing command.
+      for (const check of [ensureCommandResolvable, resolveCommandForLogs]) {
+        expect(check).toHaveBeenCalledWith(expected, managedRemoteWorkspace, expect.any(Object),
+          expect.objectContaining({remoteExecution: expect.objectContaining({remoteCwd:managedRemoteWorkspace})}));
+      }
+    }
     expect(call?.[2]).not.toContain("--skip-git-repo-check");
     expect(call?.[3].env.CODEX_HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/codex/home`);
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);

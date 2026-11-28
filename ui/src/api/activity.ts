@@ -1,4 +1,4 @@
-import type { ActivityEvent, ExecutionProjection, RunLivenessState } from "@paperclipai/shared";
+import type { ActivityEvent, ExecutionProjection, RunLivenessState, IssueRunFinalResponse } from "@paperclipai/shared";
 import { api, type RequestOptions } from "./client";
 
 export type { RunLivenessState } from "@paperclipai/shared";
@@ -78,5 +78,7 @@ export const activityApi = {
   },
   forIssue: (issueId: string) => api.get<ActivityEvent[]>(`/issues/${issueId}/activity`),
   runsForIssue: (issueId: string) => api.get<RunForIssue[]>(`/issues/${issueId}/runs`),
+  finalResponseForIssueRun: (issueId: string, runId: string) =>
+    api.get<IssueRunFinalResponse>(`/issues/${encodeURIComponent(issueId)}/runs/${encodeURIComponent(runId)}/final-response`),
   issuesForRun: (runId: string) => api.get<IssueForRun[]>(`/heartbeat-runs/${runId}/issues`),
 };

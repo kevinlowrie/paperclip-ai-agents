@@ -6867,6 +6867,20 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{issueId}/runs/{runId}/final-response",
+  tags: ["runs"],
+  summary: "Read a bounded, redacted adapter response for an issue-bound run",
+  request: { params: z.object({ issueId: z.string(), runId: heartbeatRunIdParamSchema }) },
+  responses: { 200: r.ok(z.object({
+    schemaVersion: z.literal("issue-run-final-response/v1"),
+    companyId: z.string(), issueId: z.string(), runId: z.string(), agentId: z.string(),
+    runStatus: z.string(), source: z.literal("adapter_summary"),
+    availability: z.enum(["pending", "unavailable", "available"]), text: z.string().nullable(),
+  })), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/heartbeat-runs/{runId}",
   tags: ["runs"],
   summary: "Get a heartbeat run",

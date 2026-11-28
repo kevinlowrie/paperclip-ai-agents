@@ -300,6 +300,13 @@ Invariants:
 
 ## 7.8 `heartbeat_runs`
 
+Issue-scoped consumers may read a bounded adapter summary through
+`GET /api/issues/:issueId/runs/:runId/final-response` under the existing
+`issue:read` boundary. The response requires exact run company and original
+issue-context binding, applies run-secret/current-user redaction, and never
+exposes logs or full provider result data. See
+`doc/plans/2026-11-11-issue-run-final-response.md` for availability and size rules.
+
 - `id` uuid pk
 - `company_id` uuid fk not null
 - `agent_id` uuid fk not null

@@ -143,60 +143,96 @@ export async function markExecutionReconciliation(
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
 ) {
-  if (deliveryOwner) {
-    const [retry] = await db
-      .select()
-      .from(chatActions)
+  return db.transaction(async tx => {
+    const db = tx as unknown as Db;
+    if (deliveryOwner) {
+      const [retry] = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.companyId, action.companyId),
+            eq(chatActions.id, deliveryOwner.actionId),
+          ),
+        );
+      if (
+        deliveryOwner.kind !== "chat_failed_run_retry" ||
+        !retry ||
+        retry.kind !== "failed_run_retry" ||
+        !["issued", "processing", "processed"].includes(retry.status) ||
+        retry.payload.version !== 1 ||
+        retry.payload.failedRunId !== decision.runId ||
+        retry.payload.issueId !== action.sourceIssueId
+      ) {
+        throw conflict("The authorized chat retry owner is no longer valid.");
+      }
+    }
+    await db
+      .update(nativeRunFinalizations)
+      .set({
+        failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "operator_reconciled" })}::jsonb`,
+      })
       .where(
         and(
-          eq(chatActions.companyId, action.companyId),
-          eq(chatActions.id, deliveryOwner.actionId),
+          eq(nativeRunFinalizations.companyId, action.companyId),
+          eq(nativeRunFinalizations.runId, decision.runId),
         ),
       );
-    if (
-      deliveryOwner.kind !== "chat_failed_run_retry" ||
-      !retry ||
-      retry.kind !== "failed_run_retry" ||
-      !["issued", "processing", "processed"].includes(retry.status) ||
-      retry.payload.version !== 1 ||
-      retry.payload.failedRunId !== decision.runId ||
-      retry.payload.issueId !== action.sourceIssueId
-    ) {
-      throw conflict("The authorized chat retry owner is no longer valid.");
-    }
-  }
-  await db
-    .update(nativeRunFinalizations)
-    .set({
-      failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "operator_reconciled" })}::jsonb`,
-    })
-    .where(
-      and(
-        eq(nativeRunFinalizations.companyId, action.companyId),
-        eq(nativeRunFinalizations.runId, decision.runId),
-      ),
-    );
-  await db
-    .update(issueRecoveryActions)
-    .set({
-      evidence: {
-        ...action.evidence,
-        automaticRecovery: undefined,
-        executionReconciliation: {
-          ...decision,
-          actorId,
-          recordedAt: new Date().toISOString(),
+    const [source] = await db
+      .update(issueRecoveryActions)
+      .set({
+        evidence: {
+          ...action.evidence,
+          automaticRecovery: undefined,
+          executionReconciliation: {
+            ...decision,
+            actorId,
+            recordedAt: new Date().toISOString(),
+          },
+          continuationDelivery: deliveryOwner ? "delegated" : "pending",
+          ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
         },
-        continuationDelivery: deliveryOwner ? "delegated" : "pending",
-        ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
-      },
-    })
-    .where(
-      and(
-        eq(issueRecoveryActions.companyId, action.companyId),
-        eq(issueRecoveryActions.id, action.id),
-      ),
-    );
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, action.companyId),
+          eq(issueRecoveryActions.id, action.id),
+        ),
+      ).returning({ cause: issueRecoveryActions.cause, fingerprint: issueRecoveryActions.fingerprint, kind: issueRecoveryActions.kind, evidence: issueRecoveryActions.evidence });
+    if (
+      !source ||
+      source.cause !== "legacy_execution_requires_reconciliation" ||
+      source.fingerprint !== `legacy-execution:${decision.runId}` ||
+      ["workspaceRestoreFailure", "workspaceRestoreRecovery", "systemRecovery"].some(key => key in source.evidence)
+    ) return;
+    const now = new Date();
+    const siblings = await tx.update(issueRecoveryActions).set({
+      status: "resolved", outcome: "cancelled", resolvedAt: now, updatedAt: now,
+      wakePolicy: null, monitorPolicy: null,
+      resolutionNote: "The same source execution was reconciled through another recovery action.",
+      evidence: sql`(${issueRecoveryActions.evidence} - 'automaticRecovery') || ${JSON.stringify({
+        executionReconciliation: { ...decision, actorId, recordedAt: now.toISOString() },
+        continuationDelivery: "invalidated",
+        coalescedIntoRecoveryActionId: action.id,
+      })}::jsonb`,
+    }).where(and(
+      eq(issueRecoveryActions.companyId, action.companyId),
+      eq(issueRecoveryActions.sourceIssueId, action.sourceIssueId),
+      not(eq(issueRecoveryActions.id, action.id)),
+      eq(issueRecoveryActions.kind, source.kind),
+      eq(issueRecoveryActions.cause, source.cause),
+      eq(issueRecoveryActions.fingerprint, source.fingerprint),
+      sql`${issueRecoveryActions.evidence}->>'runId' = ${decision.runId}`,
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      sql`not (${issueRecoveryActions.evidence} ?| array['executionReconciliation', 'workspaceRestoreFailure', 'workspaceRestoreRecovery', 'systemRecovery'])`,
+    )).returning({ id: issueRecoveryActions.id });
+    if (siblings.length) await persistActivity(tx as unknown as Db, {
+      companyId: action.companyId, actorType: "user", actorId,
+      action: "issue.recovery_action_resolved", entityType: "issue", entityId: action.sourceIssueId,
+      details: { reason: "same_source_execution_reconciled", recoveryActionId: action.id,
+        coalescedRecoveryActionIds: siblings.map(sibling => sibling.id), runId: decision.runId },
+    });
+  });
 }
 
 export async function deliverReconciledExecutions(
