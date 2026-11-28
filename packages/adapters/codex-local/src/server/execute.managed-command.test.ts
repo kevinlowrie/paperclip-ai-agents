@@ -42,4 +42,3 @@ it.each([false,true])("uses staged sandbox wrapper, missing asset fails closed=%
  expect(seam.restore).toHaveBeenCalledTimes(1);
  await expect(fs.access(snapshot)).rejects.toThrow();await expect(fs.access(stagedHome)).rejects.toThrow();
 });
-
