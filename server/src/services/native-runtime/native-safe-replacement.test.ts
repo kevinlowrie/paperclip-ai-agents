@@ -540,6 +540,161 @@ const support = externalDatabaseUrl
       });
     });
 
+    it("opens one workspace repair hold when a reconciled legacy run reports a new unsafe restore", async () => {
+      const source = await seed();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" })
+        .where(eq(heartbeatRuns.id, source.runId)).returning();
+      const actionsForIssue = () => db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, source.companyId),
+        eq(issueRecoveryActions.sourceIssueId, source.issueId),
+      ));
+
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const [action] = await actionsForIssue();
+      await db.transaction(async tx => {
+        await markExecutionReconciliation(tx as unknown as typeof db, action, {
+          runId: source.runId, providerStopped: true, actionOutcome: "not_performed",
+          outcomeEvidence: "Verified the stopped fixture did not perform a provider action.",
+        }, "operator");
+        await tx.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, action.id));
+      });
+      const before = await actionsForIssue();
+      expect(before).toHaveLength(1);
+      expect(before[0]).toMatchObject({
+        status: "resolved",
+        evidence: { executionReconciliation: { runId: source.runId } },
+      });
+      expect(before[0].evidence.workspaceRestoreFailure).toBeUndefined();
+
+      const updated = await terminalizeLegacyExecution({
+        db, run, status: "cancelled",
+        patch: {
+          errorCode: "workspace_restore_failed",
+          resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" },
+        },
+      });
+      expect(updated?.resultJson).toMatchObject({ workspaceRestoreFailure: "restore_unsafe_archive" });
+      const after = await actionsForIssue();
+      expect(after).toHaveLength(2);
+      expect(after.find(candidate => candidate.id === action.id)).toMatchObject({
+        status: "resolved",
+        evidence: { executionReconciliation: before[0].evidence.executionReconciliation },
+      });
+      const hold = after.find(candidate => candidate.id !== action.id);
+      expect(hold).toMatchObject({
+        status: "active",
+        ownerType: "board",
+        evidence: { runId: source.runId, workspaceRestoreFailure: "restore_unsafe_archive" },
+        nextAction: expect.stringContaining("repair"),
+      });
+
+      await terminalizeLegacyExecution({ db, run: updated!, status: "cancelled" });
+      expect((await actionsForIssue()).filter(candidate => candidate.status === "active")
+        .map(candidate => candidate.id)).toEqual([hold!.id]);
+
+      await settleUnrecoverableExecutions(db);
+      const settled = await actionsForIssue();
+      expect(settled).toHaveLength(2);
+      expect(settled.find(candidate => candidate.id === hold!.id)).toMatchObject({
+        status: "resolved",
+        outcome: "blocked",
+        evidence: {
+          runId: source.runId,
+          workspaceRestoreFailure: "restore_unsafe_archive",
+          automaticRecovery: { replay: "blocked" },
+        },
+      });
+
+      await terminalizeLegacyExecution({ db, run: updated!, status: "cancelled" });
+      const revisited = await actionsForIssue();
+      expect(revisited).toHaveLength(2);
+      for (const previous of settled) {
+        expect(revisited.find(candidate => candidate.id === previous.id)).toEqual(previous);
+      }
+    });
+
+    it.each([
+      ["missing", undefined],
+      ["short", "   " + "x".repeat(19) + "   "],
+    ] as const)("requires repair when a historical same-failure decision has %s evidence", async (_kind, workspaceRepairEvidence) => {
+      const source = await seed();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      const [run] = await db.update(heartbeatRuns).set({
+        runtimeMode: "legacy",
+        status: "cancelled",
+        errorCode: "workspace_restore_failed",
+        resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" },
+      }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      const actionsForIssue = () => db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, source.companyId),
+        eq(issueRecoveryActions.sourceIssueId, source.issueId),
+      ));
+      const decision = {
+        runId: source.runId,
+        providerStopped: true as const,
+        actionOutcome: "not_performed" as const,
+        outcomeEvidence: "Verified the stopped fixture did not perform a provider action.",
+      };
+      const validation = { db, ...source, sourceRunId: source.runId };
+      const incomplete = { ...decision, workspaceRepairEvidence };
+      await expect(validateExecutionReconciliation({ ...validation, decision: incomplete }))
+        .rejects.toThrow("workspaceRepairEvidence");
+
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const [action] = await actionsForIssue();
+      // Seed a historical record whose operator decision predates today's repair evidence gate.
+      await db.update(issueRecoveryActions).set({
+        status: "resolved",
+        resolvedAt: new Date(),
+        evidence: {
+          ...action.evidence,
+          executionReconciliation: { ...incomplete, actorId: "operator", recordedAt: new Date().toISOString() },
+          continuationDelivery: "pending",
+        },
+      }).where(eq(issueRecoveryActions.id, action.id));
+      const [historical] = await actionsForIssue();
+      expect(historical).toMatchObject({
+        status: "resolved",
+        evidence: { workspaceRestoreFailure: "restore_unsafe_archive", executionReconciliation: { runId: source.runId } },
+      });
+
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const after = await actionsForIssue();
+      expect(after).toHaveLength(2);
+      const repair = after.find(candidate => candidate.id !== historical.id);
+      expect(repair).toMatchObject({
+        status: "active",
+        evidence: { runId: source.runId, workspaceRestoreFailure: "restore_unsafe_archive" },
+        nextAction: expect.stringContaining("repair"),
+      });
+
+      const repaired = { ...decision, workspaceRepairEvidence: "Verified a fresh, confined workspace restore." };
+      await expect(validateExecutionReconciliation({ ...validation, decision: repaired }))
+        .resolves.toMatchObject({ id: source.runId });
+      await db.transaction(async tx => {
+        await markExecutionReconciliation(tx as unknown as typeof db, repair!, repaired, "operator");
+        await tx.update(issueRecoveryActions).set({ status: "resolved", resolvedAt: new Date() })
+          .where(eq(issueRecoveryActions.id, repair!.id));
+      });
+      const settled = await actionsForIssue();
+      expect(settled).toHaveLength(2);
+      expect(settled.find(candidate => candidate.id === repair!.id)).toMatchObject({
+        status: "resolved",
+        evidence: {
+          workspaceRestoreFailure: "restore_unsafe_archive",
+          executionReconciliation: { runId: source.runId, workspaceRepairEvidence: repaired.workspaceRepairEvidence },
+        },
+      });
+
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const revisited = await actionsForIssue();
+      expect(revisited).toHaveLength(2);
+      for (const previous of settled) {
+        expect(revisited.find(candidate => candidate.id === previous.id)).toEqual(previous);
+      }
+    });
+
     it("retires duplicate legacy holds for one reconciled run without adding delivery owners", async () => {
       const source = await seed();
       const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" })

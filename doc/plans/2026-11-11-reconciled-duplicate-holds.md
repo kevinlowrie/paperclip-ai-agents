@@ -13,8 +13,10 @@ to this pinned release.
 
 - Repeated terminalization reuses a resolved no-replay hold for the same
   company, issue, legacy cause, fingerprint and run. The pinned release
-  continues to handle a run with workspace-restore failure evidence through its
-  existing workspace checks.
+  requires the recorded workspace failure to match the current failure before
+  reusing a human decision. Its repair evidence must meet the same trimmed
+  length requirement as continuation delivery. A settled automatic hold for
+  the same unsafe archive still preserves its no-replay decision.
 - After reconciliation, coalesce matching legacy holds of the same kind in
   the transaction that records the decision. Link the sibling evidence to the
   selected recovery action, invalidate sibling delivery, and record an audit

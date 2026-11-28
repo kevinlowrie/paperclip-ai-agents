@@ -120,29 +120,48 @@ export async function terminalizeLegacyExecution(input: {
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       !["done", "cancelled"].includes(task.status)
     ) {
-      // Periodic stranded-work checks may revisit this terminal run before its
-      // reconciled continuation is dispatched. Reuse an existing decision or
-      // settled no-replay hold. A general hold cannot cover new restore failures.
-      const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
-        .from(issueRecoveryActions).where(and(
-          eq(issueRecoveryActions.companyId, run.companyId),
-          eq(issueRecoveryActions.sourceIssueId, task.id),
-          eq(issueRecoveryActions.status, "resolved"),
-          or(
-            sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
-            and(
-              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
-              sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
-              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
-            ),
-            hasWorkspaceRestoreFailure(updated.resultJson) ? undefined : and(
-              eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
-              eq(issueRecoveryActions.fingerprint, `legacy-execution:${run.id}`),
-              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
-              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
-            ),
+      const workspaceRestoreFailure = hasWorkspaceRestoreFailure(updated.resultJson)
+        ? updated.resultJson!.workspaceRestoreFailure
+        : undefined;
+      const reconciliation = sql`${issueRecoveryActions.evidence}->'executionReconciliation'`;
+      const reconciledRun = sql`${reconciliation}->>'runId' = ${run.id}`;
+      const workspaceReplayBlocked = and(
+        sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+        sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      );
+      // Periodic stranded-work checks may revisit a terminal run before it
+      // continues. Reuse only a decision that covers the current restore failure.
+      const settled = tx.select({
+        repairEvidence: workspaceRestoreFailure
+          ? sql<unknown>`case when ${reconciledRun} then ${reconciliation}->'workspaceRepairEvidence' end`
+          : sql`null`,
+        workspaceReplayBlocked: workspaceRestoreFailure
+          ? sql<boolean>`coalesce(${workspaceReplayBlocked}, false)`
+          : sql<boolean>`false`,
+      }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, run.companyId),
+        eq(issueRecoveryActions.sourceIssueId, task.id),
+        eq(issueRecoveryActions.status, "resolved"),
+        workspaceRestoreFailure
+          ? sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = ${workspaceRestoreFailure}`
+          : undefined,
+        or(
+          reconciledRun,
+          workspaceReplayBlocked,
+          workspaceRestoreFailure ? undefined : and(
+            eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+            eq(issueRecoveryActions.fingerprint, `legacy-execution:${run.id}`),
+            sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+            sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
           ),
-        )).limit(1);
+        ),
+      ));
+      const reconciled = workspaceRestoreFailure
+        ? (await settled).some(({ repairEvidence, workspaceReplayBlocked }) =>
+            workspaceReplayBlocked ||
+            (typeof repairEvidence === "string" && repairEvidence.trim().length >= 20))
+        : (await settled.limit(1)).length > 0;
       if (reconciled) return updated;
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
@@ -156,11 +175,11 @@ export async function terminalizeLegacyExecution(input: {
           runId: run.id,
           ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),
           originalFailureCode: updated.errorCode,
-          ...(hasWorkspaceRestoreFailure(updated.resultJson) ? { workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure } : {}),
+          ...(workspaceRestoreFailure ? { workspaceRestoreFailure } : {}),
           adapterRecovery: "unsupported_or_unknown",
           attempt: executionFailureRetryCount(run) + 1,
         },
-        nextAction: hasWorkspaceRestoreFailure(updated.resultJson)
+        nextAction: workspaceRestoreFailure
           ? "Verify safe workspace staging or repair, then reconcile the stopped run before continuing. Saved work and approval decisions remain in force."
           : "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing. This adapter has not established a safe resume checkpoint.",
         maxAttempts: 3,
