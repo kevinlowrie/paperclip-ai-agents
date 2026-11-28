@@ -12,6 +12,19 @@ export interface ProviderTraceDebugRequest {
   providerTrace: "raw";
 }
 
+/** Bounded adapter summary, not a workflow-success assertion or raw transcript. */
+export interface IssueRunFinalResponse {
+  schemaVersion: "issue-run-final-response/v1";
+  companyId: string;
+  issueId: string;
+  runId: string;
+  agentId: string;
+  runStatus: string;
+  source: "adapter_summary";
+  availability: "pending" | "unavailable" | "available";
+  text: string | null;
+}
+
 export type ProviderTraceDirection =
   "client_to_provider" | "provider_to_client" | "provider_stderr";
 export type ProviderTraceDisposition =
