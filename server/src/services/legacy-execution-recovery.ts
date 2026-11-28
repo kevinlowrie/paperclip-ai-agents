@@ -121,8 +121,8 @@ export async function terminalizeLegacyExecution(input: {
       !["done", "cancelled"].includes(task.status)
     ) {
       // Periodic stranded-work checks may revisit this terminal run before its
-      // reconciled continuation is dispatched. Preserve the recorded decision
-      // and an existing unsafe-workspace hold instead of creating another one.
+      // reconciled continuation is dispatched. Reuse an existing decision or
+      // settled no-replay hold. A general hold cannot cover new restore failures.
       const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
@@ -133,6 +133,12 @@ export async function terminalizeLegacyExecution(input: {
             and(
               sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
               sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+            ),
+            hasWorkspaceRestoreFailure(updated.resultJson) ? undefined : and(
+              eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+              eq(issueRecoveryActions.fingerprint, `legacy-execution:${run.id}`),
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
               sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
             ),
           ),

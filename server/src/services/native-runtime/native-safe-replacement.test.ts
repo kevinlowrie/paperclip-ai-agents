@@ -479,19 +479,87 @@ const support = externalDatabaseUrl
       expect(actions[0]).toMatchObject({ status: "resolved", evidence: { continuationDelivery: "pending", executionReconciliation: { runId: source.runId } } });
       await db.update(issueRecoveryActions).set({ evidence: { ...actions[0]!.evidence, continuationDelivery: "invalidated" } }).where(eq(issueRecoveryActions.id, action!.id));
     });
+    it("preserves the settled no-replay action when the same legacy run is terminalized again", async () => {
+      const source = await seed();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" })
+        .where(eq(heartbeatRuns.id, source.runId)).returning();
+      const actionsForIssue = () => db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      await settleUnrecoverableExecutions(db);
+      const before = await actionsForIssue();
+      expect(before).toHaveLength(1);
+      expect(before[0]).toMatchObject({
+        status: "resolved",
+        outcome: "blocked",
+        evidence: {
+          runId: source.runId,
+          automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked" },
+        },
+      });
+      expect(before[0].evidence.workspaceRestoreFailure).toBeUndefined();
+      expect(before[0].evidence.executionReconciliation).toBeUndefined();
+
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+
+      expect(await actionsForIssue()).toEqual(before);
+    });
+
+    it("records a newly unsafe workspace restore when the same legacy run is terminalized again", async () => {
+      const source = await seed();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" })
+        .where(eq(heartbeatRuns.id, source.runId)).returning();
+      const actionsForIssue = () => db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      await settleUnrecoverableExecutions(db);
+      const before = await actionsForIssue();
+      expect(before).toHaveLength(1);
+      expect(before[0]).toMatchObject({
+        status: "resolved",
+        evidence: { automaticRecovery: { replay: "blocked" } },
+      });
+      expect(before[0].evidence.workspaceRestoreFailure).toBeUndefined();
+
+      await terminalizeLegacyExecution({
+        db, run, status: "cancelled",
+        patch: { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } },
+      });
+
+      const after = await actionsForIssue();
+      expect(after).toHaveLength(2);
+      expect(after.find(action => action.id === before[0].id)).toEqual(before[0]);
+      expect(after.find(action => action.id !== before[0].id)).toMatchObject({
+        status: "active",
+        evidence: { runId: source.runId, workspaceRestoreFailure: "restore_unsafe_archive" },
+        nextAction: expect.stringContaining("repair"),
+      });
+    });
+
     it("retires duplicate legacy holds for one reconciled run without adding delivery owners", async () => {
       const source = await seed();
       const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" })
         .where(eq(heartbeatRuns.id, source.runId)).returning();
       await terminalizeLegacyExecution({ db, run, status: "cancelled" });
-      const [older] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
-      await db.update(issueRecoveryActions).set({ status: "resolved", evidence: {
-        ...older.evidence, automaticRecovery: { replay: "blocked", reason: "Preserve uncertain actions" },
-      } }).where(eq(issueRecoveryActions.id, older.id));
-      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
       const [current] = await db.select().from(issueRecoveryActions).where(and(
         eq(issueRecoveryActions.sourceIssueId, source.issueId), eq(issueRecoveryActions.status, "active"),
       ));
+      // Historical rows predate the terminalization guard. Seed the settled sibling explicitly.
+      const [older] = await db.insert(issueRecoveryActions).values({
+        ...current,
+        id: randomUUID(),
+        status: "resolved",
+        outcome: "blocked",
+        createdAt: new Date(current.createdAt.getTime() - 1_000),
+        evidence: {
+          ...current.evidence,
+          automaticRecovery: { replay: "blocked", reason: "Preserve uncertain actions" },
+        },
+      }).returning();
       expect(current.id).not.toBe(older.id);
       await db.transaction(async tx => {
         await markExecutionReconciliation(tx as unknown as typeof db, current, {

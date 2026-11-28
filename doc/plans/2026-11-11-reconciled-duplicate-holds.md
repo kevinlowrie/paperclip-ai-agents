@@ -7,26 +7,32 @@ Reconciling the latest record creates a pending continuation, but an older
 record with `automaticRecovery.replay=blocked` still prevents dispatch. Repeated
 operator reconciliation could then create more than one delivery owner.
 
-Backport the same-source reconciliation logic from upstream Paperclip commit
-`f125b823f4c7c37680ffa788ceee1ab0bc8f44b1`, adapting it to this pinned version's
-existing function signature. This is not a new upstream feature proposal.
-During an atomic transaction, coalesce legacy holds for the same company,
-issue, cause, kind, fingerprint and exact run. Link their evidence to the
-selected recovery action, invalidate sibling delivery, and record an audit
-event. The selected action alone owns pending continuation delivery. Preserve
-records with independent reconciliation, workspace recovery or system recovery
-evidence. Existing provider-stop, authority-release and outcome validation
-still apply.
+Adapt both same-source recovery changes from [Paperclip #17055 at
+`ea42a2e41715c70a6822a25683136e48e35ae811`](https://github.com/paperclipai/paperclip/commit/ea42a2e41715c70a6822a25683136e48e35ae811)
+to this pinned release.
 
-The embedded-Postgres regression reproduces the old behavior: one failure and
-four passing boundary controls before the fix. The corrected focused run passes
-six tests, including the existing pending-continuation regression. The full
-related suite passed all 65 tests for the initial local fix. Upstream discovery
-then replaced that implementation with the established coalescing behavior and
-expanded boundary controls. The final expanded suite passed all 70 tests, and the server typecheck
-passed (both exit 0). The fresh worktree required plugin and runner TypeScript artifacts
-before typechecking; these artifacts have now been built.
-This is source/database-fixture evidence, not a live recovery acceptance result.
+- Repeated terminalization reuses a resolved no-replay hold for the same
+  company, issue, legacy cause, fingerprint and run. The pinned release
+  continues to handle a run with workspace-restore failure evidence through its
+  existing workspace checks.
+- After reconciliation, coalesce matching legacy holds of the same kind in
+  the transaction that records the decision. Link the sibling evidence to the
+  selected recovery action, invalidate sibling delivery, and record an audit
+  event. The selected action retains responsibility for continuation delivery,
+  including existing explicit delegation. Keep sibling records with independent
+  reconciliation, workspace recovery or system recovery evidence. Existing
+  provider-stop, authority-release and outcome validation still apply.
+
+The pinned release uses the existing reconciliation signature and delivery
+path. The newer upstream implementation also handles workspace-repair-only
+reconciliation and notifies three delivery queues in the write transaction.
+
+The embedded PostgreSQL checks cover reuse of a settled hold during repeated
+terminalization and coalescing pre-existing duplicate holds after a verified
+decision. Boundary cases exercise records that must be preserved. The prior
+coalescing-only revision passed the 70-test related suite and server typecheck.
+That evidence predates the terminalization change. The checks use local source
+and database fixtures.
 
 No migration or direct operational database edit is included. Review and
 deployed acceptance must confirm one continuation owner and preservation of
